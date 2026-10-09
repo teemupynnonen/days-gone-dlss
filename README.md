@@ -119,7 +119,8 @@ TAA), view state `+0x1CE0`.
 ## Status
 
 Verified on an RTX 5080 (driver 616.92) in SDR: DLAA and Quality evaluate on every frame after
-the first, with UI, vignette and grain intact. A sweep of jitter and motion vector sign
+the first, with UI, vignette and grain intact. In HDR at 3840×2160, a 168,000-frame session
+switching between DLAA and Quality and presets K, L and M used DLSS on all but 6 frames. A sweep of jitter and motion vector sign
 combinations on a still scene kept the defaults; edge stability is about equal to the game's
 TAA.
 
