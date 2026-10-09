@@ -4,7 +4,7 @@
 #include <filesystem>
 #include <string_view>
 
-namespace dgmp::upscaler
+namespace days_gone_dlss::upscaler
 {
 enum class Quality : std::uint8_t { Off, Dlaa, Quality, Balanced, Performance, UltraPerformance, Custom, Count };
 // Values match NVSDK_NGX_DLSS_Hint_Render_Preset; Default lets the DLSS DLL choose per quality mode.

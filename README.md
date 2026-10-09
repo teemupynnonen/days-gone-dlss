@@ -18,10 +18,9 @@ It is specific to the Steam release of Days Gone, build 19221447, and needs an N
 3. Start the game, open the ReShade overlay and choose a mode in its **Days Gone DLSS** window.
 
 While DLSS is on, it controls the game's render scale; the in-game Render Scale option is
-restored when DLSS is turned off. Settings are saved in
-`%LOCALAPPDATA%/DaysGoneMP/main/upscaler.ini` and diagnostics are written to `upscaler.log`
-beside it. If the game is started with `-saveddirsuffix=DGMP_<name>`, `<name>` replaces `main`.
-NVIDIA App overrides of the DLSS model or preset still apply.
+restored when DLSS is turned off. Settings are saved in `DaysGoneDLSS.ini` and diagnostics
+are written to `DaysGoneDLSS.log`, both beside the add-on. NVIDIA App overrides of the DLSS
+model or preset still apply.
 
 ## Build
 
@@ -48,14 +47,10 @@ RelWithDebInfo copy of the current sources.
 | --- | --- |
 | `src/upscaler.cpp`, `src/upscaler.hpp` | Core: engine hooks, shader identification, DLSS evaluation and composite |
 | `src/upscaler_shaders.hpp` | HLSL for the input preparation and the SDR/HDR composites |
-| `src/upscaler_addon.cpp` | ReShade front end: events, add-on exports, profile directory |
+| `src/upscaler_addon.cpp` | ReShade add-on: events, exports, settings location |
 | `src/upscaler_menu.cpp` | Settings window in the ReShade overlay |
-| `src/upscaler_settings.cpp`, `src/upscaler_settings.hpp` | Modes, render scales and `upscaler.ini` |
+| `src/upscaler_settings.cpp`, `src/upscaler_settings.hpp` | Modes, render scales and `DaysGoneDLSS.ini` |
 | `tests/upscaler_tests.cpp` | Settings tests |
-
-The core is shared with the Days Gone MP mod, which drives it from its own MinHook detours
-instead of ReShade events (`upscaler_hooks.cpp`, not included here); `upscaler.hpp` declares that
-front end too. When this add-on is loaded, the MP mod leaves DLSS to it.
 
 ## How Bend renders anti-aliasing
 

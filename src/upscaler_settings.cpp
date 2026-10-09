@@ -12,7 +12,7 @@
 #include <string>
 #include <system_error>
 
-namespace dgmp::upscaler
+namespace days_gone_dlss::upscaler
 {
 namespace
 {

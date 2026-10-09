@@ -18,7 +18,7 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 FetchContent_MakeAvailable(minhook)
 
 # Downloads `source|path|sha256` entries from raw.githubusercontent.com into `directory`.
-function(dgmp_download directory)
+function(download_pinned directory)
     foreach(entry IN LISTS ARGN)
         string(REPLACE "|" ";" entry "${entry}")
         list(GET entry 0 source)
@@ -42,10 +42,10 @@ endfunction()
 
 # NVIDIA DLSS SDK v310.9.1. The repository carries every platform's binaries (over 1 GB),
 # so only the D3D11 headers, the static NGX loader and the x64 model DLL are downloaded.
-set(DGMP_DLSS_SDK_COMMIT 374959484e79a640feaba44c93ac8cfb0a03f5b5)
-set(DGMP_DLSS_SDK_DIR "${CMAKE_BINARY_DIR}/_deps/dlss-sdk")
-set(sdk "NVIDIA/DLSS/${DGMP_DLSS_SDK_COMMIT}")
-dgmp_download("${DGMP_DLSS_SDK_DIR}"
+set(DLSS_SDK_COMMIT 374959484e79a640feaba44c93ac8cfb0a03f5b5)
+set(DLSS_SDK_DIR "${CMAKE_BINARY_DIR}/_deps/dlss-sdk")
+set(sdk "NVIDIA/DLSS/${DLSS_SDK_COMMIT}")
+download_pinned("${DLSS_SDK_DIR}"
     "${sdk}/LICENSE.txt|LICENSE.txt|d4216e39ebef5f9b50a6712ebb37beeb5379862a67733a9999c651f21592aaf0"
     "${sdk}/include/nvsdk_ngx.h|include/nvsdk_ngx.h|dc38e7467cf415379c9d12ae1b6e4a494c453ed92720fb53e92aecb523e7b848"
     "${sdk}/include/nvsdk_ngx_defs.h|include/nvsdk_ngx_defs.h|ea23f33497cd274860d1c25a97644fce807dcb0037c594547203343103fad03e"
@@ -59,12 +59,12 @@ dgmp_download("${DGMP_DLSS_SDK_DIR}"
 )
 
 # ReShade 6.8.0 add-on API headers and the Dear ImGui 1.92.5 header its overlay requires.
-set(DGMP_RESHADE_COMMIT 18deaa52de0c425a78b329e9cb3c497281cd00ec) # v6.8.0
-set(DGMP_RESHADE_IMGUI_COMMIT 3912b3d9a9c1b3f17431aebafd86d2f40ee6e59c) # ReShade's deps/imgui
-set(DGMP_RESHADE_DIR "${CMAKE_BINARY_DIR}/_deps/reshade-api")
-set(reshade "crosire/reshade/${DGMP_RESHADE_COMMIT}")
-set(imgui "ocornut/imgui/${DGMP_RESHADE_IMGUI_COMMIT}")
-dgmp_download("${DGMP_RESHADE_DIR}"
+set(RESHADE_COMMIT 18deaa52de0c425a78b329e9cb3c497281cd00ec) # v6.8.0
+set(IMGUI_COMMIT 3912b3d9a9c1b3f17431aebafd86d2f40ee6e59c) # ReShade's deps/imgui
+set(RESHADE_DIR "${CMAKE_BINARY_DIR}/_deps/reshade-api")
+set(reshade "crosire/reshade/${RESHADE_COMMIT}")
+set(imgui "ocornut/imgui/${IMGUI_COMMIT}")
+download_pinned("${RESHADE_DIR}"
     "${reshade}/LICENSE.md|LICENSE.md|237ded5b8344f820113efab1e65e91e1f159d9202c5b4856606a0590d3ffdab0"
     "${reshade}/include/reshade.hpp|include/reshade.hpp|cf3cd150920ea310b4b1e2e4f11ab8d7221a9fc18755f4891a026563311b524c"
     "${reshade}/include/reshade_api.hpp|include/reshade_api.hpp|8d83ec8a620c48da7a20d975bd27b3345b24d3f0d5b78ae4c4fe633d61b804eb"
@@ -78,20 +78,20 @@ dgmp_download("${DGMP_RESHADE_DIR}"
     "${imgui}/imconfig.h|imgui/imconfig.h|6e5687893594ebfaf8569280cfea83d025904a8a4e23bec073086f6c5bc8f7fb"
 )
 
-add_library(dgmp_ngx STATIC IMPORTED)
-set_target_properties(dgmp_ngx PROPERTIES
-    IMPORTED_LOCATION "${DGMP_DLSS_SDK_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib"
-    IMPORTED_LOCATION_DEBUG "${DGMP_DLSS_SDK_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_s_dbg.lib"
-    INTERFACE_INCLUDE_DIRECTORIES "${DGMP_DLSS_SDK_DIR}/include"
+add_library(ngx STATIC IMPORTED)
+set_target_properties(ngx PROPERTIES
+    IMPORTED_LOCATION "${DLSS_SDK_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib"
+    IMPORTED_LOCATION_DEBUG "${DLSS_SDK_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_s_dbg.lib"
+    INTERFACE_INCLUDE_DIRECTORIES "${DLSS_SDK_DIR}/include"
 )
 
 # The add-on uses ReShade's ImGui through the overlay function table, so none is linked.
 add_library(days_gone_dlss SHARED src/upscaler.cpp src/upscaler_settings.cpp src/upscaler_menu.cpp src/upscaler_addon.cpp)
 target_include_directories(days_gone_dlss PRIVATE src)
-target_include_directories(days_gone_dlss SYSTEM PRIVATE "${DGMP_RESHADE_DIR}/include" "${DGMP_RESHADE_DIR}/imgui")
-target_link_libraries(days_gone_dlss PRIVATE minhook dgmp_ngx d3d11 dxgi d3dcompiler)
+target_include_directories(days_gone_dlss SYSTEM PRIVATE "${RESHADE_DIR}/include" "${RESHADE_DIR}/imgui")
+target_link_libraries(days_gone_dlss PRIVATE minhook ngx d3d11 dxgi d3dcompiler)
 target_compile_features(days_gone_dlss PRIVATE cxx_std_20)
-target_compile_definitions(days_gone_dlss PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX DGMP_RESHADE_ADDON ImTextureID=ImU64)
+target_compile_definitions(days_gone_dlss PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX ImTextureID=ImU64)
 target_compile_options(days_gone_dlss PRIVATE /W4 /WX /permissive- /utf-8)
 # Record only the PDB's file name, not the build machine's path.
 target_link_options(days_gone_dlss PRIVATE /PDBALTPATH:%_PDB%)
@@ -103,12 +103,12 @@ set_target_properties(days_gone_dlss PROPERTIES
 # NGX loads the model DLL from the add-on's directory.
 add_custom_command(TARGET days_gone_dlss POST_BUILD
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-        "${DGMP_DLSS_SDK_DIR}/lib/Windows_x86_64/rel/nvngx_dlss.dll" "$<TARGET_FILE_DIR:days_gone_dlss>/nvngx_dlss.dll"
+        "${DLSS_SDK_DIR}/lib/Windows_x86_64/rel/nvngx_dlss.dll" "$<TARGET_FILE_DIR:days_gone_dlss>/nvngx_dlss.dll"
 )
 
 install(TARGETS days_gone_dlss RUNTIME DESTINATION . COMPONENT addon)
-install(FILES "${DGMP_DLSS_SDK_DIR}/lib/Windows_x86_64/rel/nvngx_dlss.dll" DESTINATION . COMPONENT addon)
-install(FILES "${DGMP_DLSS_SDK_DIR}/LICENSE.txt" DESTINATION . RENAME NVIDIA-DLSS-LICENSE.txt COMPONENT addon)
+install(FILES "${DLSS_SDK_DIR}/lib/Windows_x86_64/rel/nvngx_dlss.dll" DESTINATION . COMPONENT addon)
+install(FILES "${DLSS_SDK_DIR}/LICENSE.txt" DESTINATION . RENAME NVIDIA-DLSS-LICENSE.txt COMPONENT addon)
 install(FILES "${minhook_SOURCE_DIR}/LICENSE.txt" DESTINATION . RENAME MinHook-LICENSE.txt COMPONENT addon)
 
 include(CTest)

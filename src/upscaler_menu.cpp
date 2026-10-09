@@ -1,13 +1,11 @@
-// DLSS settings UI, drawn inside the MP mod's F9 menu or as a ReShade overlay page.
+// DLSS settings UI, drawn as a ReShade overlay window.
 #include "upscaler.hpp"
 
 #include <imgui.h>
-#if defined(DGMP_RESHADE_ADDON)
 #include <reshade.hpp> // Routes ImGui calls through ReShade's overlay.
-#endif
 #include <string>
 
-namespace dgmp::upscaler
+namespace days_gone_dlss::upscaler
 {
 void drawMenu(float scale)
 {
@@ -89,7 +87,7 @@ void drawMenu(float scale)
     ImGui::SetNextItemWidth(220 * scale);
     diagnosticsChanged |= ImGui::Combo("Debug view", &options.debugView, views, static_cast<int>(std::size(views)));
     if (diagnosticsChanged) applyDiagnostics(options);
-    ImGui::Text("Front end: %s; NGX context: %s", state.frontEnd.c_str(), state.wrappedContext ? "ReShade wrapper" : "native");
+    ImGui::Text("NGX context: %s", state.wrappedContext ? "ReShade wrapper" : "native");
     ImGui::Text("Frames: %llu evaluated, %llu on game TAA", static_cast<unsigned long long>(state.evaluations),
         static_cast<unsigned long long>(state.fallbacks));
     if (!state.lastFallback.empty()) ImGui::TextWrapped("Last fallback: %s", state.lastFallback.c_str());

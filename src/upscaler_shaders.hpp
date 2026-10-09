@@ -11,7 +11,7 @@
 //
 // SDR: DLSS runs in LDR mode on the square-root encoding. HDR: highlights exceed 1, so the prepare
 // pass squares the colour and DLSS runs in HDR mode on linear values; `Linear` marks its output.
-namespace dgmp::upscaler::shaders
+namespace days_gone_dlss::upscaler::shaders
 {
 inline constexpr char Common[] = R"(
 // Bend's YCoCg history encoding: Y, Co * 0.5 + 0.5, Cg * 0.5 + 0.5.

@@ -11,7 +11,7 @@
 namespace
 {
 namespace fs = std::filesystem;
-using namespace dgmp::upscaler;
+using namespace days_gone_dlss::upscaler;
 
 void expect(bool condition, const char* message)
 {
@@ -55,7 +55,7 @@ void scales()
 
 void persistence(const fs::path& root)
 {
-    const auto path = root / L"upscaler.ini";
+    const auto path = root / L"DaysGoneDLSS.ini";
     expect(loadSettings(path) == Settings{}, "A first launch keeps the game's own anti-aliasing.");
     expect(!fs::exists(path), "Loading defaults must not create a settings file.");
 
@@ -89,21 +89,12 @@ void persistence(const fs::path& root)
         catch (const std::exception&) { rejected = true; }
         expect(rejected && loadSettings(path) == chosen, "Invalid settings cannot replace valid saved ones.");
     }
-
-    // Each local client keeps its own file.
-    fs::create_directories(root / L"client2");
-    fs::create_directories(root / L"client3");
-    saveSettings(root / L"client2" / L"upscaler.ini", {Quality::Dlaa});
-    saveSettings(root / L"client3" / L"upscaler.ini", {Quality::UltraPerformance, 0.75f, Preset::L});
-    expect(loadSettings(root / L"client2" / L"upscaler.ini").quality == Quality::Dlaa
-        && loadSettings(root / L"client3" / L"upscaler.ini").preset == Preset::L
-        && loadSettings(path) == chosen, "Clients restore only their own DLSS choices.");
 }
 }
 
 int main()
 {
-    const auto root = fs::temp_directory_path() / (L"dgmp-upscaler-test-" + std::to_wstring(GetCurrentProcessId())
+    const auto root = fs::temp_directory_path() / (L"days-gone-dlss-test-" + std::to_wstring(GetCurrentProcessId())
         + L"-" + std::to_wstring(GetTickCount64()));
     try
     {

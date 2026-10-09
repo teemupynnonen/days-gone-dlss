@@ -12,13 +12,11 @@ struct ID3D11Device;
 struct ID3D11DeviceContext;
 struct ID3D11PixelShader;
 struct ID3D11SamplerState;
-struct IDXGISwapChain;
 struct IUnknown;
 
-// NVIDIA DLSS in place of Bend's temporal AA. See docs/dlss.md for the render pipeline it hooks.
-// The core below is shared by two front ends that forward the immediate context's calls: the MP
-// mod's own hooks (upscaler_hooks.cpp) and the ReShade add-on (upscaler_addon.cpp).
-namespace dgmp::upscaler
+// NVIDIA DLSS in place of Bend's temporal AA; README.md describes the render pipeline it hooks.
+// The ReShade add-on (upscaler_addon.cpp) forwards the immediate context's calls to it.
+namespace days_gone_dlss::upscaler
 {
 struct Diagnostics
 {
@@ -30,7 +28,7 @@ struct Diagnostics
 struct Status
 {
     bool active{}, failed{}, ngxFailed{}, shadersReady{}, planned{}, running{}, wrappedContext{};
-    std::string failure, ngxMessage, lastFallback, frontEnd;
+    std::string failure, ngxMessage, lastFallback;
     unsigned renderWidth{}, renderHeight{}, outputWidth{}, outputHeight{};
     std::uint64_t evaluations{}, fallbacks{};
     float jitter[2]{};
@@ -42,8 +40,8 @@ struct Status
 
 // ---- Engine side ----
 // Outside the loader lock, after MinHook is initialized: settings, console variables, view hook.
-void initialize(std::uintptr_t imageBase, const std::filesystem::path& directory, std::string frontEnd);
-// Keeps the render scale and jitter in step with DLSS (game thread in the mod, present in the add-on).
+void initialize(std::uintptr_t imageBase, const std::filesystem::path& directory);
+// Keeps the render scale and jitter in step with DLSS; called at present.
 void tick() noexcept;
 // Restores the engine's render settings and stops replacing the game's TAA.
 void disable() noexcept;
@@ -51,7 +49,7 @@ void disable() noexcept;
 void resume() noexcept;
 // Waits briefly for the render thread to release DLSS, then removes the engine hook.
 void shutdown() noexcept;
-// True while a DLSS mode is selected; front ends attach to Direct3D lazily.
+// True while a DLSS mode is selected; the add-on attaches to Direct3D lazily.
 bool wanted() noexcept;
 
 // ---- Render side, on the thread executing Direct3D work ----
@@ -80,14 +78,4 @@ void applySettings(const Settings& settings);
 Diagnostics currentDiagnostics();
 void applyDiagnostics(const Diagnostics& diagnostics);
 void drawMenu(float scale);
-
-// ---- MP mod front end (upscaler_hooks.cpp) ----
-namespace mod
-{
-// Stands down when the ReShade add-on already provides DLSS in this process.
-void initialize(std::uintptr_t imageBase, const std::filesystem::path& directory);
-bool providedByAddon() noexcept;
-void present(IDXGISwapChain* swapChain) noexcept;
-void shutdown() noexcept;
-}
 }

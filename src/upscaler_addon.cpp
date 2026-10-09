@@ -1,5 +1,5 @@
-// ReShade add-on front end for the DLSS core (DaysGoneDLSS.addon64). ReShade's events replace the
-// MP mod's MinHook detours, and NGX receives ReShade's wrapped context so other add-ons that
+// ReShade add-on for the DLSS core (DaysGoneDLSS.addon64). ReShade's events feed the core the
+// game's Direct3D calls, and NGX receives ReShade's wrapped context so other add-ons that
 // follow DLSS evaluations, such as RenoDX, see it like a game's own DLSS.
 #include "upscaler.hpp"
 
@@ -11,8 +11,6 @@
 #include <reshade.hpp>
 #include <array>
 #include <cstdio>
-#include <cstdlib>
-#include <cwctype>
 #include <filesystem>
 #include <string>
 
@@ -22,7 +20,7 @@ extern "C" __declspec(dllexport) const char* DESCRIPTION =
 
 namespace
 {
-using namespace dgmp;
+using namespace days_gone_dlss;
 using namespace reshade::api;
 
 // ReShade's proxies return their native object for this interface (IID_UnwrappedObject).
@@ -48,28 +46,17 @@ bool supportedGame()
         && nt->OptionalHeader.SizeOfImage == 0x93F0000;
 }
 
-// Settings and logs follow the client profile: -saveddirsuffix=DGMP_<client>, otherwise "main".
+// Settings and the log live beside the add-on, as ReShade keeps its own.
 std::filesystem::path dataDirectory()
 {
-    std::wstring client = L"main";
-    const std::wstring line = GetCommandLineW();
-    const std::wstring key = L"-saveddirsuffix=dgmp_";
-    std::wstring lower(line);
-    for (auto& character : lower) character = static_cast<wchar_t>(std::towlower(character));
-    if (const auto found = lower.find(key); found != lower.npos)
+    std::wstring path(MAX_PATH, L'\0');
+    for (;;)
     {
-        auto end = found + key.size();
-        while (end < line.size() && (std::iswalnum(line[end]) || line[end] == L'_')) ++end;
-        if (end > found + key.size()) client = lower.substr(found + key.size(), end - found - key.size());
+        const auto length = GetModuleFileNameW(self, path.data(), static_cast<DWORD>(path.size()));
+        if (length == 0) return std::filesystem::current_path();
+        if (length < path.size()) return std::filesystem::path(path.substr(0, length)).parent_path();
+        path.resize(path.size() * 2);
     }
-    wchar_t* local{};
-    std::size_t length{};
-    std::filesystem::path root = _wdupenv_s(&local, &length, L"LOCALAPPDATA") == 0 && local ? local : L".";
-    free(local);
-    auto directory = root / L"DaysGoneMP" / client;
-    std::error_code ignored;
-    std::filesystem::create_directories(directory, ignored);
-    return directory;
 }
 
 // The command queue ReShade reports is a base inside its D3D11DeviceContext proxy; find the
@@ -103,7 +90,7 @@ void onInitCommandQueue(command_queue* queue)
 {
     if (queue->get_device()->get_api() != device_api::d3d11) return;
     auto* context = reinterpret_cast<ID3D11DeviceContext*>(queue->get_native());
-    // Keep the game's device: tools such as the MP mod's overlay create short-lived probe devices later.
+    // Keep the game's device: overlays and other tools can create short-lived probe devices later.
     if (!context || context->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE || nativeContext) return;
     nativeContext = context;
     nativeDevice = reinterpret_cast<ID3D11Device*>(queue->get_device()->get_native());
@@ -180,7 +167,7 @@ void onPresent(command_queue*, swapchain* chain, const rect*, const rect*, uint3
         {
             const auto status = MH_Initialize();
             if (status != MH_OK && status != MH_ERROR_ALREADY_INITIALIZED) throw std::runtime_error(MH_StatusToString(status));
-            upscaler::initialize(reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr)), dataDirectory(), "ReShade add-on");
+            upscaler::initialize(reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr)), dataDirectory());
             engineReady = true;
         }
         catch (const std::exception& error)

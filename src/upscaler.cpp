@@ -25,14 +25,14 @@
 #include <thread>
 #include <unordered_map>
 
-namespace dgmp::upscaler
+namespace days_gone_dlss::upscaler
 {
 namespace
 {
 using Microsoft::WRL::ComPtr;
 using Address = std::uintptr_t;
 
-// Steam build 19221447; docs/dlss.md records how each address was found.
+// Steam build 19221447; README.md lists what each address is.
 constexpr Address PreVisibilityFrameSetupRva = 0x20E6920;
 constexpr unsigned char PreVisibilityPrefix[]{0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x18, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55};
 // FMemStackBase page allocation for RHI commands (the slow path of every AllocCommand).
@@ -178,7 +178,7 @@ struct ViewCommand
 };
 
 // ---- DirectX (render thread) ----
-// Set while DLSS issues its own Direct3D calls, so front ends pass those straight through.
+// Set while DLSS issues its own Direct3D calls, so the add-on passes those straight through.
 thread_local int bypass{};
 struct Bypass
 {
@@ -194,7 +194,6 @@ ComPtr<ID3D11Device> device, ngxDevice;
 ComPtr<ID3D11Device1> device1;
 ComPtr<ID3D11DeviceContext1> context1;
 ComPtr<ID3D11DeviceContext> ngxContext;
-std::string frontEndName;
 ComPtr<ID3DDeviceContextState> ownState;
 ComPtr<ID3D11ComputeShader> prepareShader, compositeComputeShader;
 ComPtr<ID3D11PixelShader> compositePixelShader;
@@ -455,7 +454,7 @@ void remember(std::size_t slot, ComPtr<IUnknown> native, std::string status)
 
 // FD3D11ComputeShader/FD3D11PixelShader hold a TRefCountPtr to the native shader and, when the
 // engine keeps it, the bytecode. The cached FShaderResource points at the RHI shader at +8.
-// This finds shaders created before the front end could watch shader creation.
+// This finds shaders created before the add-on could watch shader creation.
 void identifyShaders()
 {
     const auto runtime = GetModuleHandleW(L"d3d11.dll");
@@ -660,7 +659,7 @@ bool initializeNgx()
         ngx.failed = true;
         ngx.message = needsDriver
             ? "DLSS needs NVIDIA driver " + std::to_string(major) + "." + std::to_string(minor) + " or newer."
-            : "DLSS is unavailable on this GPU (" + hex(static_cast<std::uint32_t>(initResult)) + "). nvngx_dlss.dll must be beside the mod.";
+            : "DLSS is unavailable on this GPU (" + hex(static_cast<std::uint32_t>(initResult)) + "). nvngx_dlss.dll must be beside the add-on.";
         log(ngx.message);
         // Shut NGX down so choosing a mode again repeats the whole check.
         if (ngx.parameters) NVSDK_NGX_D3D11_DestroyParameters(ngx.parameters);
@@ -1090,16 +1089,15 @@ void applyDiagnostics(const Diagnostics& options)
     diagnostics = options;
 }
 
-void initialize(std::uintptr_t base, const std::filesystem::path& directory, std::string frontEnd)
+void initialize(std::uintptr_t base, const std::filesystem::path& directory)
 {
     {
         std::lock_guard lock(logMutex);
-        logFile.open(directory / "upscaler.log", std::ios::app);
+        logFile.open(directory / "DaysGoneDLSS.log", std::ios::app);
     }
     imageBase = base;
     dataDirectory = directory;
-    settingsPath = directory / "upscaler.ini";
-    frontEndName = std::move(frontEnd);
+    settingsPath = directory / "DaysGoneDLSS.ini";
     try
     {
         std::lock_guard lock(settingsMutex);
@@ -1134,7 +1132,7 @@ void initialize(std::uintptr_t base, const std::filesystem::path& directory, std
     }
     releaseRequested = false;
     active = true;
-    log("Upscaler ready (" + frontEndName + "): r.ScreenPercentage " + std::to_string(percentage) + ", r.TemporalAASamples "
+    log("Upscaler ready: r.ScreenPercentage " + std::to_string(percentage) + ", r.TemporalAASamples "
         + std::to_string(samples) + ", mode " + std::string(label(currentSettings().quality)) + ".");
 }
 
@@ -1293,7 +1291,7 @@ void pixelShader(ID3D11DeviceContext* context, ID3D11PixelShader* shader) noexce
 }
 
 // DLSS renders below output resolution, so mipmapped textures need the matching negative LOD bias.
-// Material samplers are created at load time; front ends bind biased copies in their place.
+// Material samplers are created at load time; the add-on binds biased copies in their place.
 bool biasSamplers(ID3D11DeviceContext* context, unsigned count, ID3D11SamplerState* const* samplers,
     ID3D11SamplerState** biased) noexcept
 {
@@ -1349,13 +1347,13 @@ void shaderCreated(const void* code, std::size_t size, IUnknown* shader) noexcep
         }
 }
 
-// Developer override: upscaler-diagnostics.ini beside the settings is re-read when it changes, so
+// Developer override: DaysGoneDLSS-diagnostics.ini beside the settings is re-read when it changes, so
 // jitter and motion conventions can be compared on a running game without the overlay.
 static void reloadDiagnostics()
 {
     static std::filesystem::file_time_type seen{};
     std::error_code error;
-    const auto path = dataDirectory / "upscaler-diagnostics.ini";
+    const auto path = dataDirectory / "DaysGoneDLSS-diagnostics.ini";
     const auto modified = std::filesystem::last_write_time(path, error);
     if (error || modified == seen) return;
     seen = modified;
@@ -1435,7 +1433,6 @@ Status status()
     }
     result.running = evaluations && lastEvaluated + 2 >= frame.index;
     result.wrappedContext = ngxContext && ngxContext.Get() != immediate;
-    result.frontEnd = frontEndName;
     result.lastFallback = lastFallback;
     result.evaluations = evaluations;
     result.fallbacks = fallbacks;
