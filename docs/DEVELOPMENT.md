@@ -47,8 +47,12 @@ and local settings are excluded. ReShade is installed separately by the player.
 Days Gone runs Unreal 4.11 with Bend's own post-processing on Direct3D 11:
 
 1. `FDepthResolveCS` combines device depth with the GBuffer velocity into a packed `R32_UINT`
-   motion texture: 14-bit X, 13-bit Y of the history UV offset, plus flags. Zero means no
-   usable history. Camera motion comes from depth, so it is complete.
+   motion texture for the TAA: 14-bit X, 13-bit Y of the history UV offset (about 0.06 pixels
+   at 4K), dilated to the nearest depth in 3×3, plus flags. Zero means no usable history:
+   off-screen, or faster than a dithered 6.7 to 11 percent of the screen per frame. The top two
+   bits count matching previous-frame depths and are zero where history is rejected, including
+   pixels marked as moving (bit 31 of its `t0` input) that drew no object velocity. Camera
+   motion comes from depth and the view's previous matrices, so it is complete.
 2. Tonemapping writes a gamma-2 (square-root) encoded colour target, `R16G16B16A16_FLOAT`.
 3. The TAA job runs after Slate has drawn the UI into its own target. At full resolution
    `TBendSMAATemporalAACS_T1X_0000` resolves TAA in YCoCg, then squares the colour and applies
@@ -76,10 +80,18 @@ percent screen percentage. The jitter is added to the projection with +Y up.
   executes immediately before that frame's TAA.
 - **TAA replacement.** ReShade's `dispatch`, `draw`, `bind_pipeline` and `push_descriptors`
   events recognise the game's shaders. They are identified by their DXBC checksum when created
-  (`init_pipeline`); the game creates each more than once, so every copy is recorded. In a
-  separate `ID3DDeviceContextState`, so the engine's cached bindings are untouched, a prepare
-  shader decodes the motion texture exactly as the TAA does, copies depth and colour, and NGX
-  evaluates DLSS with inverted depth and render-resolution motion vectors (`MVLowRes`, in render
+  (`init_pipeline`); the game creates each more than once, so every copy is recorded. All
+  add-on passes run in a separate `ID3DDeviceContextState`, so the engine's cached bindings are
+  untouched.
+- **Motion.** The packed motion suits the TAA but not DLSS, which shows its quantization,
+  dilation and zeroed pixels as warping. Beside `FDepthResolveCS`, while its inputs are bound,
+  a compute shader repeats the resolve's motion maths per pixel in float: GBuffer velocity
+  (UE4's `DecodeVelocityFromTexture`) or camera reprojection from depth, back to render pixels
+  through the resolve's pixel to screen mapping. It also copies depth and writes the TAA's
+  history rejection for moving pixels without object velocity as DLSS's current-colour bias
+  mask.
+- **Evaluation.** At the TAA dispatch a prepare shader copies the colour, and NGX evaluates
+  DLSS with inverted depth and undilated render-resolution motion vectors (`MVLowRes`, in render
   pixels). At full resolution a compute shader then performs the
   TAA's composite into its output. When upscaling, the game's composite draw runs with a
   replacement pixel shader and the DLSS output in place of its history. Both composites read

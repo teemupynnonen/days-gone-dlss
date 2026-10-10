@@ -92,7 +92,7 @@ void drawMenu(float scale)
     ImGui::SameLine();
     diagnosticsChanged |= ImGui::Checkbox("Invert jitter Y", &options.invertJitterY);
     diagnosticsChanged |= ImGui::Checkbox("Motion vectors include jitter", &options.jitteredMotion);
-    const char* views[]{"Final image", "Motion vectors", "Depth", "DLSS input colour"};
+    const char* views[]{"Final image", "Motion vectors", "Depth", "DLSS input colour", "Current colour bias"};
     ImGui::SetNextItemWidth(220 * scale);
     diagnosticsChanged |= ImGui::Combo("Debug view", &options.debugView, views, static_cast<int>(std::size(views)));
     if (diagnosticsChanged) applyDiagnostics(options);

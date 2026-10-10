@@ -76,54 +76,82 @@ float3 Rcas(float3 b, float3 d, float3 e, float3 f, float3 h, float sharpness, b
     return hdr ? result / (1 - min(result, 0.99999)) : result;
 }
 
-// Diagnostic views: 1 motion vectors, 2 depth, 3 DLSS input colour.
-float3 DebugColor(uint view, float2 motion, float depth, float3 input)
+// Diagnostic views: 1 motion vectors, 2 depth, 3 DLSS input colour, 4 current-colour bias in red.
+float3 DebugColor(uint view, float2 motion, float depth, float3 input, float bias)
 {
     if (view == 1) return float3(saturate(0.5 + motion * 0.05), saturate(length(motion) * 0.05));
     if (view == 2) return saturate(depth * 50).xxx;
+    if (view == 4) return lerp(saturate(input) * 0.5, float3(1, 0, 0), bias);
     return input;
 }
 )";
 
-// Converts the game's packed motion, device depth and colour into DLSS inputs at render resolution.
-inline constexpr char Prepare[] = R"(
-cbuffer TemporalParameters : register(b0) { float4 Temporal[11]; };
-cbuffer GlobalParameters : register(b1) { float4 Global[11]; };
-cbuffer PrepareParameters : register(b2)
-{
-    uint2 RenderSize;
-    uint UvRegister;      // .zw: reciprocal of the input buffer size
-    uint HistoryRegister; // .xy scale the current UV, .zw map it to history UV
-    uint CheckerRegister; // .x scales X for checkerboard layouts
-    uint Linear;          // Square the colour for DLSS's HDR mode
-    uint2 Padding;
-};
-Texture2D<uint> Motion : register(t0);
-Texture2D<float4> Color : register(t1);
-Texture2D<float> Depth : register(t2);
+// Runs beside FDepthResolveCS on its inputs: device depth, GBuffer velocity and its reprojection.
+// The resolve packs motion for the game's TAA, dilated to the nearest depth in 3x3, quantized to
+// about 0.06 pixels at 4K and zero where it is off-screen or fast. DLSS shows each of those as
+// warping, so this repeats the resolve's motion maths per pixel in full precision.
+//
+// The resolve also has the TAA drop history where a pixel is marked as moving (bit 31 of t0) but
+// drew no object velocity, such as a character the velocity pass skipped. DLSS gets the same
+// pixels as its current-colour bias.
+inline constexpr char Motion[] = R"(
+cbuffer ResolveParameters : register(b0) { float4 Resolve[13]; };
+Texture2D<uint> Pixels : register(t0);
+Texture2D<float> Depth : register(t1);
+Texture2D<float2> Velocity : register(t3);
 RWTexture2D<float2> OutMotion : register(u0);
 RWTexture2D<float> OutDepth : register(u1);
-RWTexture2D<float4> OutColor : register(u2);
+RWTexture2D<float> OutBias : register(u2);
+
+// UE4's DecodeVelocityFromTexture; Bend keeps a flag in the lowest bit of Y.
+float2 DecodeVelocity(float2 encoded)
+{
+    const float scale = 1 / (0.499 * 0.5);
+    float y = (uint(encoded.y * 65535 + 0.5) & ~1u) - 0.5;
+    return float2(encoded.x, y / 65535) * scale - 32767.0 / 65535 * scale;
+}
+
+[numthreads(8, 8, 1)]
+void main(uint2 thread : SV_DispatchThreadID)
+{
+    int4 view = asint(Resolve[7]); // Min and max in buffer pixels
+    int2 pixel = int2(thread) + view.xy;
+    if (any(pixel >= view.zw)) return;
+    // .y drops all motion, .z drops object velocity and, unless .w, camera motion too.
+    uint4 flags = asuint(Resolve[5]);
+    float depth = Depth[pixel];
+    float2 velocity = Velocity[pixel];
+    float2 screen = pixel * Resolve[8].xy + Resolve[8].zw;
+    bool objectVelocity = velocity.x > 0 && !flags.y && !flags.z;
+    float2 motion = 0; // Screen position delta from this frame to the previous one
+    if (objectVelocity) motion = -DecodeVelocity(velocity);
+    else if (!flags.y && (!flags.z || flags.w))
+    {
+        float4 previous = screen.x * Resolve[9] + screen.y * Resolve[10] + max(depth, 1e-11) * Resolve[11] + Resolve[12];
+        motion = previous.xy / previous.w - screen;
+    }
+    // Back to render pixels through the inverse of the pixel to screen mapping.
+    OutMotion[thread] = motion / Resolve[8].xy;
+    OutDepth[thread] = depth;
+    OutBias[thread] = (Pixels[pixel] & 0x80000000) && !objectVelocity && !flags.z ? 1 : 0;
+}
+)";
+
+// Converts the game's colour into the DLSS input at render resolution.
+inline constexpr char Prepare[] = R"(
+cbuffer PrepareParameters : register(b0)
+{
+    uint2 RenderSize;
+    uint Linear; // Square the colour for DLSS's HDR mode
+    uint Padding;
+};
+Texture2D<float4> Color : register(t0);
+RWTexture2D<float4> OutColor : register(u0);
 
 [numthreads(8, 8, 1)]
 void main(uint2 pixel : SV_DispatchThreadID)
 {
     if (any(pixel >= RenderSize)) return;
-    float2 inverseSize = Temporal[UvRegister].zw;
-    float2 uv = (pixel + 0.5) * inverseSize;
-    uint packed = Motion[pixel];
-    float2 motion = 0;
-    // Zero marks pixels without usable history (off-screen or too fast); the TAA rejects them too.
-    if (packed != 0)
-    {
-        // 14-bit X and 13-bit Y, the same decode as TemporalAACS_T1X.
-        float2 encoded = float2(packed & 0x3fff, (packed >> 14) & 0x1fff) * Global[10].zw;
-        float4 history = Temporal[HistoryRegister];
-        float2 previous = ((encoded - 0.5) * 0.25 + uv * history.xy * float2(Temporal[CheckerRegister].x, 1)) * history.zw;
-        motion = (previous - uv) / inverseSize;
-    }
-    OutMotion[pixel] = motion;
-    OutDepth[pixel] = Depth[pixel];
     float4 color = Color[pixel];
     OutColor[pixel] = Linear ? float4(color.rgb * color.rgb, color.a) : color;
 }
@@ -147,6 +175,7 @@ Texture2D<float4> Auxiliary : register(t2);
 Texture2D<float2> MotionInput : register(t3);
 Texture2D<float> DepthInput : register(t4);
 Texture2D<float4> ColorInput : register(t5);
+Texture2D<float> BiasInput : register(t6);
 SamplerState Bilinear : register(s0);
 
 float3 Encoded(int2 local, int2 last)
@@ -170,7 +199,8 @@ float4 main(float2 uv : TEXCOORD0, float4 position : SV_Position) : SV_Target
     if (DebugView != 0)
     {
         int3 source = int3(int2(local * RenderScale), 0);
-        encoded = DebugColor(DebugView, MotionInput.Load(source), DepthInput.Load(source), ColorInput.Load(source).rgb);
+        encoded = DebugColor(DebugView, MotionInput.Load(source), DepthInput.Load(source), ColorInput.Load(source).rgb,
+            BiasInput.Load(source));
         color = encoded * encoded;
     }
     else if (asuint(Hdr ? Composite[5].z : Composite[5].x) != 0)
@@ -205,6 +235,7 @@ Texture2D<float4> Upscaled : register(t1);
 Texture2D<float2> MotionInput : register(t3);
 Texture2D<float> DepthInput : register(t4);
 Texture2D<float4> ColorInput : register(t5);
+Texture2D<float> BiasInput : register(t6);
 RWTexture2D<float4> Output : register(u0);
 
 float3 Encoded(int2 pixel)
@@ -222,7 +253,7 @@ void main(uint2 pixel : SV_DispatchThreadID)
     bool linearColor = Linear != 0;
     if (DebugView != 0)
     {
-        color = DebugColor(DebugView, MotionInput[pixel], DepthInput[pixel], ColorInput[pixel].rgb);
+        color = DebugColor(DebugView, MotionInput[pixel], DepthInput[pixel], ColorInput[pixel].rgb, BiasInput[pixel]);
         linearColor = false;
     }
     else if (Sharpness > 0)

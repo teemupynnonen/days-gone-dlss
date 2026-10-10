@@ -90,12 +90,7 @@ constexpr ShaderSlot Shaders[]{
 };
 constexpr std::size_t NoSlot = std::size(Shaders);
 
-// Where each TAA variant keeps its inputs and the constants the motion decode needs. The HDR
-// variant inserts its brightness constants at register 5.
-struct TemporalLayout { UINT motionSlot, colorSlot, uvRegister, historyRegister, checkerRegister; };
-constexpr TemporalLayout FullLayout{1, 2, 5, 8, 9}, FullHdrLayout{1, 2, 6, 9, 10}, UpscaleLayout{0, 1, 0, 3, 4};
-
-struct PrepareConstants { std::uint32_t renderSize[2], uvRegister, historyRegister, checkerRegister, linear, padding[2]; };
+struct PrepareConstants { std::uint32_t renderSize[2], linear, padding; };
 struct PixelConstants { std::int32_t outputOrigin[2]; std::uint32_t debugView, hdr; float renderScale[2]; std::uint32_t linear; float sharpness; };
 struct ComputeConstants { std::uint32_t outputSize[2], debugView, hdr, linear; float sharpness; std::uint32_t padding[2]; };
 
@@ -195,10 +190,10 @@ ComPtr<ID3D11Device1> device1;
 ComPtr<ID3D11DeviceContext1> context1;
 ComPtr<ID3D11DeviceContext> ngxContext;
 ComPtr<ID3DDeviceContextState> ownState;
-ComPtr<ID3D11ComputeShader> prepareShader, compositeComputeShader;
+ComPtr<ID3D11ComputeShader> motionShader, prepareShader, compositeComputeShader;
 ComPtr<ID3D11PixelShader> compositePixelShader;
 ComPtr<ID3D11Buffer> prepareConstants, pixelConstants, computeConstants;
-Target motionTarget, depthTarget, colorTarget, outputTarget;
+Target motionTarget, depthTarget, biasTarget, colorTarget, outputTarget;
 // Identified game shaders: read lock-free on every call, written under the mutex from the render
 // thread or whichever thread the game creates shaders on.
 // The game can create a shader more than once with the same bytecode, so each slot keeps every
@@ -241,7 +236,7 @@ struct Ngx
 struct Frame
 {
     std::uint64_t index{};
-    ComPtr<ID3D11ShaderResourceView> depth;
+    bool motion{}; // Motion and depth were computed at this frame's depth resolve
     bool upscaled{};
     bool linear{}; // DLSS ran in HDR mode on linear colour
     std::int32_t outputOrigin[2]{};
@@ -581,7 +576,9 @@ ComPtr<ID3D11Buffer> constantBuffer(UINT size)
 
 void createPipeline()
 {
-    auto code = compile(shaders::Prepare, "dlss-prepare", "cs_5_0");
+    auto code = compile(shaders::Motion, "dlss-motion", "cs_5_0");
+    check(device->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, motionShader.GetAddressOf()), "Creating the DLSS motion shader");
+    code = compile(shaders::Prepare, "dlss-prepare", "cs_5_0");
     check(device->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, prepareShader.GetAddressOf()), "Creating the DLSS input shader");
     code = compile(shaders::CompositeCompute, "dlss-composite-cs", "cs_5_0");
     check(device->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, compositeComputeShader.GetAddressOf()), "Creating the DLAA composite shader");
@@ -764,7 +761,7 @@ NVSDK_NGX_Result evaluateDlss(ID3D11DeviceContext* context, const NVSDK_NGX_D3D1
     NVSDK_NGX_Parameter_SetD3d11Resource(parameters, NVSDK_NGX_Parameter_MotionVectors, evaluation.pInMotionVectors);
     NVSDK_NGX_Parameter_SetD3d11Resource(parameters, NVSDK_NGX_Parameter_TransparencyMask, nullptr);
     NVSDK_NGX_Parameter_SetD3d11Resource(parameters, NVSDK_NGX_Parameter_ExposureTexture, nullptr);
-    NVSDK_NGX_Parameter_SetD3d11Resource(parameters, NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_Mask, nullptr);
+    NVSDK_NGX_Parameter_SetD3d11Resource(parameters, NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_Mask, evaluation.pInBiasCurrentColorMask);
     NVSDK_NGX_Parameter_SetF(parameters, NVSDK_NGX_Parameter_Jitter_Offset_X, evaluation.InJitterOffsetX);
     NVSDK_NGX_Parameter_SetF(parameters, NVSDK_NGX_Parameter_Jitter_Offset_Y, evaluation.InJitterOffsetY);
     NVSDK_NGX_Parameter_SetF(parameters, NVSDK_NGX_Parameter_Sharpness, 0.0f);
@@ -775,6 +772,7 @@ NVSDK_NGX_Result evaluateDlss(ID3D11DeviceContext* context, const NVSDK_NGX_D3D1
     for (const char* base : {NVSDK_NGX_Parameter_DLSS_Input_Color_Subrect_Base_X, NVSDK_NGX_Parameter_DLSS_Input_Color_Subrect_Base_Y,
         NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_X, NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_Y,
         NVSDK_NGX_Parameter_DLSS_Input_MV_SubrectBase_X, NVSDK_NGX_Parameter_DLSS_Input_MV_SubrectBase_Y,
+        NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_SubrectBase_X, NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_SubrectBase_Y,
         NVSDK_NGX_Parameter_DLSS_Output_Subrect_Base_X, NVSDK_NGX_Parameter_DLSS_Output_Subrect_Base_Y})
         NVSDK_NGX_Parameter_SetUI(parameters, base, 0);
     NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, evaluation.InRenderSubrectDimensions.Width);
@@ -818,6 +816,58 @@ std::string describe(ID3D11ShaderResourceView* view)
         + std::to_string(description.Format) + ", view format " + std::to_string(viewDescription.Format);
 }
 
+// Runs DLSS's Direct3D work in its own context state, so the engine's cached bindings are untouched.
+template<class Work> void inOwnState(ID3D11DeviceContext* context, Work&& work)
+{
+    Bypass guard;
+    ComPtr<ID3DDeviceContextState> gameState;
+    context1->SwapDeviceContextState(ownState.Get(), gameState.GetAddressOf());
+    const auto restore = [&]
+    {
+        context->ClearState();
+        context1->SwapDeviceContextState(gameState.Get(), nullptr);
+    };
+    try { work(); }
+    catch (...)
+    {
+        restore();
+        throw;
+    }
+    restore();
+}
+
+// FDepthResolveCS packs its motion for the game's TAA in a form DLSS cannot use (shaders::Motion),
+// so this repeats the resolve's motion maths on its inputs while they are bound.
+void computeMotion(ID3D11DeviceContext* context, UINT groupsX, UINT groupsY)
+{
+    frame.motion = false;
+    if (!plan) return;
+    ComPtr<ID3D11Buffer> parameters;
+    ComPtr<ID3D11ShaderResourceView> pixels, depth, velocity;
+    context->CSGetConstantBuffers(0, 1, parameters.GetAddressOf());
+    context->CSGetShaderResources(0, 1, pixels.GetAddressOf());
+    context->CSGetShaderResources(1, 1, depth.GetAddressOf());
+    context->CSGetShaderResources(3, 1, velocity.GetAddressOf());
+    if (!parameters || !pixels || !depth || !velocity) return;
+    logOnce("inputs-motion", "Motion inputs: pixel flags " + describe(pixels.Get()) + "; depth " + describe(depth.Get())
+        + "; velocity " + describe(velocity.Get()) + ".");
+
+    ensureTarget(motionTarget, plan->renderWidth, plan->renderHeight, DXGI_FORMAT_R16G16_FLOAT, "Creating the DLSS motion texture");
+    ensureTarget(depthTarget, plan->renderWidth, plan->renderHeight, DXGI_FORMAT_R32_FLOAT, "Creating the DLSS depth texture");
+    ensureTarget(biasTarget, plan->renderWidth, plan->renderHeight, DXGI_FORMAT_R8_UNORM, "Creating the DLSS colour bias texture");
+    inOwnState(context, [&]
+    {
+        ID3D11ShaderResourceView* inputs[]{pixels.Get(), depth.Get(), nullptr, velocity.Get()};
+        ID3D11UnorderedAccessView* outputs[]{motionTarget.access.Get(), depthTarget.access.Get(), biasTarget.access.Get()};
+        context->CSSetShader(motionShader.Get(), nullptr, 0);
+        context->CSSetConstantBuffers(0, 1, parameters.GetAddressOf());
+        context->CSSetShaderResources(0, static_cast<UINT>(std::size(inputs)), inputs);
+        context->CSSetUnorderedAccessViews(0, static_cast<UINT>(std::size(outputs)), outputs, nullptr);
+        context->Dispatch(groupsX, groupsY, 1);
+    });
+    frame.motion = true;
+}
+
 bool replaceTemporal(ID3D11DeviceContext* context, std::size_t slot, UINT groupsX, UINT groupsY)
 {
     const auto pass = Shaders[slot].pass;
@@ -844,36 +894,34 @@ bool replaceTemporal(ID3D11DeviceContext* context, std::size_t slot, UINT groups
         return fallback("the render size " + std::to_string(renderWidth) + "x" + std::to_string(renderHeight) + " is above the DLSS input size");
     if (pass == Pass::TemporalFull && (renderWidth != outputWidth || renderHeight != outputHeight))
         return fallback("full-resolution TAA with a scaled view");
-    if (!frame.depth) return fallback("no depth this frame");
+    // A size absorbed above outgrows the motion texture from the depth resolve, once per mode change.
+    if (!frame.motion || motionTarget.width != plan->renderWidth || motionTarget.height != plan->renderHeight)
+        return fallback("no motion vectors this frame");
     if (pass == Pass::TemporalUpscale && !identified(Pass::Composite, hdr)) return fallback("the upscale composite pass is not identified yet");
 
-    const auto& layout = pass == Pass::TemporalFull ? (hdr ? FullHdrLayout : FullLayout) : UpscaleLayout;
-    ComPtr<ID3D11ShaderResourceView> motion, color, overlay;
-    ComPtr<ID3D11Buffer> temporal, global;
+    // The full-resolution TAA also composites the UI into its output, with the constants the replacement reuses.
+    ComPtr<ID3D11ShaderResourceView> color, overlay;
+    ComPtr<ID3D11Buffer> temporal;
     ComPtr<ID3D11UnorderedAccessView> gameOutput;
-    context->CSGetShaderResources(layout.motionSlot, 1, motion.GetAddressOf());
-    context->CSGetShaderResources(layout.colorSlot, 1, color.GetAddressOf());
-    context->CSGetConstantBuffers(0, 1, temporal.GetAddressOf());
-    context->CSGetConstantBuffers(1, 1, global.GetAddressOf());
+    context->CSGetShaderResources(pass == Pass::TemporalFull ? 2 : 1, 1, color.GetAddressOf());
     if (pass == Pass::TemporalFull)
     {
         context->CSGetShaderResources(0, 1, overlay.GetAddressOf());
+        context->CSGetConstantBuffers(0, 1, temporal.GetAddressOf());
         context->CSGetUnorderedAccessViews(0, 1, gameOutput.GetAddressOf());
     }
-    if (!motion || !color || !temporal || !global || (pass == Pass::TemporalFull && (!overlay || !gameOutput)))
+    if (!color || (pass == Pass::TemporalFull && (!overlay || !temporal || !gameOutput)))
         return fallback("the TAA bindings are incomplete");
     logOnce(pass == Pass::TemporalFull ? "inputs-full" : "inputs-upscale", std::string("DLSS inputs (")
-        + (pass == Pass::TemporalFull ? "full" : "upscale") + " TAA): colour " + describe(color.Get()) + "; motion "
-        + describe(motion.Get()) + "; depth " + describe(frame.depth.Get()) + "; render " + std::to_string(renderWidth) + "x"
-        + std::to_string(renderHeight) + " -> " + std::to_string(outputWidth) + "x" + std::to_string(outputHeight) + ".");
+        + (pass == Pass::TemporalFull ? "full" : "upscale") + " TAA): colour " + describe(color.Get()) + "; render "
+        + std::to_string(renderWidth) + "x" + std::to_string(renderHeight) + " -> " + std::to_string(outputWidth) + "x"
+        + std::to_string(outputHeight) + ".");
 
-    ensureTarget(motionTarget, plan->renderWidth, plan->renderHeight, DXGI_FORMAT_R16G16_FLOAT, "Creating the DLSS motion texture");
-    ensureTarget(depthTarget, plan->renderWidth, plan->renderHeight, DXGI_FORMAT_R32_FLOAT, "Creating the DLSS depth texture");
     ensureTarget(colorTarget, plan->renderWidth, plan->renderHeight, DXGI_FORMAT_R16G16B16A16_FLOAT, "Creating the DLSS colour texture");
     ensureTarget(outputTarget, plan->outputWidth, plan->outputHeight, DXGI_FORMAT_R16G16B16A16_FLOAT, "Creating the DLSS output texture");
 
-    // The motion vectors are at render resolution. Without MVLowRes DLSS reads them as dilated
-    // output-resolution vectors, which only matches when it does not upscale.
+    // The motion vectors are per render pixel and undilated. Without MVLowRes DLSS reads them as
+    // dilated output-resolution vectors.
     int flags = NVSDK_NGX_DLSS_Feature_Flags_DepthInverted | NVSDK_NGX_DLSS_Feature_Flags_MVLowRes;
     if (options.jitteredMotion) flags |= NVSDK_NGX_DLSS_Feature_Flags_MVJittered;
     if (hdr) flags |= NVSDK_NGX_DLSS_Feature_Flags_IsHDR;
@@ -881,20 +929,16 @@ bool replaceTemporal(ID3D11DeviceContext* context, std::size_t slot, UINT groups
     QueryPerformanceCounter(&now);
     QueryPerformanceFrequency(&frequency);
 
-    Bypass guard;
-    ComPtr<ID3DDeviceContextState> gameState;
-    context1->SwapDeviceContextState(ownState.Get(), gameState.GetAddressOf());
-    try
+    inOwnState(context, [&]
     {
-        const PrepareConstants prepare{{renderWidth, renderHeight}, layout.uvRegister, layout.historyRegister, layout.checkerRegister, hdr, {}};
+        const PrepareConstants prepare{{renderWidth, renderHeight}, hdr, {}};
         context->UpdateSubresource(prepareConstants.Get(), 0, nullptr, &prepare, 0, 0);
-        ID3D11Buffer* prepareBuffers[]{temporal.Get(), global.Get(), prepareConstants.Get()};
-        ID3D11ShaderResourceView* prepareInputs[]{motion.Get(), color.Get(), frame.depth.Get()};
-        ID3D11UnorderedAccessView* prepareOutputs[]{motionTarget.access.Get(), depthTarget.access.Get(), colorTarget.access.Get()};
+        ID3D11ShaderResourceView* prepareInput = color.Get();
+        ID3D11UnorderedAccessView* prepareOutput = colorTarget.access.Get();
         context->CSSetShader(prepareShader.Get(), nullptr, 0);
-        context->CSSetConstantBuffers(0, 3, prepareBuffers);
-        context->CSSetShaderResources(0, 3, prepareInputs);
-        context->CSSetUnorderedAccessViews(0, 3, prepareOutputs, nullptr);
+        context->CSSetConstantBuffers(0, 1, prepareConstants.GetAddressOf());
+        context->CSSetShaderResources(0, 1, &prepareInput);
+        context->CSSetUnorderedAccessViews(0, 1, &prepareOutput, nullptr);
         context->Dispatch(groupsX, groupsY, 1);
         context->ClearState();
 
@@ -906,6 +950,7 @@ bool replaceTemporal(ID3D11DeviceContext* context, std::size_t slot, UINT groups
         evaluation.Feature.pInOutput = outputTarget.texture.Get();
         evaluation.pInDepth = depthTarget.texture.Get();
         evaluation.pInMotionVectors = motionTarget.texture.Get();
+        evaluation.pInBiasCurrentColorMask = biasTarget.texture.Get();
         // Bend adds the jitter to the projection with +Y up; DLSS takes render pixels with +Y down.
         evaluation.InJitterOffsetX = view.jitter[0] * (options.invertJitterX ? -1.0f : 1.0f);
         evaluation.InJitterOffsetY = view.jitter[1] * (options.invertJitterY ? -1.0f : 1.0f);
@@ -928,24 +973,16 @@ bool replaceTemporal(ID3D11DeviceContext* context, std::size_t slot, UINT groups
             context->UpdateSubresource(computeConstants.Get(), 0, nullptr, &output, 0, 0);
             ID3D11Buffer* buffers[]{temporal.Get(), computeConstants.Get()};
             ID3D11ShaderResourceView* inputs[]{overlay.Get(), outputTarget.view.Get(), nullptr,
-                motionTarget.view.Get(), depthTarget.view.Get(), colorTarget.view.Get()};
+                motionTarget.view.Get(), depthTarget.view.Get(), colorTarget.view.Get(), biasTarget.view.Get()};
             ID3D11UnorderedAccessView* outputs[]{gameOutput.Get()};
             context->CSSetShader(compositeComputeShader.Get(), nullptr, 0);
             context->CSSetConstantBuffers(0, 2, buffers);
-            context->CSSetShaderResources(0, 6, inputs);
+            context->CSSetShaderResources(0, static_cast<UINT>(std::size(inputs)), inputs);
             context->CSSetUnorderedAccessViews(0, 1, outputs, nullptr);
             context->Dispatch((outputWidth + 7) / 8, (outputHeight + 7) / 8, 1);
-            context->ClearState();
         }
         ngx.reset = false;
-    }
-    catch (...)
-    {
-        context->ClearState();
-        context1->SwapDeviceContextState(gameState.Get(), nullptr);
-        throw;
-    }
-    context1->SwapDeviceContextState(gameState.Get(), nullptr);
+    });
 
     lastEvaluated = frame.index;
     lastEvaluation = now;
@@ -967,8 +1004,8 @@ template<class Call> void composite(ID3D11DeviceContext* context, Call&& call)
 {
     Bypass guard;
     const auto options = currentDiagnostics();
-    // Slots t1..t5: the game binds its history at t1 and an auxiliary history at t2.
-    std::array<ID3D11ShaderResourceView*, 5> gameInputs{};
+    // Slots t1..t6: the game binds its history at t1 and an auxiliary history at t2.
+    std::array<ID3D11ShaderResourceView*, 6> gameInputs{};
     ID3D11Buffer* gameConstants{};
     ID3D11PixelShader* gamePixelShader = currentPixelShader;
     const auto slot = slotOf(gamePixelShader);
@@ -980,7 +1017,8 @@ template<class Call> void composite(ID3D11DeviceContext* context, Call&& call)
     const PixelConstants constants{{frame.outputOrigin[0], frame.outputOrigin[1]}, static_cast<std::uint32_t>(options.debugView), hdr,
         {frame.renderScale[0], frame.renderScale[1]}, frame.linear, frame.sharpness};
     context->UpdateSubresource(pixelConstants.Get(), 0, nullptr, &constants, 0, 0);
-    ID3D11ShaderResourceView* ours[]{outputTarget.view.Get(), gameInputs[1], motionTarget.view.Get(), depthTarget.view.Get(), colorTarget.view.Get()};
+    ID3D11ShaderResourceView* ours[]{outputTarget.view.Get(), gameInputs[1], motionTarget.view.Get(), depthTarget.view.Get(),
+        colorTarget.view.Get(), biasTarget.view.Get()};
     ID3D11Buffer* buffer = pixelConstants.Get();
     context->PSSetShaderResources(1, static_cast<UINT>(std::size(ours)), ours);
     context->PSSetConstantBuffers(1, 1, &buffer);
@@ -1012,7 +1050,7 @@ void releaseRenderer()
     ngx.initialized = false;
     frame = {};
     biasedSamplers.clear();
-    motionTarget = depthTarget = colorTarget = outputTarget = {};
+    motionTarget = depthTarget = biasTarget = colorTarget = outputTarget = {};
     {
         std::lock_guard lock(shaderMutex);
         for (std::size_t slot = 0; slot < std::size(Shaders); ++slot)
@@ -1028,6 +1066,7 @@ void releaseRenderer()
     }
     currentPixelShader = nullptr;
     immediate = nullptr;
+    motionShader.Reset();
     prepareShader.Reset();
     compositeComputeShader.Reset();
     compositePixelShader.Reset();
@@ -1276,11 +1315,7 @@ bool dispatch(ID3D11DeviceContext* context, unsigned x, unsigned y, unsigned z) 
         const auto slot = slotOf(shader.Get());
         const auto pass = slot == NoSlot ? Pass::None : Shaders[slot].pass;
         if (pass != Pass::None) ++recognisedDispatches;
-        if (pass == Pass::DepthResolve)
-        {
-            frame.depth.Reset();
-            context->CSGetShaderResources(1, 1, frame.depth.GetAddressOf());
-        }
+        if (pass == Pass::DepthResolve) computeMotion(context, x, y);
         else if ((pass == Pass::TemporalFull || pass == Pass::TemporalUpscale) && z == 1)
         {
             if (pass == Pass::TemporalFull) hdrOutput = Shaders[slot].hdr;
@@ -1390,7 +1425,7 @@ static void reloadDiagnostics()
         if (key == "invert_jitter_x") options.invertJitterX = value != 0;
         else if (key == "invert_jitter_y") options.invertJitterY = value != 0;
         else if (key == "jittered_motion") options.jitteredMotion = value != 0;
-        else if (key == "debug_view" && value >= 0 && value <= 3) options.debugView = value;
+        else if (key == "debug_view" && value >= 0 && value <= 4) options.debugView = value;
         else if (key == "game_taa") options.gameTemporalAA = value != 0;
     }
     applyDiagnostics(options);
