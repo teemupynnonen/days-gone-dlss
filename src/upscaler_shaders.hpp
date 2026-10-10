@@ -57,6 +57,25 @@ float3 EncodePq(float3 color)
     return pow((18.8515625 * p + 0.8359375) / (18.6875 * p + 1), 78.84375);
 }
 
+// AMD FidelityFX RCAS (FsrRcasF in ffx_fsr1.h, MIT: AMD-FidelityFX-LICENSE.txt) on square-root encoded
+// colour: b, d, f and h are the pixels above, left, right and below e. Its noise filter is left out
+// because grain is applied afterwards. RCAS limits sharpening to the 0 to 1 range, which HDR exceeds,
+// so HDR is sharpened as x / (1 + x). Sharpness scales the negative lobe; 0 would return e.
+float3 RcasIn(float3 x, bool hdr) { return hdr ? x / (1 + x) : saturate(x); }
+
+float3 Rcas(float3 b, float3 d, float3 e, float3 f, float3 h, float sharpness, bool hdr)
+{
+    b = RcasIn(b, hdr); d = RcasIn(d, hdr); e = RcasIn(e, hdr); f = RcasIn(f, hdr); h = RcasIn(h, hdr);
+    float3 low = min(min(b, d), min(f, h)), high = max(max(b, d), max(f, h));
+    // The lobe at which each channel would clip below 0 or above 1.
+    float3 hitMin = min(low, e) / max(4 * high, 1.0 / 65536);
+    float3 hitMax = (1 - max(high, e)) / min(4 * low - 4, -1.0 / 65536);
+    float3 lobes = max(-hitMin, hitMax);
+    float lobe = max(-(0.25 - 1.0 / 16), min(max(lobes.r, max(lobes.g, lobes.b)), 0)) * sharpness;
+    float3 result = (lobe * (b + d + f + h) + e) / (4 * lobe + 1);
+    return hdr ? result / (1 - min(result, 0.99999)) : result;
+}
+
 // Diagnostic views: 1 motion vectors, 2 depth, 3 DLSS input colour.
 float3 DebugColor(uint view, float2 motion, float depth, float3 input)
 {
@@ -120,7 +139,7 @@ cbuffer OutputParameters : register(b1)
     uint Hdr;     // The HDR variant: brightness in Composite[5].xy, blend flag in .z, PQ output
     float2 RenderScale;
     uint Linear;  // DLSS output is linear rather than square-root encoded
-    uint Padding;
+    float Sharpness;
 };
 Texture2D<float4> Interface : register(t0);
 Texture2D<float4> Upscaled : register(t1);
@@ -130,12 +149,24 @@ Texture2D<float> DepthInput : register(t4);
 Texture2D<float4> ColorInput : register(t5);
 SamplerState Bilinear : register(s0);
 
+float3 Encoded(int2 local, int2 last)
+{
+    float3 color = Upscaled.Load(int3(clamp(local, 0, last), 0)).rgb;
+    return Linear ? sqrt(max(color, 0)) : color;
+}
+
 float4 main(float2 uv : TEXCOORD0, float4 position : SV_Position) : SV_Target
 {
     int2 pixel = int2(position.xy);
     int2 local = pixel - OutputOrigin;
-    float3 color = Upscaled.Load(int3(local, 0)).rgb;
-    float3 encoded = Linear ? sqrt(max(color, 0)) : color;
+    uint width, height;
+    Upscaled.GetDimensions(width, height);
+    int2 last = int2(width, height) - 1;
+    float3 encoded = Encoded(local, last);
+    if (Sharpness > 0 && DebugView == 0)
+        encoded = Rcas(Encoded(local + int2(0, -1), last), Encoded(local + int2(-1, 0), last), encoded,
+            Encoded(local + int2(1, 0), last), Encoded(local + int2(0, 1), last), Sharpness, Linear != 0);
+    float3 color = encoded * encoded;
     if (DebugView != 0)
     {
         int3 source = int3(int2(local * RenderScale), 0);
@@ -148,7 +179,6 @@ float4 main(float2 uv : TEXCOORD0, float4 position : SV_Position) : SV_Target
         encoded = FromYCoCg(auxiliary + (ToYCoCg(encoded) - auxiliary) * 0.25);
         color = encoded * encoded;
     }
-    else if (!Linear) color = encoded * encoded;
     color = Vignette(color, uv, Composite[2], Composite[3], Composite[4], Hdr ? Composite[5].x : 1)
         * Grain(uv + Composite[0].xy, Composite[1]);
     float4 ui = Interface.Load(int3(pixel, 0));
@@ -167,7 +197,8 @@ cbuffer OutputParameters : register(b1)
     uint DebugView;
     uint Hdr;
     uint Linear;
-    uint3 Padding;
+    float Sharpness;
+    uint2 Padding;
 };
 Texture2D<float4> Interface : register(t0);
 Texture2D<float4> Upscaled : register(t1);
@@ -175,6 +206,12 @@ Texture2D<float2> MotionInput : register(t3);
 Texture2D<float> DepthInput : register(t4);
 Texture2D<float4> ColorInput : register(t5);
 RWTexture2D<float4> Output : register(u0);
+
+float3 Encoded(int2 pixel)
+{
+    float3 color = Upscaled[clamp(pixel, 0, int2(OutputSize) - 1)].rgb;
+    return Linear ? sqrt(max(color, 0)) : color;
+}
 
 [numthreads(8, 8, 1)]
 void main(uint2 pixel : SV_DispatchThreadID)
@@ -187,6 +224,13 @@ void main(uint2 pixel : SV_DispatchThreadID)
     {
         color = DebugColor(DebugView, MotionInput[pixel], DepthInput[pixel], ColorInput[pixel].rgb);
         linearColor = false;
+    }
+    else if (Sharpness > 0)
+    {
+        int2 at = int2(pixel);
+        float3 encoded = Rcas(Encoded(at + int2(0, -1)), Encoded(at + int2(-1, 0)), Encoded(at),
+            Encoded(at + int2(1, 0)), Encoded(at + int2(0, 1)), Sharpness, linearColor);
+        color = linearColor ? encoded * encoded : encoded;
     }
     // The full-resolution TAA applies grain before and after decoding; keep both.
     float grain = Grain(center * Temporal[Hdr ? 6 : 5].zw + Temporal[0].xy, Temporal[1]);

@@ -14,11 +14,14 @@ struct Settings
 {
     static constexpr float MinScale = 0.33f, MaxScale = 1.0f, DefaultCustomScale = 0.75f;
     static constexpr float MinMipBias = -2.0f, MaxMipBias = 1.0f;
+    static constexpr float DefaultSharpness = 0.33f, MaxSharpness = 1.0f;
     Quality quality{Quality::Off};
     float customScale{DefaultCustomScale};
     Preset preset{Preset::Default};
     // Added to the automatic log2(render / output) texture LOD bias.
     float mipBiasOffset{};
+    // RCAS strength on the DLSS output; 0 leaves it unsharpened.
+    float sharpness{DefaultSharpness};
 
     bool operator==(const Settings&) const = default;
 };

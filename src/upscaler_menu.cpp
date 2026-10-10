@@ -54,6 +54,15 @@ void drawMenu(float scale)
     }
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Default lets DLSS choose: K for DLAA to Balanced, M for Performance and L for Ultra Performance.");
+    float sharpening = wanted.sharpness * 100;
+    ImGui::SetNextItemWidth(260 * scale);
+    if (ImGui::SliderFloat("Sharpening", &sharpening, 0, Settings::MaxSharpness * 100, "%.0f%%", ImGuiSliderFlags_AlwaysClamp))
+    {
+        wanted.sharpness = sharpening / 100;
+        changed = true;
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("AMD FidelityFX RCAS on the DLSS output. The game's own anti-aliasing sharpens; DLSS does not. 0%% is off. Default: 33%%.");
     ImGui::SetNextItemWidth(260 * scale);
     if (ImGui::SliderFloat("Texture detail bias", &wanted.mipBiasOffset, Settings::MinMipBias, Settings::MaxMipBias, "%+.2f",
         ImGuiSliderFlags_AlwaysClamp))

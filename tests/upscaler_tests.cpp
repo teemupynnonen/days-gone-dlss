@@ -59,9 +59,9 @@ void persistence(const fs::path& root)
     expect(loadSettings(path) == Settings{}, "A first launch keeps the game's own anti-aliasing.");
     expect(!fs::exists(path), "Loading defaults must not create a settings file.");
 
-    const Settings chosen{Quality::Custom, 0.625f, Preset::K, -0.25f};
+    const Settings chosen{Quality::Custom, 0.625f, Preset::K, -0.25f, 0.4f};
     saveSettings(path, chosen);
-    expect(loadSettings(path) == chosen, "Restart restores the mode, custom scale, preset and texture bias.");
+    expect(loadSettings(path) == chosen, "Restart restores the mode, custom scale, preset, texture bias and sharpening.");
     for (int i = 0; i < static_cast<int>(Quality::Count); ++i)
     {
         auto mode = chosen;
@@ -73,15 +73,21 @@ void persistence(const fs::path& root)
     write(path, "# DLSS\r\nunknown=future\r\n quality = performance \r\npreset=13\r\nbroken\r\n");
     expect(loadSettings(path) == Settings{Quality::Performance, Settings::DefaultCustomScale, Preset::M, 0},
         "CRLF, whitespace and unknown keys keep the valid fields.");
-    write(path, "quality=ludicrous\npreset=7\ncustom_scale=nan\nmip_bias_offset=5\n");
-    expect(loadSettings(path) == Settings{Quality::Off, Settings::DefaultCustomScale, Preset::Default, Settings::MaxMipBias},
-        "Unknown modes and reserved presets fall back to defaults; bias is clamped.");
+    write(path, "quality=ludicrous\npreset=7\ncustom_scale=nan\nmip_bias_offset=5\nsharpness=7\n");
+    expect(loadSettings(path) == Settings{Quality::Off, Settings::DefaultCustomScale, Preset::Default, Settings::MaxMipBias,
+        Settings::MaxSharpness}, "Unknown modes and reserved presets fall back to defaults; bias and sharpening are clamped.");
+    write(path, "quality=dlaa\n");
+    expect(loadSettings(path).sharpness == Settings::DefaultSharpness, "Settings saved before sharpening get its default.");
+    write(path, "sharpness=-1\n");
+    expect(loadSettings(path).sharpness == 0, "Negative sharpening turns it off.");
     write(path, "custom_scale=0.05\n");
     expect(loadSettings(path).customScale == Settings::MinScale, "Clamp a custom scale below what DLSS supports.");
 
     for (const auto& invalid : {Settings{Quality::Custom, std::numeric_limits<float>::quiet_NaN()},
         Settings{Quality::Custom, 1.5f}, Settings{Quality::Quality, 0.75f, static_cast<Preset>(7)},
-        Settings{Quality::Count}, Settings{Quality::Quality, 0.75f, Preset::Default, -3}})
+        Settings{Quality::Count}, Settings{Quality::Quality, 0.75f, Preset::Default, -3},
+        Settings{Quality::Quality, 0.75f, Preset::Default, 0, std::numeric_limits<float>::quiet_NaN()},
+        Settings{Quality::Quality, 0.75f, Preset::Default, 0, 2}})
     {
         saveSettings(path, chosen);
         bool rejected = false;

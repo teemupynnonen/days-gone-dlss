@@ -43,5 +43,6 @@ See [DEVELOPMENT.md](docs/DEVELOPMENT.md) for build instructions and rendering i
 
 ## License
 
-Code and documentation: Bustanity, MIT. NVIDIA DLSS, MinHook, ReShade, and
-Dear ImGui retain their own licenses, included in the ZIP's `DaysGoneDLSS` folder.
+Code and documentation: Bustanity, MIT. NVIDIA DLSS, MinHook, ReShade, Dear ImGui, and
+AMD FidelityFX (the sharpening filter) retain their own licenses, included in the ZIP's
+`DaysGoneDLSS` folder.

@@ -99,6 +99,13 @@ percent screen percentage. The jitter is added to the projection with +Y up.
 - **HDR.** The square-root encoding exceeds 1 in HDR, so the prepare shader squares the colour
   and DLSS runs with `IsHDR` on linear values. The composites then skip their squaring, apply
   the game's scene and UI brightness and encode PQ.
+- **Sharpening.** The game's TAA sharpens the current frame (centre + 4 × (centre − 3×3 mean),
+  weighted by local contrast), and DLSS has no sharpening of its own. With the Sharpening
+  setting above 0 (default 33%, tuned on an LG C1 in HDR), both composites run AMD FidelityFX
+  RCAS (FSR 1, MIT) on the DLSS output before vignette, grain and UI. The setting scales
+  RCAS's negative lobe, so 100% is RCAS at 0 stops. Its noise filter is left out because grain
+  is applied afterwards. RCAS works on the square-root encoding and limits itself to 0 to 1,
+  so HDR, which exceeds 1, is sharpened as x / (1 + x) and mapped back.
 - **Texture detail.** While rendering below output resolution, mipmapped pixel shader samplers
   that are filtered and wrap or mirror on U and V are swapped for copies with
   `log2(render / output)` plus the user's offset added to their LOD bias. These are the

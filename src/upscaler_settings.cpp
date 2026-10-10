@@ -136,6 +136,12 @@ Settings loadSettings(const std::filesystem::path& path)
             if (number(value, offset) && std::isfinite(offset))
                 settings.mipBiasOffset = std::clamp(offset, Settings::MinMipBias, Settings::MaxMipBias);
         }
+        else if (key == "sharpness")
+        {
+            float sharpness{};
+            if (number(value, sharpness) && std::isfinite(sharpness))
+                settings.sharpness = std::clamp(sharpness, 0.0f, Settings::MaxSharpness);
+        }
     }
     if (input.bad()) throw std::runtime_error("Cannot read upscaler settings.");
     return settings;
@@ -147,8 +153,9 @@ void saveSettings(const std::filesystem::path& path, const Settings& settings)
         throw std::runtime_error("Cannot save an unknown upscaler mode.");
     if (!std::isfinite(settings.customScale) || settings.customScale < Settings::MinScale || settings.customScale > Settings::MaxScale
         || !std::isfinite(settings.mipBiasOffset) || settings.mipBiasOffset < Settings::MinMipBias
-        || settings.mipBiasOffset > Settings::MaxMipBias)
-        throw std::runtime_error("Cannot save an invalid upscaler scale or bias.");
+        || settings.mipBiasOffset > Settings::MaxMipBias || !std::isfinite(settings.sharpness) || settings.sharpness < 0
+        || settings.sharpness > Settings::MaxSharpness)
+        throw std::runtime_error("Cannot save an invalid upscaler scale, bias or sharpness.");
     auto temporary = path;
     temporary += L".tmp";
     try
@@ -158,7 +165,8 @@ void saveSettings(const std::filesystem::path& path, const Settings& settings)
         output << "quality=" << QualityKeys[static_cast<std::size_t>(settings.quality)]
             << "\ncustom_scale=" << std::setprecision(std::numeric_limits<float>::max_digits10) << settings.customScale
             << "\npreset=" << static_cast<int>(settings.preset)
-            << "\nmip_bias_offset=" << settings.mipBiasOffset << '\n';
+            << "\nmip_bias_offset=" << settings.mipBiasOffset
+            << "\nsharpness=" << settings.sharpness << '\n';
         output.close();
         if (!output) throw std::runtime_error("Cannot write upscaler settings.");
         // Keep the last complete file if writing or replacing it fails.

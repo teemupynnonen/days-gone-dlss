@@ -114,6 +114,8 @@ install(FILES "${DLSS_SDK_DIR}/LICENSE.txt" DESTINATION DaysGoneDLSS RENAME NVID
 install(FILES "${minhook_SOURCE_DIR}/LICENSE.txt" DESTINATION DaysGoneDLSS RENAME MinHook-LICENSE.txt COMPONENT addon)
 install(FILES "${RESHADE_DIR}/LICENSE.md" DESTINATION DaysGoneDLSS RENAME ReShade-LICENSE.txt COMPONENT addon)
 install(FILES "${RESHADE_DIR}/imgui/LICENSE.txt" DESTINATION DaysGoneDLSS RENAME ImGui-LICENSE.txt COMPONENT addon)
+# The sharpening shader is ported from FidelityFX FSR 1 RCAS.
+install(FILES licenses/AMD-FidelityFX-LICENSE.txt DESTINATION DaysGoneDLSS COMPONENT addon)
 
 include(CTest)
 if(BUILD_TESTING)

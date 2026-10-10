@@ -96,8 +96,8 @@ struct TemporalLayout { UINT motionSlot, colorSlot, uvRegister, historyRegister,
 constexpr TemporalLayout FullLayout{1, 2, 5, 8, 9}, FullHdrLayout{1, 2, 6, 9, 10}, UpscaleLayout{0, 1, 0, 3, 4};
 
 struct PrepareConstants { std::uint32_t renderSize[2], uvRegister, historyRegister, checkerRegister, linear, padding[2]; };
-struct PixelConstants { std::int32_t outputOrigin[2]; std::uint32_t debugView, hdr; float renderScale[2]; std::uint32_t linear, padding; };
-struct ComputeConstants { std::uint32_t outputSize[2], debugView, hdr, linear, padding[3]; };
+struct PixelConstants { std::int32_t outputOrigin[2]; std::uint32_t debugView, hdr; float renderScale[2]; std::uint32_t linear; float sharpness; };
+struct ComputeConstants { std::uint32_t outputSize[2], debugView, hdr, linear; float sharpness; std::uint32_t padding[2]; };
 
 struct ViewCapture
 {
@@ -246,6 +246,7 @@ struct Frame
     bool linear{}; // DLSS ran in HDR mode on linear colour
     std::int32_t outputOrigin[2]{};
     float renderScale[2]{1, 1};
+    float sharpness{};
 } frame;
 // Whether the game's last composite was the HDR variant; the upscaling TAA does not say.
 bool hdrOutput{};
@@ -922,7 +923,8 @@ bool replaceTemporal(ID3D11DeviceContext* context, std::size_t slot, UINT groups
 
         if (pass == Pass::TemporalFull)
         {
-            const ComputeConstants output{{outputWidth, outputHeight}, static_cast<std::uint32_t>(options.debugView), hdr, hdr, {}};
+            const ComputeConstants output{{outputWidth, outputHeight}, static_cast<std::uint32_t>(options.debugView), hdr, hdr,
+                wanted.sharpness, {}};
             context->UpdateSubresource(computeConstants.Get(), 0, nullptr, &output, 0, 0);
             ID3D11Buffer* buffers[]{temporal.Get(), computeConstants.Get()};
             ID3D11ShaderResourceView* inputs[]{overlay.Get(), outputTarget.view.Get(), nullptr,
@@ -956,6 +958,7 @@ bool replaceTemporal(ID3D11DeviceContext* context, std::size_t slot, UINT groups
     frame.outputOrigin[1] = view.unscaled[1];
     frame.renderScale[0] = static_cast<float>(renderWidth) / static_cast<float>(outputWidth);
     frame.renderScale[1] = static_cast<float>(renderHeight) / static_cast<float>(outputHeight);
+    frame.sharpness = wanted.sharpness;
     return true;
 }
 
@@ -975,7 +978,7 @@ template<class Call> void composite(ID3D11DeviceContext* context, Call&& call)
     context->PSGetShaderResources(1, static_cast<UINT>(gameInputs.size()), gameInputs.data());
     context->PSGetConstantBuffers(1, 1, &gameConstants);
     const PixelConstants constants{{frame.outputOrigin[0], frame.outputOrigin[1]}, static_cast<std::uint32_t>(options.debugView), hdr,
-        {frame.renderScale[0], frame.renderScale[1]}, frame.linear, 0};
+        {frame.renderScale[0], frame.renderScale[1]}, frame.linear, frame.sharpness};
     context->UpdateSubresource(pixelConstants.Get(), 0, nullptr, &constants, 0, 0);
     ID3D11ShaderResourceView* ours[]{outputTarget.view.Get(), gameInputs[1], motionTarget.view.Get(), depthTarget.view.Get(), colorTarget.view.Get()};
     ID3D11Buffer* buffer = pixelConstants.Get();
