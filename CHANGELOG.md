@@ -1,5 +1,15 @@
 # Days Gone DLSS changelog
 
+## 1.2.0
+
+- Fix a heat-haze shimmer with DLSS, strongest around foliage: motion vectors are now computed in
+  full precision for every pixel instead of decoded from the game's TAA format.
+- Fix smearing at the screen edges when turning and in fast motion, where the game's format had no
+  motion.
+- Keep DLSS from reusing history on moving objects the game draws without motion, as the game's own
+  anti-aliasing does, such as the player's body in a first-person camera mod.
+- Add a Current colour bias debug view.
+
 ## 1.1.0
 
 - Fix smearing on movement in Quality and lower modes: DLSS now treats the game's motion vectors

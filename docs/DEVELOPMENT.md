@@ -27,7 +27,7 @@ From the repository root, after building and testing:
 cpack --config build/release/CPackConfig.cmake -B build/release
 ```
 
-This produces `build/release/DaysGoneDLSS-1.1.0.zip` and its `.sha256` checksum. CPack
+This produces `build/release/DaysGoneDLSS-1.2.0.zip` and its `.sha256` checksum. CPack
 packages only the `addon` component, so SDK headers, static libraries, tests, debug symbols,
 and local settings are excluded. ReShade is installed separately by the player.
 
