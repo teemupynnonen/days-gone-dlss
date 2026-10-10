@@ -37,6 +37,10 @@ support. For DLSS errors, check the overlay status and your NVIDIA driver.
 Report issues with `DaysGoneDLSS.log` and `ReShade.log` from the game executable's folder,
 plus your GPU, driver, resolution, SDR/HDR setting, and steps to reproduce.
 
+## Technical reference
+
+See [DEVELOPMENT.md](docs/DEVELOPMENT.md) for build instructions and rendering implementation details.
+
 ## License
 
 Code and documentation: Bustanity, MIT. NVIDIA DLSS, MinHook, ReShade, and
