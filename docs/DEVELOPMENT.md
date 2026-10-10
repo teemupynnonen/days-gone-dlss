@@ -31,18 +31,6 @@ This produces `build/release/DaysGoneDLSS-1.1.0.zip` and its `.sha256` checksum.
 packages only the `addon` component, so SDK headers, static libraries, tests, debug symbols,
 and local settings are excluded. ReShade is installed separately by the player.
 
-The root README is the player guide and can also be used as the Nexus description body.
-Its first paragraph is suitable for the Nexus summary. The ZIP includes the same guide as
-`DaysGoneDLSS/README.md`. Keep the archive layout and its install instructions in sync.
-
-Before publishing, commit the release sources and documentation, tag that commit, then
-build and package from that clean checkout. Keep the version in `project()` and the changelog
-in sync. A locally prepared archive from an uncommitted tree is a release candidate, not a
-tagged release. Complete the NVIDIA licensing review and gameplay validation before upload.
-
-`bin/DaysGoneDLSS.addon64` is a checked-in prebuilt copy; release packaging uses the freshly
-built target instead.
-
 ## Sources
 
 | File | Purpose |
