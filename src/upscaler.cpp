@@ -32,7 +32,7 @@ namespace
 using Microsoft::WRL::ComPtr;
 using Address = std::uintptr_t;
 
-// Steam build 19221447; README.md lists what each address is.
+// Steam build 19221447; docs/DEVELOPMENT.md lists what each address is.
 constexpr Address PreVisibilityFrameSetupRva = 0x20E6920;
 constexpr unsigned char PreVisibilityPrefix[]{0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x18, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55};
 // FMemStackBase page allocation for RHI commands (the slow path of every AllocCommand).

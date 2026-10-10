@@ -76,6 +76,7 @@ download_pinned("${RESHADE_DIR}"
     "${reshade}/include/reshade_overlay.hpp|include/reshade_overlay.hpp|ed914b12fbc41ed038287b0163c0bc934772afcff2c22392044c6008adc5ae79"
     "${imgui}/imgui.h|imgui/imgui.h|07562842049eaca4e47c3fcdcc9d8eafd442695b9856d6f6639e92e1bb6c737e"
     "${imgui}/imconfig.h|imgui/imconfig.h|6e5687893594ebfaf8569280cfea83d025904a8a4e23bec073086f6c5bc8f7fb"
+    "${imgui}/LICENSE.txt|imgui/LICENSE.txt|c80c5789748d955c4a650562baa0d750494e2c7128c2ca66aaebe2e3c4e198bf"
 )
 
 add_library(ngx STATIC IMPORTED)
@@ -107,9 +108,12 @@ add_custom_command(TARGET days_gone_dlss POST_BUILD
 )
 
 install(TARGETS days_gone_dlss RUNTIME DESTINATION . COMPONENT addon)
+install(FILES README.md CHANGELOG.md LICENSE DESTINATION DaysGoneDLSS COMPONENT addon)
 install(FILES "${DLSS_SDK_DIR}/lib/Windows_x86_64/rel/nvngx_dlss.dll" DESTINATION . COMPONENT addon)
-install(FILES "${DLSS_SDK_DIR}/LICENSE.txt" DESTINATION . RENAME NVIDIA-DLSS-LICENSE.txt COMPONENT addon)
-install(FILES "${minhook_SOURCE_DIR}/LICENSE.txt" DESTINATION . RENAME MinHook-LICENSE.txt COMPONENT addon)
+install(FILES "${DLSS_SDK_DIR}/LICENSE.txt" DESTINATION DaysGoneDLSS RENAME NVIDIA-DLSS-LICENSE.txt COMPONENT addon)
+install(FILES "${minhook_SOURCE_DIR}/LICENSE.txt" DESTINATION DaysGoneDLSS RENAME MinHook-LICENSE.txt COMPONENT addon)
+install(FILES "${RESHADE_DIR}/LICENSE.md" DESTINATION DaysGoneDLSS RENAME ReShade-LICENSE.txt COMPONENT addon)
+install(FILES "${RESHADE_DIR}/imgui/LICENSE.txt" DESTINATION DaysGoneDLSS RENAME ImGui-LICENSE.txt COMPONENT addon)
 
 include(CTest)
 if(BUILD_TESTING)
@@ -120,3 +124,12 @@ if(BUILD_TESTING)
     target_compile_options(upscaler_tests PRIVATE /W4 /WX /permissive- /utf-8)
     add_test(NAME upscaler_settings COMMAND upscaler_tests)
 endif()
+
+# Package only runtime files and documentation, not dependency development files.
+set(CPACK_GENERATOR ZIP)
+set(CPACK_COMPONENTS_ALL addon)
+set(CPACK_ARCHIVE_COMPONENT_INSTALL ON)
+set(CPACK_ARCHIVE_ADDON_FILE_NAME "DaysGoneDLSS-${PROJECT_VERSION}")
+set(CPACK_INCLUDE_TOPLEVEL_DIRECTORY OFF)
+set(CPACK_PACKAGE_CHECKSUM SHA256)
+include(CPack)
