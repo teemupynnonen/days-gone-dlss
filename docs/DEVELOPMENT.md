@@ -91,15 +91,21 @@ percent screen percentage. The jitter is added to the projection with +Y up.
   (`init_pipeline`); the game creates each more than once, so every copy is recorded. In a
   separate `ID3DDeviceContextState`, so the engine's cached bindings are untouched, a prepare
   shader decodes the motion texture exactly as the TAA does, copies depth and colour, and NGX
-  evaluates DLSS with inverted depth. At full resolution a compute shader then performs the
+  evaluates DLSS with inverted depth and render-resolution motion vectors (`MVLowRes`, in render
+  pixels). At full resolution a compute shader then performs the
   TAA's composite into its output. When upscaling, the game's composite draw runs with a
   replacement pixel shader and the DLSS output in place of its history. Both composites read
   the game's own constant buffer, so vignette, grain, UI and HDR brightness match the original.
 - **HDR.** The square-root encoding exceeds 1 in HDR, so the prepare shader squares the colour
   and DLSS runs with `IsHDR` on linear values. The composites then skip their squaring, apply
   the game's scene and UI brightness and encode PQ.
-- **Texture detail.** While rendering below output resolution, mipmapped samplers are swapped
-  for copies with `log2(render / output)` plus the user's offset added to their LOD bias.
+- **Texture detail.** While rendering below output resolution, mipmapped pixel shader samplers
+  that are filtered and wrap or mirror on U and V are swapped for copies with
+  `log2(render / output)` plus the user's offset added to their LOD bias. These are the
+  samplers Bend biases itself when rendering below output resolution on PS4 Pro
+  (`r.Bend.Texture.NeoGlobalBias`). Point, clamped and comparison samplers belong to
+  screen-space passes. D3D11 adds a sampler's bias to explicit mip reads too, so biasing them
+  would, for example, make SSAO's wider samples read full-detail depth and darken the ground.
 
 Any frame the replacement cannot handle uses the game's TAA and logs why once. If the upscale
 composite does not follow a replaced TAA, DLSS stops instead of showing a stale history.

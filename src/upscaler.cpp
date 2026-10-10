@@ -214,6 +214,20 @@ struct BiasedSampler { ComPtr<ID3D11SamplerState> original, biased; };
 std::unordered_map<ID3D11SamplerState*, BiasedSampler> biasedSamplers;
 float samplerBias{};
 
+// Bend's own bias for rendering below output resolution (r.Bend.Texture.NeoGlobalBias, PS4 Pro) covers
+// only its filtered, wrapping material samplers. Screen-space passes sample with point or clamped
+// samplers, and the bias also shifts their explicit mip reads: SSAO would read full-detail depth for
+// its wider samples and darken the ground.
+bool materialSampler(const D3D11_SAMPLER_DESC& sampler)
+{
+    const auto tiles = [](D3D11_TEXTURE_ADDRESS_MODE mode)
+    {
+        return mode == D3D11_TEXTURE_ADDRESS_WRAP || mode == D3D11_TEXTURE_ADDRESS_MIRROR;
+    };
+    return sampler.MaxLOD > sampler.MinLOD && tiles(sampler.AddressU) && tiles(sampler.AddressV)
+        && sampler.Filter != D3D11_FILTER_MIN_MAG_MIP_POINT && !D3D11_DECODE_IS_COMPARISON_FILTER(sampler.Filter);
+}
+
 struct Ngx
 {
     bool initialized{}, failed{};
@@ -857,7 +871,9 @@ bool replaceTemporal(ID3D11DeviceContext* context, std::size_t slot, UINT groups
     ensureTarget(colorTarget, plan->renderWidth, plan->renderHeight, DXGI_FORMAT_R16G16B16A16_FLOAT, "Creating the DLSS colour texture");
     ensureTarget(outputTarget, plan->outputWidth, plan->outputHeight, DXGI_FORMAT_R16G16B16A16_FLOAT, "Creating the DLSS output texture");
 
-    int flags = NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
+    // The motion vectors are at render resolution. Without MVLowRes DLSS reads them as dilated
+    // output-resolution vectors, which only matches when it does not upscale.
+    int flags = NVSDK_NGX_DLSS_Feature_Flags_DepthInverted | NVSDK_NGX_DLSS_Feature_Flags_MVLowRes;
     if (options.jitteredMotion) flags |= NVSDK_NGX_DLSS_Feature_Flags_MVJittered;
     if (hdr) flags |= NVSDK_NGX_DLSS_Feature_Flags_IsHDR;
     LARGE_INTEGER now{}, frequency{};
@@ -1040,7 +1056,10 @@ void updatePlan(const Settings& wanted)
         plan.reset();
         return;
     }
-    if (!plan || !(planSettings == wanted) || planOutput[0] != outputWidth || planOutput[1] != outputHeight)
+    // Only the mode and custom scale decide the render size; a new plan would also undo the rounding
+    // absorbed in replaceTemporal and recreate the feature while a slider is dragged.
+    if (!plan || planSettings.quality != wanted.quality || planSettings.customScale != wanted.customScale
+        || planOutput[0] != outputWidth || planOutput[1] != outputHeight)
     {
         plan = makePlan(wanted, outputWidth, outputHeight);
         planSettings = wanted;
@@ -1316,8 +1335,7 @@ bool biasSamplers(ID3D11DeviceContext* context, unsigned count, ID3D11SamplerSta
                 BiasedSampler entry{samplers[i], nullptr};
                 D3D11_SAMPLER_DESC description{};
                 samplers[i]->GetDesc(&description);
-                // Samplers clamped to one mip level and shadow comparison samplers are left alone.
-                if (description.MaxLOD > description.MinLOD && !D3D11_DECODE_IS_COMPARISON_FILTER(description.Filter))
+                if (materialSampler(description))
                 {
                     description.MipLODBias = std::clamp(description.MipLODBias + bias, D3D11_MIP_LOD_BIAS_MIN, D3D11_MIP_LOD_BIAS_MAX);
                     device->CreateSamplerState(&description, entry.biased.GetAddressOf());
