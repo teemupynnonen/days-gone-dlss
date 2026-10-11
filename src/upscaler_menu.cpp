@@ -92,6 +92,7 @@ void drawMenu(float scale)
     ImGui::SameLine();
     diagnosticsChanged |= ImGui::Checkbox("Invert jitter Y", &options.invertJitterY);
     diagnosticsChanged |= ImGui::Checkbox("Motion vectors include jitter", &options.jitteredMotion);
+    diagnosticsChanged |= ImGui::Checkbox("Correct full-resolution ambient occlusion", &options.fullResolutionAmbientOcclusion);
     const char* views[]{"Final image", "Motion vectors", "Depth", "DLSS input colour", "Current colour bias"};
     ImGui::SetNextItemWidth(220 * scale);
     diagnosticsChanged |= ImGui::Combo("Debug view", &options.debugView, views, static_cast<int>(std::size(views)));
@@ -103,6 +104,7 @@ void drawMenu(float scale)
     ImGui::Text("Jitter %.3f, %.3f px; view %dx%d of %dx%d%s", state.jitter[0], state.jitter[1], state.viewRender[0],
         state.viewRender[1], state.viewOutput[0], state.viewOutput[1], state.cameraCut ? ", camera cut" : "");
     ImGui::Text("Mip bias %+.2f", state.mipBias);
+    ImGui::Text("Ambient lighting: %u shaders, %u failures", state.ambientShaders, state.ambientShaderFailures);
     for (const auto& shader : state.shaders) ImGui::TextUnformatted(shader.c_str());
 }
 }

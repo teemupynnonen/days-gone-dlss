@@ -11,8 +11,9 @@ cmake --build --preset release
 ctest --test-dir build/release
 ```
 
-CMake downloads MinHook, the DLSS SDK v310.9.1 headers, loader and `nvngx_dlss.dll`, and the
-ReShade 6.8.0 add-on headers, each pinned by commit and checked by SHA-256. The add-on is
+CMake downloads MinHook, the DLSS SDK v310.9.1 headers, loader and `nvngx_dlss.dll`, the
+ReShade 6.8.0 add-on headers, and Microsoft's DXBC checksum implementation, each pinned
+by commit and checked by SHA-256. The add-on is
 written to `build/release/DaysGoneDLSS.addon64` together with `nvngx_dlss.dll`.
 
 `cmake --install build/release --component addon --prefix <dir>` collects the add-on,
@@ -27,7 +28,7 @@ From the repository root, after building and testing:
 cpack --config build/release/CPackConfig.cmake -B build/release
 ```
 
-This produces `build/release/DaysGoneDLSS-1.2.0.zip` and its `.sha256` checksum. CPack
+This produces `build/release/DaysGoneDLSS-1.3.0.zip` and its `.sha256` checksum. CPack
 packages only the `addon` component, so SDK headers, static libraries, tests, debug symbols,
 and local settings are excluded. ReShade is installed separately by the player.
 
@@ -41,6 +42,11 @@ and local settings are excluded. ReShade is installed separately by the player.
 | `src/upscaler_menu.cpp` | Settings window in the ReShade overlay |
 | `src/upscaler_settings.cpp`, `src/upscaler_settings.hpp` | Modes, render scales and `DaysGoneDLSS.ini` |
 | `tests/upscaler_tests.cpp` | Settings tests |
+| `src/shader_bytecode.*` | Bounded DXBC parsing and checksum updates |
+| `src/ambient_occlusion.*`, `tests/ambient_occlusion_tests.cpp` | AO reconstruction weight correction and WARP regression tests |
+
+The shader rendering test uses authored HLSL on WARP to check the AO near-integer
+rounding regression. No extracted game shaders are required by the tests.
 
 ## How Bend renders anti-aliasing
 
@@ -96,6 +102,8 @@ percent screen percentage. The jitter is added to the projection with +Y up.
   TAA's composite into its output. When upscaling, the game's composite draw runs with a
   replacement pixel shader and the DLSS output in place of its history. Both composites read
   the game's own constant buffer, so vignette, grain, UI and HDR brightness match the original.
+  Mode changes wait until the RHI reaches a view near the requested render size; queued
+  views from the previous mode use game TAA instead of violating DLSS's input-size limits.
 - **HDR.** The square-root encoding exceeds 1 in HDR, so the prepare shader squares the colour
   and DLSS runs with `IsHDR` on linear values. The composites then skip their squaring, apply
   the game's scene and UI brightness and encode PQ.
@@ -113,6 +121,16 @@ percent screen percentage. The jitter is added to the projection with +Y up.
   (`r.Bend.Texture.NeoGlobalBias`). Point, clamped and comparison samplers belong to
   screen-space passes. D3D11 adds a sampler's bias to explicit mip reads too, so biasing them
   would, for example, make SSAO's wider samples read full-detail depth and darken the ground.
+- **Ambient occlusion.** The deferred lighting shaders truncate their reconstruction weights
+  to integers. Small interpolation errors can turn a nominal weight of 1 into 0; at foliage
+  depth edges all other samples can be rejected, producing fully unoccluded pixels in a 2×2
+  pattern before DLSS. Insert `round_ne` before this integer conversion in the 30 verified
+  lighting permutations. The samples, directional decode, depth rejection, spatial filter
+  and temporal accumulation are unchanged. At each lighting draw, require a zero-origin viewport
+  and an `R32G32_UINT` AO view of exactly that size; other sizes use the original shader.
+  Original DXBC instructions and constants are retained; only the rounding instruction and
+  the necessary container sizes, offsets and checksum change. No extracted game shaders are
+  included in the distribution.
 
 Any frame the replacement cannot handle uses the game's TAA and logs why once. If the upscale
 composite does not follow a replaced TAA, DLSS stops instead of showing a stale history.
@@ -130,11 +148,3 @@ composite does not follow a replaced TAA, DLSS stops instead of showing a stale 
 FViewInfo (0x2D50 bytes): ViewRect `+0xB28`, UnscaledViewRect `+0xB38`, jitter `+0x10F0`,
 screen percentage `+0x1744`, camera cut `+0x1755`, anti-aliasing method `+0x1760` (3 is Bend
 TAA), view state `+0x1CE0`.
-
-## Status
-
-Verified on an RTX 5080 (driver 616.92) in SDR: DLAA and Quality evaluate on every frame after
-the first, with UI, vignette and grain intact. In HDR at 3840×2160, a 168,000-frame session
-switching between DLAA and Quality and presets K, L and M used DLSS on all but 6 frames. A sweep of jitter and motion vector sign
-combinations on a still scene kept the defaults; edge stability is about equal to the game's
-TAA.

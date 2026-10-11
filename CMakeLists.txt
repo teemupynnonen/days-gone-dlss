@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(DaysGoneDLSS VERSION 1.2.0 LANGUAGES C CXX)
+project(DaysGoneDLSS VERSION 1.3.0 LANGUAGES C CXX)
 
 if(NOT WIN32 OR NOT MSVC)
     message(FATAL_ERROR "Days Gone DLSS requires Windows and MSVC.")
@@ -87,10 +87,21 @@ set_target_properties(ngx PROPERTIES
 )
 
 # The add-on uses ReShade's ImGui through the overlay function table, so none is linked.
-add_library(days_gone_dlss SHARED src/upscaler.cpp src/upscaler_settings.cpp src/upscaler_menu.cpp src/upscaler_addon.cpp)
+# Use the compiler's checksum routine after editing DXBC instructions. Standard MD5 has different padding.
+set(DXBC_HASH_DIR "${CMAKE_BINARY_DIR}/_deps/dxbc-hash")
+set(dxc "microsoft/DirectXShaderCompiler/6e0fab36dc9ac8c423e1b08fed3aeb0e739d9e54")
+download_pinned("${DXBC_HASH_DIR}"
+    "${dxc}/lib/DxilHash/DxilHash.cpp|DxilHash.cpp|d66b631ea28d4c90a8217fac004f9290eaac07f79115451e0c4e954c0b0c94af"
+    "${dxc}/LICENSE.TXT|LICENSE.TXT|27a49e35d1da96eba18fba54bc882667ff0ff8c0254f16f2b6e165d605ba7df8"
+)
+add_library(dxbc_hash STATIC "${DXBC_HASH_DIR}/DxilHash.cpp")
+target_compile_definitions(dxbc_hash PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+
+add_library(days_gone_dlss SHARED src/upscaler.cpp src/upscaler_settings.cpp src/upscaler_menu.cpp src/upscaler_addon.cpp
+    src/ambient_occlusion.cpp src/shader_bytecode.cpp)
 target_include_directories(days_gone_dlss PRIVATE src)
 target_include_directories(days_gone_dlss SYSTEM PRIVATE "${RESHADE_DIR}/include" "${RESHADE_DIR}/imgui")
-target_link_libraries(days_gone_dlss PRIVATE minhook ngx d3d11 dxgi d3dcompiler)
+target_link_libraries(days_gone_dlss PRIVATE minhook ngx dxbc_hash d3d11 dxgi d3dcompiler)
 target_compile_features(days_gone_dlss PRIVATE cxx_std_20)
 target_compile_definitions(days_gone_dlss PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX ImTextureID=ImU64)
 target_compile_options(days_gone_dlss PRIVATE /W4 /WX /permissive- /utf-8)
@@ -116,6 +127,7 @@ install(FILES "${RESHADE_DIR}/LICENSE.md" DESTINATION DaysGoneDLSS RENAME ReShad
 install(FILES "${RESHADE_DIR}/imgui/LICENSE.txt" DESTINATION DaysGoneDLSS RENAME ImGui-LICENSE.txt COMPONENT addon)
 # The sharpening shader is ported from FidelityFX FSR 1 RCAS.
 install(FILES licenses/AMD-FidelityFX-LICENSE.txt DESTINATION DaysGoneDLSS COMPONENT addon)
+install(FILES "${DXBC_HASH_DIR}/LICENSE.TXT" DESTINATION DaysGoneDLSS RENAME DirectXShaderCompiler-LICENSE.txt COMPONENT addon)
 
 include(CTest)
 if(BUILD_TESTING)
@@ -125,6 +137,13 @@ if(BUILD_TESTING)
     target_compile_definitions(upscaler_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(upscaler_tests PRIVATE /W4 /WX /permissive- /utf-8)
     add_test(NAME upscaler_settings COMMAND upscaler_tests)
+    add_executable(ambient_occlusion_tests tests/ambient_occlusion_tests.cpp src/ambient_occlusion.cpp src/shader_bytecode.cpp)
+    target_include_directories(ambient_occlusion_tests PRIVATE src)
+    target_compile_features(ambient_occlusion_tests PRIVATE cxx_std_20)
+    target_compile_definitions(ambient_occlusion_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(ambient_occlusion_tests PRIVATE /W4 /WX /permissive- /utf-8)
+    target_link_libraries(ambient_occlusion_tests PRIVATE dxbc_hash d3d11 d3dcompiler)
+    add_test(NAME ambient_occlusion_rendering COMMAND ambient_occlusion_tests)
 endif()
 
 # Package only runtime files and documentation, not dependency development files.

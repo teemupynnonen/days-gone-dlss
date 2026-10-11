@@ -22,6 +22,7 @@ struct Diagnostics
 {
     bool invertJitterX{}, invertJitterY{true}, jitteredMotion{};
     bool gameTemporalAA{}; // Comparison only: leave the frame to the game's TAA at the DLSS render scale.
+    bool fullResolutionAmbientOcclusion{true};
     int debugView{};
 };
 
@@ -35,6 +36,7 @@ struct Status
     int viewRender[2]{}, viewOutput[2]{};
     bool cameraCut{};
     float mipBias{};
+    unsigned ambientShaders{}, ambientShaderFailures{};
     std::array<std::string, 9> shaders;
 };
 

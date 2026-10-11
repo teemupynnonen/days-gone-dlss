@@ -1,5 +1,6 @@
 #include "upscaler.hpp"
 #include "upscaler_shaders.hpp"
+#include "ambient_occlusion.hpp"
 
 #include <Windows.h>
 #include <Psapi.h>
@@ -54,6 +55,10 @@ constexpr std::size_t NativeShaderOffset = 0x98;
 constexpr char MismatchStatus[] = "bytecode does not match build 19221447";
 // Any GUID identifies a custom-engine NGX project.
 constexpr char NgxProjectId[] = "8d3b6f2e-5c1a-4e7b-9f0d-2a6c4b8e1d73";
+constexpr GUID FullResolutionAmbientShader{0x761c968b, 0xb189, 0x4ae7, {0x89, 0xab, 0xb0, 0x4d, 0xae, 0x84, 0xfb, 0x32}};
+constexpr GUID AmbientTextureSlot{0x292946db, 0x06c3, 0x43e7, {0x90, 0x34, 0xc4, 0x6b, 0x29, 0xb7, 0xcf, 0x51}};
+std::atomic<unsigned> ambientShaders{}, ambientShaderFailures{};
+std::uint64_t ambientDraws{};
 
 enum class Pass : std::uint8_t { None, TemporalFull, TemporalUpscale, Composite, DepthResolve };
 
@@ -185,6 +190,8 @@ struct Bypass
 
 ID3D11DeviceContext* immediate{};
 ID3D11PixelShader* currentPixelShader{};
+ComPtr<ID3D11PixelShader> currentAmbientShader;
+unsigned currentAmbientTexture{};
 ComPtr<ID3D11Device> device, ngxDevice;
 ComPtr<ID3D11Device1> device1;
 ComPtr<ID3D11DeviceContext1> context1;
@@ -877,6 +884,8 @@ bool replaceTemporal(ID3D11DeviceContext* context, std::size_t slot, UINT groups
     const auto options = currentDiagnostics();
     const auto view = currentView();
     if (!plan) return fallback("no DLSS plan yet");
+    if (wanted.quality != planSettings.quality || wanted.customScale != planSettings.customScale)
+        return fallback("waiting for the requested DLSS mode");
     if (options.gameTemporalAA) return fallback("the diagnostics ask for the game's TAA");
     // Each view command precedes exactly one TAA dispatch; a repeat means the engine skipped one.
     if (!view.sequence || view.sequence == lastUsedView.sequence) return fallback("the engine did not report this frame's view");
@@ -887,6 +896,10 @@ bool replaceTemporal(ID3D11DeviceContext* context, std::size_t slot, UINT groups
     const auto outputWidth = static_cast<UINT>(view.unscaled[2] - view.unscaled[0]), outputHeight = static_cast<UINT>(view.unscaled[3] - view.unscaled[1]);
     if (groupsX != (renderWidth + 7) / 8 || groupsY != (renderHeight + 7) / 8) return fallback("the TAA dispatch does not cover the view");
     if (outputWidth != plan->outputWidth || outputHeight != plan->outputHeight) return fallback("the output size changed");
+    // The RHI can still be executing the previous mode's smaller view. It may be
+    // below the new DLSS mode's minimum input size, even though it fits the buffer.
+    if (renderWidth * 50 < plan->renderWidth * 49 || renderHeight * 50 < plan->renderHeight * 49)
+        return fallback("waiting for the requested render size");
     // The engine rounds the scaled view up; absorb that instead of a frame from the previous mode.
     if (renderWidth > plan->renderWidth && renderWidth * 50 <= plan->renderWidth * 51) plan->renderWidth = renderWidth;
     if (renderHeight > plan->renderHeight && renderHeight * 50 <= plan->renderHeight * 51) plan->renderHeight = renderHeight;
@@ -1040,6 +1053,44 @@ bool compositing(ID3D11DeviceContext* context)
     return classify(currentPixelShader) == Pass::Composite;
 }
 
+void bindAmbientLighting(ID3D11DeviceContext* context)
+{
+    if (!currentAmbientShader) return;
+    auto* shader = currentPixelShader;
+    const auto options = currentDiagnostics();
+    if (replacing.load(std::memory_order_relaxed) && options.fullResolutionAmbientOcclusion && !options.gameTemporalAA)
+    {
+        ComPtr<ID3D11ShaderResourceView> view;
+        context->PSGetShaderResources(currentAmbientTexture, 1, view.GetAddressOf());
+        D3D11_SHADER_RESOURCE_VIEW_DESC description{};
+        if (view) view->GetDesc(&description);
+        if (view && description.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2D && description.Format == DXGI_FORMAT_R32G32_UINT)
+        {
+            ComPtr<ID3D11Resource> resource;
+            ComPtr<ID3D11Texture2D> texture;
+            view->GetResource(resource.GetAddressOf());
+            if (SUCCEEDED(resource.As(&texture)))
+            {
+                D3D11_TEXTURE2D_DESC dimensions{};
+                texture->GetDesc(&dimensions);
+                D3D11_VIEWPORT viewport{};
+                UINT count = 1;
+                context->RSGetViewports(&count, &viewport);
+                const auto mip = description.Texture2D.MostDetailedMip;
+                // Test the actual bound view: graphics presets can switch AO to half resolution.
+                if (count == 1 && mip < 32 && viewport.TopLeftX == 0 && viewport.TopLeftY == 0
+                    && viewport.Width == static_cast<float>(dimensions.Width >> mip)
+                    && viewport.Height == static_cast<float>(dimensions.Height >> mip))
+                {
+                    shader = currentAmbientShader.Get();
+                    if (++ambientDraws == 1) log("First full-resolution ambient lighting correction drawn.");
+                }
+            }
+        }
+    }
+    context->PSSetShader(shader, nullptr, 0);
+}
+
 void releaseRenderer()
 {
     replacing = false;
@@ -1065,6 +1116,7 @@ void releaseRenderer()
         }
     }
     currentPixelShader = nullptr;
+    currentAmbientShader.Reset();
     immediate = nullptr;
     motionShader.Reset();
     prepareShader.Reset();
@@ -1328,9 +1380,11 @@ bool dispatch(ID3D11DeviceContext* context, unsigned x, unsigned y, unsigned z) 
 
 bool draw(ID3D11DeviceContext* context, unsigned count, unsigned start, int base, bool indexed) noexcept
 {
-    if (!compositing(context)) return false;
+    if (bypass || context != immediate) return false;
     try
     {
+        bindAmbientLighting(context);
+        if (!compositing(context)) return false;
         composite(context, [&]
         {
             if (indexed) context->DrawIndexed(count, start, base);
@@ -1344,7 +1398,17 @@ bool draw(ID3D11DeviceContext* context, unsigned count, unsigned start, int base
 
 void pixelShader(ID3D11DeviceContext* context, ID3D11PixelShader* shader) noexcept
 {
-    if (context == immediate && !bypass) currentPixelShader = shader;
+    if (context != immediate || bypass) return;
+    currentPixelShader = shader;
+    currentAmbientShader.Reset();
+    if (!shader || !replacing.load(std::memory_order_relaxed)) return;
+    try
+    {
+        UINT slotSize = sizeof(currentAmbientTexture), shaderSize = sizeof(ID3D11PixelShader*);
+        if (SUCCEEDED(shader->GetPrivateData(AmbientTextureSlot, &slotSize, &currentAmbientTexture)))
+            shader->GetPrivateData(FullResolutionAmbientShader, &shaderSize, currentAmbientShader.GetAddressOf());
+    }
+    catch (...) {}
 }
 
 // DLSS renders below output resolution, so mipmapped textures need the matching negative LOD bias.
@@ -1401,6 +1465,28 @@ void shaderCreated(const void* code, std::size_t size, IUnknown* shader) noexcep
             try { remember(slot, ComPtr<IUnknown>(shader), "created, bytecode verified"); }
             catch (...) {}
         }
+    try
+    {
+        const auto patch = makeFullResolutionAmbientOcclusion(code, size);
+        if (!patch.bytecode.empty())
+        {
+            ComPtr<ID3D11PixelShader> original, replacement;
+            check(shader->QueryInterface(IID_PPV_ARGS(&original)), "Querying the ambient lighting shader");
+            ComPtr<ID3D11Device> shaderDevice;
+            original->GetDevice(&shaderDevice);
+            Bypass guard;
+            check(shaderDevice->CreatePixelShader(patch.bytecode.data(), patch.bytecode.size() * 4, nullptr, &replacement),
+                "Creating the full-resolution ambient lighting shader");
+            check(original->SetPrivateDataInterface(FullResolutionAmbientShader, replacement.Get()), "Storing the ambient lighting shader");
+            check(original->SetPrivateData(AmbientTextureSlot, sizeof(patch.textureSlot), &patch.textureSlot), "Storing the ambient texture slot");
+            ++ambientShaders;
+        }
+    }
+    catch (const std::exception& error)
+    {
+        ++ambientShaderFailures;
+        log(error.what());
+    }
 }
 
 // Developer override: DaysGoneDLSS-diagnostics.ini beside the settings is re-read when it changes, so
@@ -1427,10 +1513,12 @@ static void reloadDiagnostics()
         else if (key == "jittered_motion") options.jitteredMotion = value != 0;
         else if (key == "debug_view" && value >= 0 && value <= 4) options.debugView = value;
         else if (key == "game_taa") options.gameTemporalAA = value != 0;
+        else if (key == "full_resolution_ao") options.fullResolutionAmbientOcclusion = value != 0;
     }
     applyDiagnostics(options);
     log("Diagnostics: invert jitter X " + std::to_string(options.invertJitterX) + ", Y " + std::to_string(options.invertJitterY)
-        + ", jittered motion " + std::to_string(options.jitteredMotion) + ", debug view " + std::to_string(options.debugView) + ".");
+        + ", jittered motion " + std::to_string(options.jitteredMotion) + ", debug view " + std::to_string(options.debugView)
+        + ", full-resolution AO " + std::to_string(options.fullResolutionAmbientOcclusion) + ".");
 }
 
 void endFrame() noexcept
@@ -1462,7 +1550,9 @@ void endFrame() noexcept
                 + ", jitter " + std::to_string(lastUsedView.jitter[0]) + ", " + std::to_string(lastUsedView.jitter[1])
                 + "; dispatches " + std::to_string(dispatchCalls) + ", other contexts " + std::to_string(foreignDispatches)
                 + " (last " + hex(reinterpret_cast<Address>(lastForeignContext)) + "), recognised " + std::to_string(recognisedDispatches)
-                + ", history resets " + std::to_string(resets) + ".");
+                + ", history resets " + std::to_string(resets)
+                + "; ambient shaders " + std::to_string(ambientShaders.load()) + ", failures "
+                + std::to_string(ambientShaderFailures.load()) + ", draws " + std::to_string(ambientDraws) + ".");
         const auto next = frame.index + 1;
         frame = {};
         frame.index = next;
@@ -1500,6 +1590,8 @@ Status status()
     result.viewOutput[1] = lastUsedView.unscaled[3] - lastUsedView.unscaled[1];
     result.cameraCut = lastUsedView.cameraCut;
     result.mipBias = targetMipBias.load();
+    result.ambientShaders = ambientShaders.load();
+    result.ambientShaderFailures = ambientShaderFailures.load();
     std::lock_guard lock(shaderMutex);
     for (std::size_t slot = 0; slot < std::size(Shaders); ++slot)
         result.shaders[slot] = std::string(Shaders[slot].name) + ": " + (shaderStatus[slot].empty() ? "not seen yet" : shaderStatus[slot]);

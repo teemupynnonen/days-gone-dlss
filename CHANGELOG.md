@@ -1,5 +1,10 @@
 # Days Gone DLSS changelog
 
+## 1.3.0
+
+- Fix the foliage grid at low render scales by correcting ambient-occlusion weights.
+- Fix DLSS stopping when switching from Ultra Performance to Quality.
+
 ## 1.2.0
 
 - Fix a heat-haze shimmer with DLSS, strongest around foliage: motion vectors are now computed in
