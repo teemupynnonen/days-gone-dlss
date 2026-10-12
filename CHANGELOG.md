@@ -1,5 +1,10 @@
 # Days Gone DLSS changelog
 
+## 1.3.1
+
+- Apply the foliage grid fix in windowed mode and at custom render scales. It previously
+  turned off unless the render size was a multiple of 4 pixels.
+
 ## 1.3.0
 
 - Fix the foliage grid at low render scales by correcting ambient-occlusion weights.

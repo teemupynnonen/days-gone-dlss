@@ -25,6 +25,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 
 namespace days_gone_dlss::upscaler
 {
@@ -1053,40 +1054,52 @@ bool compositing(ID3D11DeviceContext* context)
     return classify(currentPixelShader) == Pass::Composite;
 }
 
+// Size of one mip of the 2D texture behind a view; zero for other resources.
+std::pair<UINT, UINT> mipSize(ID3D11View* view, UINT mip)
+{
+    ComPtr<ID3D11Resource> resource;
+    ComPtr<ID3D11Texture2D> texture;
+    view->GetResource(resource.GetAddressOf());
+    if (mip >= 32 || FAILED(resource.As(&texture))) return {};
+
+    D3D11_TEXTURE2D_DESC description{};
+    texture->GetDesc(&description);
+
+    return {description.Width >> mip, description.Height >> mip};
+}
+
+// Graphics presets can switch AO to half resolution, so test the views actually bound.
+// Compare with the lighting target rather than the viewport: the engine pads its buffers
+// to a multiple of 4 pixels, e.g. a 427x241 view renders into 428x244 textures.
+bool ambientMatchesTarget(ID3D11DeviceContext* context)
+{
+    ComPtr<ID3D11ShaderResourceView> ambient;
+    ComPtr<ID3D11RenderTargetView> target;
+    context->PSGetShaderResources(currentAmbientTexture, 1, ambient.GetAddressOf());
+    context->OMGetRenderTargets(1, target.GetAddressOf(), nullptr);
+    if (!ambient || !target) return false;
+
+    D3D11_SHADER_RESOURCE_VIEW_DESC ambientView{};
+    D3D11_RENDER_TARGET_VIEW_DESC targetView{};
+    ambient->GetDesc(&ambientView);
+    target->GetDesc(&targetView);
+    if (ambientView.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D || ambientView.Format != DXGI_FORMAT_R32G32_UINT
+        || targetView.ViewDimension != D3D11_RTV_DIMENSION_TEXTURE2D) return false;
+
+    const auto size = mipSize(ambient.Get(), ambientView.Texture2D.MostDetailedMip);
+    return size.first && size == mipSize(target.Get(), targetView.Texture2D.MipSlice);
+}
+
 void bindAmbientLighting(ID3D11DeviceContext* context)
 {
     if (!currentAmbientShader) return;
     auto* shader = currentPixelShader;
     const auto options = currentDiagnostics();
-    if (replacing.load(std::memory_order_relaxed) && options.fullResolutionAmbientOcclusion && !options.gameTemporalAA)
+    if (replacing.load(std::memory_order_relaxed) && options.fullResolutionAmbientOcclusion && !options.gameTemporalAA
+        && ambientMatchesTarget(context))
     {
-        ComPtr<ID3D11ShaderResourceView> view;
-        context->PSGetShaderResources(currentAmbientTexture, 1, view.GetAddressOf());
-        D3D11_SHADER_RESOURCE_VIEW_DESC description{};
-        if (view) view->GetDesc(&description);
-        if (view && description.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2D && description.Format == DXGI_FORMAT_R32G32_UINT)
-        {
-            ComPtr<ID3D11Resource> resource;
-            ComPtr<ID3D11Texture2D> texture;
-            view->GetResource(resource.GetAddressOf());
-            if (SUCCEEDED(resource.As(&texture)))
-            {
-                D3D11_TEXTURE2D_DESC dimensions{};
-                texture->GetDesc(&dimensions);
-                D3D11_VIEWPORT viewport{};
-                UINT count = 1;
-                context->RSGetViewports(&count, &viewport);
-                const auto mip = description.Texture2D.MostDetailedMip;
-                // Test the actual bound view: graphics presets can switch AO to half resolution.
-                if (count == 1 && mip < 32 && viewport.TopLeftX == 0 && viewport.TopLeftY == 0
-                    && viewport.Width == static_cast<float>(dimensions.Width >> mip)
-                    && viewport.Height == static_cast<float>(dimensions.Height >> mip))
-                {
-                    shader = currentAmbientShader.Get();
-                    if (++ambientDraws == 1) log("First full-resolution ambient lighting correction drawn.");
-                }
-            }
-        }
+        shader = currentAmbientShader.Get();
+        if (++ambientDraws == 1) log("First full-resolution ambient lighting correction drawn.");
     }
     context->PSSetShader(shader, nullptr, 0);
 }

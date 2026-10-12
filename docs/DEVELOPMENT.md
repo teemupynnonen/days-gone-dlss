@@ -28,7 +28,7 @@ From the repository root, after building and testing:
 cpack --config build/release/CPackConfig.cmake -B build/release
 ```
 
-This produces `build/release/DaysGoneDLSS-1.3.0.zip` and its `.sha256` checksum. CPack
+This produces `build/release/DaysGoneDLSS-1.3.1.zip` and its `.sha256` checksum. CPack
 packages only the `addon` component, so SDK headers, static libraries, tests, debug symbols,
 and local settings are excluded. ReShade is installed separately by the player.
 
@@ -126,8 +126,10 @@ percent screen percentage. The jitter is added to the projection with +Y up.
   depth edges all other samples can be rejected, producing fully unoccluded pixels in a 2×2
   pattern before DLSS. Insert `round_ne` before this integer conversion in the 30 verified
   lighting permutations. The samples, directional decode, depth rejection, spatial filter
-  and temporal accumulation are unchanged. At each lighting draw, require a zero-origin viewport
-  and an `R32G32_UINT` AO view of exactly that size; other sizes use the original shader.
+  and temporal accumulation are unchanged. At each lighting draw, require an `R32G32_UINT` AO
+  view of the same size as the bound render target; other sizes use the original shader.
+  Compare with the target rather than the viewport: the engine pads its buffers to a multiple
+  of 4 pixels, so a 427×241 view renders into 428×244 textures.
   Original DXBC instructions and constants are retained; only the rounding instruction and
   the necessary container sizes, offsets and checksum change. No extracted game shaders are
   included in the distribution.
