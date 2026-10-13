@@ -97,11 +97,40 @@ download_pinned("${DXBC_HASH_DIR}"
 add_library(dxbc_hash STATIC "${DXBC_HASH_DIR}/DxilHash.cpp")
 target_compile_definitions(dxbc_hash PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 
+# The ray-tracing experiment traces with Shader Model 6.5 ray queries, which d3dcompiler cannot
+# compile. The Windows SDK's dxc signs the DXIL with the dxil.dll beside it.
+find_program(DXC_EXECUTABLE dxc HINTS "$ENV{WindowsSdkVerBinPath}x64" REQUIRED)
+set(GENERATED_DIR "${CMAKE_BINARY_DIR}/generated")
+add_custom_command(OUTPUT "${GENERATED_DIR}/ray_tracing_trace.h"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${GENERATED_DIR}"
+    COMMAND "${DXC_EXECUTABLE}" -nologo -T cs_6_5 -E main -Vn TraceShader -Fh "${GENERATED_DIR}/ray_tracing_trace.h"
+        "${CMAKE_SOURCE_DIR}/src/ray_tracing_trace.hlsl"
+    DEPENDS src/ray_tracing_trace.hlsl src/ray_tracing_scene.hlsli
+    VERBATIM
+)
+add_custom_command(OUTPUT "${GENERATED_DIR}/ray_tracing_ao.h"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${GENERATED_DIR}"
+    COMMAND "${DXC_EXECUTABLE}" -nologo -T cs_6_5 -E main -Vn AmbientTraceShader -Fh "${GENERATED_DIR}/ray_tracing_ao.h"
+        "${CMAKE_SOURCE_DIR}/src/ray_tracing_ao.hlsl"
+    DEPENDS src/ray_tracing_ao.hlsl src/ray_tracing_coverage.hlsli
+    VERBATIM
+)
+add_custom_command(OUTPUT "${GENERATED_DIR}/ray_tracing_bounce.h"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${GENERATED_DIR}"
+    COMMAND "${DXC_EXECUTABLE}" -nologo -T cs_6_5 -E main -Vn BounceTraceShader -Fh "${GENERATED_DIR}/ray_tracing_bounce.h"
+        "${CMAKE_SOURCE_DIR}/src/ray_tracing_bounce.hlsl"
+    DEPENDS src/ray_tracing_bounce.hlsl src/ray_tracing_scene.hlsli
+    VERBATIM
+)
+add_custom_target(ray_tracing_shaders DEPENDS "${GENERATED_DIR}/ray_tracing_trace.h" "${GENERATED_DIR}/ray_tracing_ao.h"
+    "${GENERATED_DIR}/ray_tracing_bounce.h")
+
 add_library(days_gone_dlss SHARED src/upscaler.cpp src/upscaler_settings.cpp src/upscaler_menu.cpp src/upscaler_addon.cpp
-    src/ambient_occlusion.cpp src/shader_bytecode.cpp)
-target_include_directories(days_gone_dlss PRIVATE src)
+    src/ambient_occlusion.cpp src/shader_bytecode.cpp src/ray_tracing.cpp src/ray_tracing_menu.cpp src/alpha_test.cpp)
+add_dependencies(days_gone_dlss ray_tracing_shaders)
+target_include_directories(days_gone_dlss PRIVATE src "${GENERATED_DIR}")
 target_include_directories(days_gone_dlss SYSTEM PRIVATE "${RESHADE_DIR}/include" "${RESHADE_DIR}/imgui")
-target_link_libraries(days_gone_dlss PRIVATE minhook ngx dxbc_hash d3d11 dxgi d3dcompiler)
+target_link_libraries(days_gone_dlss PRIVATE minhook ngx dxbc_hash d3d11 d3d12 dxgi d3dcompiler)
 target_compile_features(days_gone_dlss PRIVATE cxx_std_20)
 target_compile_definitions(days_gone_dlss PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX ImTextureID=ImU64)
 target_compile_options(days_gone_dlss PRIVATE /W4 /WX /permissive- /utf-8)
@@ -144,6 +173,16 @@ if(BUILD_TESTING)
     target_compile_options(ambient_occlusion_tests PRIVATE /W4 /WX /permissive- /utf-8)
     target_link_libraries(ambient_occlusion_tests PRIVATE dxbc_hash d3d11 d3dcompiler)
     add_test(NAME ambient_occlusion_rendering COMMAND ambient_occlusion_tests)
+    add_executable(ray_tracing_tests tests/ray_tracing_tests.cpp src/ray_tracing.cpp src/alpha_test.cpp src/shader_bytecode.cpp)
+    add_dependencies(ray_tracing_tests ray_tracing_shaders)
+    target_include_directories(ray_tracing_tests PRIVATE src "${GENERATED_DIR}")
+    target_compile_features(ray_tracing_tests PRIVATE cxx_std_20)
+    target_compile_definitions(ray_tracing_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(ray_tracing_tests PRIVATE /W4 /WX /permissive- /utf-8)
+    target_link_libraries(ray_tracing_tests PRIVATE dxbc_hash d3d11 d3d12 dxgi d3dcompiler)
+    # Needs a DXR 1.1 GPU; reports 77 without one.
+    add_test(NAME ray_tracing_capture COMMAND ray_tracing_tests)
+    set_tests_properties(ray_tracing_capture PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
 # Package only runtime files and documentation, not dependency development files.

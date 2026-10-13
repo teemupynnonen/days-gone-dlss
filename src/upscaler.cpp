@@ -1,6 +1,8 @@
 #include "upscaler.hpp"
 #include "upscaler_shaders.hpp"
 #include "ambient_occlusion.hpp"
+#include "ray_tracing.hpp"
+#include "shader_bytecode.hpp"
 
 #include <Windows.h>
 #include <Psapi.h>
@@ -47,8 +49,10 @@ constexpr std::size_t CommandLinkOffset = 0x08, ExecutingOffset = 0x10, CommandC
 constexpr Address ScreenPercentageDataRva = 0x4ADCA50, TemporalSamplesDataRva = 0x4CD0620;
 // FSceneRenderer views and the FViewInfo fields read here.
 constexpr std::size_t RendererViews = 0x80, RendererViewCount = 0x88, ViewInfoSize = 0x2D50;
-constexpr std::size_t ViewRectOffset = 0xB28, UnscaledViewRectOffset = 0xB38, TemporalJitterOffset = 0x10F0,
-    ScreenPercentageOffset = 0x1744, CameraCutOffset = 0x1755, AntiAliasingOffset = 0x1760, ViewStateOffset = 0x1CE0;
+constexpr std::size_t ViewRectOffset = 0xB28, UnscaledViewRectOffset = 0xB38, TranslatedViewProjectionOffset = 0xC20,
+    PreViewTranslationOffset = 0xCB4, ViewOriginOffset = 0xCC0,
+    TemporalJitterOffset = 0x10F0, ScreenPercentageOffset = 0x1744, CameraCutOffset = 0x1755, AntiAliasingOffset = 0x1760,
+    ViewStateOffset = 0x1CE0;
 constexpr std::uint8_t BendTemporalAA = 3;
 constexpr int MaxViews = 4;
 // TRefCountPtr to the native ID3D11ComputeShader/ID3D11PixelShader inside Bend's FD3D11 shader objects.
@@ -62,15 +66,6 @@ std::atomic<unsigned> ambientShaders{}, ambientShaderFailures{};
 std::uint64_t ambientDraws{};
 
 enum class Pass : std::uint8_t { None, TemporalFull, TemporalUpscale, Composite, DepthResolve };
-
-constexpr std::uint8_t nibble(char value) { return static_cast<std::uint8_t>(value <= '9' ? value - '0' : value - 'a' + 10); }
-constexpr std::array<std::uint8_t, 16> dxbcHash(const char (&hex)[33])
-{
-    std::array<std::uint8_t, 16> result{};
-    for (std::size_t i = 0; i < result.size(); ++i)
-        result[i] = static_cast<std::uint8_t>(nibble(hex[i * 2]) << 4 | nibble(hex[i * 2 + 1]));
-    return result;
-}
 
 struct ShaderSlot
 {
@@ -107,6 +102,10 @@ struct ViewCapture
     std::int32_t rect[4]{}, unscaled[4]{};
     float jitter[2]{};
     bool cameraCut{};
+    float clipFromWorld[16]{}; // Jittered translated-world to clip, as the base pass draws with it
+    // Translated world is world plus this, the negated camera position; known when it matches ViewOrigin.
+    float preViewTranslation[3]{};
+    bool cameraKnown{};
 };
 
 struct Target
@@ -269,12 +268,6 @@ std::string failure;
 std::uint64_t dispatchCalls{}, foreignDispatches{}, recognisedDispatches{}, resets{};
 ID3D11DeviceContext* lastForeignContext{};
 
-void log(std::string_view message)
-{
-    std::lock_guard lock(logMutex);
-    if (logFile) logFile << GetTickCount64() << " [thread " << GetCurrentThreadId() << "] " << message << std::endl;
-}
-
 void logOnce(const std::string& key, std::string_view message)
 {
     if (loggedOnce.emplace(key, true).second) log(message);
@@ -319,8 +312,12 @@ std::filesystem::path moduleDirectory()
 
 void executeViewCommand(Address, ViewCommand* command)
 {
-    std::lock_guard lock(viewMutex);
-    executingView = command->view;
+    {
+        std::lock_guard lock(viewMutex);
+        executingView = command->view;
+    }
+    const auto& view = command->view;
+    ray_tracing::beginView(view.clipFromWorld, view.rect, view.unscaled, view.preViewTranslation, view.cameraKnown);
 }
 
 // Mirrors the engine's AllocCommand: append to the last memory page, or let the engine add a page.
@@ -383,6 +380,15 @@ void preVisibility(Address renderer, Address commandList)
         std::memcpy(capture.rect, reinterpret_cast<const void*>(view + ViewRectOffset), sizeof(capture.rect));
         std::memcpy(capture.unscaled, reinterpret_cast<const void*>(view + UnscaledViewRectOffset), sizeof(capture.unscaled));
         std::memcpy(capture.jitter, reinterpret_cast<const void*>(view + TemporalJitterOffset), sizeof(capture.jitter));
+        std::memcpy(capture.clipFromWorld, reinterpret_cast<const void*>(view + TranslatedViewProjectionOffset), sizeof(capture.clipFromWorld));
+        std::memcpy(capture.preViewTranslation, reinterpret_cast<const void*>(view + PreViewTranslationOffset), sizeof(capture.preViewTranslation));
+        float origin[3]{};
+        std::memcpy(origin, reinterpret_cast<const void*>(view + ViewOriginOffset), sizeof(origin));
+        capture.cameraKnown = std::abs(capture.preViewTranslation[0] + origin[0]) < 1 && std::abs(capture.preViewTranslation[1] + origin[1]) < 1
+            && std::abs(capture.preViewTranslation[2] + origin[2]) < 1;
+        static bool reported{};
+        if (!capture.cameraKnown && !std::exchange(reported, true))
+            log("FViewMatrices::PreViewTranslation does not mirror ViewOrigin; ray tracing keeps no geometry from earlier frames.");
         capture.cameraCut = *reinterpret_cast<const std::uint8_t*>(view + CameraCutOffset) != 0;
         capture.thread = GetCurrentThreadId();
         {
@@ -397,7 +403,7 @@ void preVisibility(Address renderer, Address commandList)
             capture.sequence = ++captureSequence;
             capturedView = capture;
         }
-        if (fullJitter) enqueueView(commandList, capture);
+        if (fullJitter || ray_tracing::wanted()) enqueueView(commandList, capture);
     }
 }
 
@@ -1183,6 +1189,11 @@ void updatePlan(const Settings& wanted)
 }
 }
 
+void log(std::string_view message)
+{
+    std::lock_guard lock(logMutex);
+    if (logFile) logFile << GetTickCount64() << " [thread " << GetCurrentThreadId() << "] " << message << std::endl;
+}
 
 Settings currentSettings()
 {
@@ -1514,6 +1525,8 @@ static void reloadDiagnostics()
     seen = modified;
     std::ifstream input(path);
     auto options = currentDiagnostics();
+    auto features = ray_tracing::status().features;
+    bool featuresRead{};
     std::string line;
     while (std::getline(input, line))
     {
@@ -1527,7 +1540,40 @@ static void reloadDiagnostics()
         else if (key == "debug_view" && value >= 0 && value <= 4) options.debugView = value;
         else if (key == "game_taa") options.gameTemporalAA = value != 0;
         else if (key == "full_resolution_ao") options.fullResolutionAmbientOcclusion = value != 0;
+        else if (key == "ray_tracing_view" && value >= 0 && value <= 9) ray_tracing::select(static_cast<ray_tracing::View>(value));
+        else if (key == "ray_tracing_sun_shadows")
+        {
+            features.sunShadows = value != 0;
+            featuresRead = true;
+        }
+        else if (key == "ray_tracing_ambient_occlusion")
+        {
+            features.ambientOcclusion = value != 0;
+            featuresRead = true;
+        }
+        else if (key == "ray_tracing_replace_canopy_shadows")
+        {
+            features.replaceCanopyShadows = value != 0;
+            featuresRead = true;
+        }
+        else if (key == "ray_tracing_offscreen_geometry")
+        {
+            features.offscreenGeometry = value != 0;
+            featuresRead = true;
+        }
+        else if (key == "dlss_quality" && value >= 0 && value < static_cast<int>(Quality::Count)) // TEMPORARY: the menu's mode change
+        {
+            auto wanted = currentSettings();
+            wanted.quality = static_cast<Quality>(value);
+            applySettings(wanted);
+        }
+        else if (key == "ray_tracing_global_illumination")
+        {
+            features.globalIllumination = value != 0;
+            featuresRead = true;
+        }
     }
+    if (featuresRead) ray_tracing::enable(features);
     applyDiagnostics(options);
     log("Diagnostics: invert jitter X " + std::to_string(options.invertJitterX) + ", Y " + std::to_string(options.invertJitterY)
         + ", jittered motion " + std::to_string(options.jitteredMotion) + ", debug view " + std::to_string(options.debugView)
@@ -1543,8 +1589,10 @@ void endFrame() noexcept
             if (!released.exchange(true) && hooked) releaseRenderer();
             return;
         }
+        // The ray-tracing switches live in the same file and work without DLSS.
+        static std::uint64_t presents{};
+        if (active && ++presents % 30 == 0) reloadDiagnostics();
         if (!active || !hooked) return;
-        if (frame.index % 30 == 0) reloadDiagnostics();
         const auto wanted = currentSettings();
         // Missing slots cost one memory read each until the engine fills its caches.
         identifyShaders();
