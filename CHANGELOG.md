@@ -1,6 +1,6 @@
 # Days Gone DLSS changelog
 
-## Unreleased
+## 1.4.0
 
 - Support Days Gone 1.07, the version before the Remastered update (Steam beta
   `days_gone_classic`). The add-on detects the game version when it loads. On 1.07 its
