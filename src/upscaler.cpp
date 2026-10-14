@@ -1741,7 +1741,13 @@ Status status()
     result.ambientShaderFailures = ambientShaderFailures.load();
     std::lock_guard lock(shaderMutex);
     for (std::size_t slot = 0; slot < std::size(Shaders); ++slot)
-        result.shaders[slot] = std::string(Shaders[slot].name) + ": " + (shaderStatus[slot].empty() ? "not seen yet" : shaderStatus[slot]);
+    {
+        const auto& shaderState = shaderStatus[slot];
+        result.shaders[slot] = std::string(Shaders[slot].name) + ": " + (shaderState.empty() ? "not seen yet" : shaderState);
+        if (shaderState == MismatchStatus) result.shaderMismatch = true;
+        else if (!shaderState.empty()) ++result.shadersRecognised;
+    }
+
     return result;
 }
 }

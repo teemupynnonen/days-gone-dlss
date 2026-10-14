@@ -9,6 +9,10 @@
   makes foliage and ground boil with DLSS in Performance and lower modes; turning it off renders as
   the game's lower settings do.
 - Rename the diagnostics checkbox to "Correct ambient occlusion weights".
+- Tidy the overlay: a coloured status line at the top, explanations moved into tooltips,
+  settings greyed out while DLSS is off, a "Reset to defaults" button, and a clear error when
+  the game's shaders are not the expected ones. Diagnostics stay in their collapsed section,
+  with the game shader list folded into one line.
 
 ## 1.3.1
 
