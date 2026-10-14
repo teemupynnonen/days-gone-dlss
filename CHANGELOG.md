@@ -1,5 +1,15 @@
 # Days Gone DLSS changelog
 
+## Unreleased
+
+- Support Days Gone 1.07, the version before the Remastered update (Steam beta
+  `days_gone_classic`). The add-on detects the game version when it loads. On 1.07 its
+  composites follow that version's vignette, film grain and HDR output.
+- Add a "Screen-space indirect lighting" setting on 1.07. 1.07's indirect lighting is noisy and
+  makes foliage and ground boil with DLSS in Performance and lower modes; turning it off renders as
+  the game's lower settings do.
+- Rename the diagnostics checkbox to "Correct ambient occlusion weights".
+
 ## 1.3.1
 
 - Apply the foliage grid fix in windowed mode and at custom render scales. It previously

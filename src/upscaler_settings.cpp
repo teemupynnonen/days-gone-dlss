@@ -142,6 +142,11 @@ Settings loadSettings(const std::filesystem::path& path)
             if (number(value, sharpness) && std::isfinite(sharpness))
                 settings.sharpness = std::clamp(sharpness, 0.0f, Settings::MaxSharpness);
         }
+        else if (key == "indirect_lighting")
+        {
+            int enabled{};
+            if (number(value, enabled)) settings.indirectLighting = enabled != 0;
+        }
     }
     if (input.bad()) throw std::runtime_error("Cannot read upscaler settings.");
     return settings;
@@ -166,7 +171,8 @@ void saveSettings(const std::filesystem::path& path, const Settings& settings)
             << "\ncustom_scale=" << std::setprecision(std::numeric_limits<float>::max_digits10) << settings.customScale
             << "\npreset=" << static_cast<int>(settings.preset)
             << "\nmip_bias_offset=" << settings.mipBiasOffset
-            << "\nsharpness=" << settings.sharpness << '\n';
+            << "\nsharpness=" << settings.sharpness
+            << "\nindirect_lighting=" << (settings.indirectLighting ? 1 : 0) << '\n';
         output.close();
         if (!output) throw std::runtime_error("Cannot write upscaler settings.");
         // Keep the last complete file if writing or replacing it fails.
