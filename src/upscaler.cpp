@@ -1128,8 +1128,8 @@ template<class Call> void composite(ID3D11DeviceContext* context, Call&& call)
 {
     Bypass guard;
     const auto options = currentDiagnostics();
-    // Slots t1..t6: the game binds its history at t1 and an auxiliary history at t2.
-    std::array<ID3D11ShaderResourceView*, 6> gameInputs{};
+    // Slots t1..t5, which the replacement binds. The game has its history at t1 and an auxiliary history at t2.
+    std::array<ID3D11ShaderResourceView*, 5> gameInputs{};
     ID3D11Buffer* gameConstants{};
     ID3D11PixelShader* gamePixelShader = currentPixelShader;
     const auto slot = slotOf(gamePixelShader);
@@ -1142,7 +1142,7 @@ template<class Call> void composite(ID3D11DeviceContext* context, Call&& call)
     const PixelConstants constants{{frame.outputOrigin[0], frame.outputOrigin[1]}, static_cast<std::uint32_t>(options.debugView), hdr,
         {frame.renderScale[0], frame.renderScale[1]}, frame.linear, frame.sharpness, filtered, {}};
     context->UpdateSubresource(pixelConstants.Get(), 0, nullptr, &constants, 0, 0);
-    ID3D11ShaderResourceView* ours[]{outputTarget.view.Get(), gameInputs[1], motionTarget.view.Get(), depthTarget.view.Get(),
+    ID3D11ShaderResourceView* ours[]{outputTarget.view.Get(), motionTarget.view.Get(), depthTarget.view.Get(),
         colorTarget.view.Get(), biasTarget.view.Get()};
     ID3D11Buffer* buffer = pixelConstants.Get();
     context->PSSetShaderResources(1, static_cast<UINT>(std::size(ours)), ours);
