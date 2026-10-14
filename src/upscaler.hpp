@@ -39,6 +39,8 @@ struct Status
     float mipBias{};
     unsigned ambientShaders{}, ambientShaderFailures{};
     std::array<std::string, 9> shaders;
+    unsigned shadersRecognised{};
+    bool shaderMismatch{}; // A game shader has unexpected bytecode, so DLSS stays off.
 };
 
 // ---- Engine side ----
