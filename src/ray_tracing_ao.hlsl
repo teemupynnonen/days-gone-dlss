@@ -5,7 +5,7 @@
 // on the normal's side, so only those four are traced. Each gets one cosine-weighted ray from the
 // game's surface into the part of the hemisphere nearest its corner, and occluders within a radius
 // count more the nearer they are. The top bytes hold Bend's depth; Direct3D 11 fills them in.
-#define AmbientRootSignature "RootConstants(num32BitConstants=22, b0), SRV(t0), SRV(t2), " \
+#define AmbientRootSignature "RootConstants(num32BitConstants=22, b0), SRV(t0), SRV(t2), SRV(t7), SRV(t8), SRV(t9), " \
     "DescriptorTable(SRV(t3, numDescriptors=4), UAV(u0))"
 
 cbuffer AmbientParameters : register(b0)
@@ -23,8 +23,11 @@ Texture2D<float4> Coordinates : register(t4);     // Alpha-tested vertices' text
 Texture2D<float> Coverage : register(t5);         // Each material's lowest passing fade level * 16 / 255; 1: never
 Texture2D<uint> Normals : register(t6);           // The game's G-buffer normal over the view, 0 for sky
 RWTexture2D<uint4> Output : register(u0);         // xy: visibility of the four traced corners, 6 bits each
+StructuredBuffer<uint2> CachedDraws : register(t7);          // Per cached instance (from 2): first coordinate, coverage slot
+StructuredBuffer<float4> CacheCoordinates : register(t8);    // Cached alpha-tested vertices' texture coordinates and fade
+StructuredBuffer<float4> TemplateCoordinates : register(t9); // Those of the foliage templates (slots with the top bit set)
 
-#include "ray_tracing_coverage.hlsli"
+#include "ray_tracing_scene.hlsli"
 
 static const float3 Corners[4] = { float3(-1, -1, 1), float3(1, -1, 1), float3(-1, 1, 1), float3(1, 1, 1) };
 // Occluders count within 1 m plus 2.5% of the view distance: the game's screen-space occlusion also
@@ -32,6 +35,8 @@ static const float3 Corners[4] = { float3(-1, -1, 1), float3(1, -1, 1), float3(-
 // take away light the game's ambient lighting already gets from the surroundings, such as the
 // ground below a wall.
 static const float Radius = 100, RadiusPerDistance = 0.025;
+// The trees' copies count from 30 cm plus 0.2% of the view distance on, as for sun rays.
+static const float CopyDistance = 30, CopyDistancePerDistance = 2e-3;
 
 float3 Unproject(float2 screen, float depth)
 {
@@ -75,21 +80,32 @@ float3 CosineDirection(float3 normal, float2 random)
 
 // 1 where nothing lies within the radius, else the squared fraction of it the ray travels: an
 // occluder at half the radius takes away three quarters of the light, and the edge of the radius
-// does not show. The fraction itself would leave the ground under a car most of its light. Only
-// the view's geometry (instance mask 1) occludes: the shadow casters are the sun shadow map's
-// coarser level of detail, placed from the map, and stand off the surfaces they double by more than
-// these short rays allow.
-float Visibility(float3 start, float3 direction, float radius)
+// does not show. The fraction itself would leave the ground under a car most of its light.
+// The view's geometry (instance mask 1, with the cached draws standing in for it) occludes from the
+// start. The trees' copies (mask 4) stand in for most of the view's foliage but keep the wind of the
+// frame their template came from, so they occlude from `copyDistance` on: a leaf is not occluded by
+// its own copy. The shadow casters are the sun shadow map's coarser level of detail, placed from the
+// map, and stand off the surfaces they double by more than these short rays allow.
+float Visibility(float3 start, float3 direction, float radius, float copyDistance)
 {
     RayDesc ray;
     ray.Origin = start;
     ray.Direction = direction;
     ray.TMin = 0;
     ray.TMax = radius;
-    RayQuery<RAY_FLAG_NONE> query;
-    query.TraceRayInline(Scene, RAY_FLAG_NONE, 1, ray);
-    Resolve(query);
-    float travelled = query.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? query.CommittedRayT() / radius : 1;
+    RayQuery<RAY_FLAG_NONE> view;
+    view.TraceRayInline(Scene, RAY_FLAG_NONE, 1, ray);
+    Resolve(view);
+    if (view.CommittedStatus() == COMMITTED_TRIANGLE_HIT) ray.TMax = view.CommittedRayT();
+    if (copyDistance < ray.TMax)
+    {
+        ray.TMin = copyDistance;
+        RayQuery<RAY_FLAG_NONE> copies;
+        copies.TraceRayInline(Scene, RAY_FLAG_NONE, 4, ray);
+        Resolve(copies);
+        if (copies.CommittedStatus() == COMMITTED_TRIANGLE_HIT) ray.TMax = copies.CommittedRayT();
+    }
+    float travelled = ray.TMax / radius;
     return travelled * travelled;
 }
 
@@ -113,7 +129,7 @@ void main(uint2 pixel : SV_DispatchThreadID)
     // the eye as well keeps it in front of the surface where the G-buffer's normal tilts into it.
     float bias = 0.5 + viewDistance * 1e-3;
     float3 start = surface + (normal + (eye - surface) / viewDistance) * bias;
-    float radius = Radius + RadiusPerDistance * viewDistance;
+    float radius = Radius + RadiusPerDistance * viewDistance, copyDistance = CopyDistance + CopyDistancePerDistance * viewDistance;
 
     float3 sides[4];
     for (uint pair = 0; pair < 4; ++pair) sides[pair] = dot(normal, Corners[pair]) > 0 ? Corners[pair] : -Corners[pair];
@@ -135,7 +151,7 @@ void main(uint2 pixel : SV_DispatchThreadID)
                 break;
             }
         }
-        uint value = uint(Visibility(start, direction, radius) * 63 + 0.5);
+        uint value = uint(Visibility(start, direction, radius, copyDistance) * 63 + 0.5);
         uint slot = pair * 2 + (all(sides[pair] == Corners[pair]) ? 0 : 1);
         if (slot < 4) packed.x |= value << (slot * 6);
         else packed.y |= value << (slot * 6 - 24);

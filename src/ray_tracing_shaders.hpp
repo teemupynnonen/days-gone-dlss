@@ -102,8 +102,9 @@ void main(uint index : SV_DispatchThreadID)
 }
 )";
 
-// Copies a material's baked coverage (depth 1 where its alpha test kept the pixel) into its slot of
-// the coverage atlas shared with D3D12.
+// Reduces a material's baked coverage (each sample's lowest passing fade level, 1 where none passes)
+// into its slot of the coverage atlas shared with D3D12. A slot texel passes once CoveredSamples of
+// its samples do: thin needles stay, and a stray sample does not fill the gaps between them.
 inline constexpr char BakeCopy[] = R"(
 cbuffer BakeParameters : register(b0)
 {
@@ -113,10 +114,28 @@ cbuffer BakeParameters : register(b0)
 Texture2D<float> Baked : register(t0);
 RWTexture2D<unorm float> Coverage : register(u0);
 
+static const uint Samples = 4;        // Per slot texel side, as BakeSamples
+static const uint CoveredSamples = 4; // Of Samples * Samples
+
 [numthreads(8, 8, 1)]
 void main(uint2 texel : SV_DispatchThreadID)
 {
-    Coverage[Slot + texel] = Baked[texel];
+    // The texel's level is the CoveredSamples-th lowest of its samples'; lowest stays sorted.
+    float lowest[CoveredSamples];
+    for (uint i = 0; i < CoveredSamples; ++i) lowest[i] = 1;
+    for (uint y = 0; y < Samples; ++y)
+        for (uint x = 0; x < Samples; ++x)
+        {
+            float level = Baked[texel * Samples + uint2(x, y)];
+            for (uint j = 0; j < CoveredSamples; ++j)
+                if (level < lowest[j])
+                {
+                    float larger = lowest[j];
+                    lowest[j] = level;
+                    level = larger;
+                }
+        }
+    Coverage[Slot + texel] = lowest[CoveredSamples - 1];
 }
 )";
 

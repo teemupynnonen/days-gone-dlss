@@ -167,6 +167,6 @@ void main(uint2 pixel : SV_DispatchThreadID)
     // Everything captured shadows the point, foliage included: a tree's copy shading its own leaves
     // is canopy shading them all the same.
     float3 start = hit + hitNormal * (0.5 + length(hit - eye) * 1e-3);
-    if (lit > 0 && Occluded(start, 7, 0, 1e30)) lit = 0;
+    if (lit > 0 && Occluded(start, Sun.xyz, 7, 0, 1e30)) lit = 0;
     Output[pixel] = float4(AlbedoAt(hit) * lit, 1);
 }

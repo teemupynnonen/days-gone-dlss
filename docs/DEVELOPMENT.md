@@ -238,7 +238,9 @@ the corner for two seconds; the work goes on underneath, so switching back is in
   combination covers, since one of them is the mesh fully faded in. A slot covers a whole texture,
   so the bake samples through copies of the game's samplers clamped to the finest mip; at the mip
   a 256² slot would pick, thin needles blur into an opacity that passes everywhere and the cards
-  shadow as solid rectangles.
+  shadow as solid rectangles. Sampled once per slot texel, the finest mip in turn misses needles a
+  texel or two wide and the canopy lets too much sun through, so the bake runs at 1024² and a slot
+  texel passes at the fourth-lowest level of its 16 samples.
 - **Shadow casters.** The game culls geometry outside the view, so objects just off screen would
   stop shadowing it. Bend renders the sun's shadow into a 6912×2304 atlas of three 2304² maps: the
   first covers the whole shadow distance, the other two repeat nearer casters, and small objects
@@ -262,8 +264,7 @@ the corner for two seconds; the work goes on underneath, so switching back is in
   cached hit's vertices from the cache, from the instance's ID on, for its normal. The geometry
   was captured in translated world, so its instance moves by the camera's movement since: the
   view hook reads `PreViewTranslation` (`FViewInfo` + 0xCB4) and checks it against `ViewOrigin`
-  (+ 0xCC0). Ambient occlusion traces only the view's own capture, so the view captures every
-  draw while it runs.
+  (+ 0xCC0).
 - **Foliage.** Bend draws trees and plants as instanced draws whose vertex shader reads each
   instance's transform (three rows, translation in w) from a static structured buffer at `t0`, by
   an index in the low 24 bits of a per-frame list at vertex buffer slot 0, and draws none of them
@@ -276,8 +277,8 @@ the corner for two seconds; the work goes on underneath, so switching back is in
   distance on, so a copy never shadows its own tree's leaves. Once a mesh's copy is ready, the
   view stops capturing its draws: the copies stand in for them, which saves most of the
   rebuild. The copies keep the pose the template was captured in, so their shadows do not sway
-  with the wind. Ambient occlusion traces only the view's geometry, so the view keeps the foliage
-  while it runs.
+  with the wind. While ambient occlusion runs, the view keeps capturing the meshes of trees within
+  20 m (below).
 - **Interop and trace.** Direct3D 11 cannot share buffers with Direct3D 12, and D3D12-created
   resources do not open in D3D11 on this driver, so Direct3D 11 creates every shared resource:
   textures with `SHARED | SHARED_NTHANDLE` and a shared fence. A D3D12 device on the same
@@ -300,13 +301,20 @@ the corner for two seconds; the work goes on underneath, so switching back is in
 - **Ambient occlusion.** Bend's screen-space AO is an `R32G32_UINT` target: eight cube-corner
   visibilities of 6 bits and the square root of depth in half precision. Of each opposite pair the
   lighting reads the corner on the normal's side, so `src/ray_tracing_ao.hlsl` traces those four,
-  one cosine-weighted ray each through the view's geometry, within 1 m plus 2.5% of the view
-  distance. A hit at a fraction t of that radius leaves t² of the light: a linear falloff left
-  the ground under a car most of it. The result is written in the game's packing; the add-on runs
-  the game's own `BlurAmbientCS` on it and copies it over the game's target when lighting first
-  reads it, so the lighting's temporal accumulation filters it in place of the screen-space
-  result. The lighting only scales its ambient terms by AO, and only where it is darker than the
-  material's baked occlusion, so in sunlight the difference is subtle.
+  one cosine-weighted ray each, within 1 m plus 2.5% of the view distance. A hit at a fraction t
+  of that radius leaves t² of the light: a linear falloff left the ground under a car most of it.
+  Rays see the view's geometry, including the cached draws standing in for it, and the trees'
+  copies from 30 cm plus 0.2% of the view distance on, as sun rays do. The shadow casters are a
+  coarser level of detail and are left out. A copy keeps its template's wind, and grass copies
+  counting only from 30 cm no longer darken the ground, so the view keeps capturing every foliage
+  mesh drawn for a tree within 20 m. AO used to make the view capture every static and foliage
+  draw: near the bridge (1920×1080, DLSS Balanced) that rebuilt 2.9 instead of 0.4 million
+  triangles and cost 4.9 ms over sun shadows alone, against 0.6 to 1.1 ms now. The result is
+  written in the game's packing; the add-on runs the game's own `BlurAmbientCS` on it and copies
+  it over the game's target when lighting first reads it, so the lighting's temporal accumulation
+  filters it in place of the screen-space result. The lighting only scales its ambient terms by
+  AO, and only where it is darker than the material's baked occlusion, so in sunlight the
+  difference is subtle.
 - **Global illumination.** One bounce of sunlight, added to the game's lighting. Bend lights the
   opaque scene with a full-screen draw per lighting model into an `R11G11B10_FLOAT` scene colour,
   each picked by the stencil's low 4 bits, blending off. Models 1 to 3 keep the square root of the

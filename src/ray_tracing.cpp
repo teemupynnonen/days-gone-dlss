@@ -48,6 +48,9 @@ constexpr UINT MaskedVertexBytes = 28; // float4 clip position, float2 texture c
 // Baked coverage of alpha-tested materials: 32 by 32 slots of 256 texels square. A forest view
 // holds a few hundred: leaf atlases per species and impostors of distant trees.
 constexpr UINT SlotSize = 256, AtlasSlots = 32, MaterialSlots = AtlasSlots * AtlasSlots, NoMaterial = 0xffffffff;
+// Needles a texel or two wide in the game's textures fall between a slot's texels, and light leaks
+// through the canopy. Each slot texel is baked from BakeSamples squared samples (as BakeCopy reads them).
+constexpr UINT BakeSamples = 4;
 // A material whose alpha test also reads a fade is baked at evenly spaced fades from 0 to 1. Each
 // texel keeps the lowest level that passes, as level * 16 / 255 (255 where none does).
 constexpr UINT FadeLevels = 16;
@@ -113,6 +116,10 @@ constexpr UINT FoliageTransformBytes = 48, FoliageLatency = 4, FoliageIndexCapac
 constexpr UINT FoliageMemory = 600;
 constexpr UINT NoInstance = 0xffffffff;
 constexpr float FoliageRadius = 8000;
+// Ambient occlusion rays see the view's own foliage within this distance (cm) of the camera, and the
+// trees' copies beyond it. The copies only occlude from 30 cm, so grass beyond it no longer darkens
+// the ground; at 5 m that showed a few metres in front of the player.
+constexpr float AmbientFoliageRadius = 2000;
 
 // Bend's screen-space ambient occlusion (BendScreenSpaceShadowingCS) runs at the end of the G-buffer
 // pass. BuildAmbientMaskCS reads the G-buffer normal (t0) and picks the cube corners on its side,
@@ -468,6 +475,7 @@ struct Gpu
     std::unordered_map<ID3D11Buffer*, FoliageTrees> foliage;
     struct FoliageTemplate { std::uint64_t cacheKey; ID3D11Buffer* transforms; UINT reference; };
     std::unordered_map<std::uint64_t, FoliageTemplate> foliageTemplates;
+    std::unordered_set<std::uint64_t> nearFoliage; // The meshes of the trees within AmbientFoliageRadius
     struct FoliageReadback { ComPtr<ID3D11Buffer> staging; std::vector<Capture::FoliageDraw> draws; bool pending{}; };
     std::array<FoliageReadback, FoliageLatency> foliageReadbacks;
     UINT foliageNext{};
@@ -901,10 +909,12 @@ UINT writeFoliage(Gpu& g, D3D12_RAYTRACING_INSTANCE_DESC* instances, std::uint32
         return foliageReference(g, model->second, *entry);
     };
     std::unordered_map<std::uint64_t, std::optional<FoliageReference>> references;
+    g.nearFoliage.clear();
     UINT count{};
     for (const auto& [distance, trees, i] : nearby)
         for (const auto mesh : trees->meshes[i])
         {
+            if (distance < double{AmbientFoliageRadius} * AmbientFoliageRadius) g.nearFoliage.insert(mesh);
             auto reference = references.find(mesh);
             if (reference == references.end()) reference = references.emplace(mesh, resolve(mesh)).first;
             if (!reference->second || count == capacity) continue;
@@ -1059,7 +1069,7 @@ std::unique_ptr<Gpu> create(ID3D11DeviceContext* context)
     check(g.device->CreateShaderResourceView(noCanopy.Get(), nullptr, g.noCanopy.GetAddressOf()), "Creating the empty canopy view");
     g.coverage = sharedTexture(g.device.Get(), SlotSize * AtlasSlots, SlotSize * AtlasSlots, DXGI_FORMAT_R8_UNORM, "Creating the coverage atlas");
     check(g.device->CreateUnorderedAccessView(g.coverage.Get(), nullptr, g.coverageAccess.GetAddressOf()), "Creating the coverage view");
-    D3D11_TEXTURE2D_DESC bake{SlotSize, SlotSize, 1, 1, DXGI_FORMAT_R32_TYPELESS, {1, 0}, D3D11_USAGE_DEFAULT,
+    D3D11_TEXTURE2D_DESC bake{SlotSize * BakeSamples, SlotSize * BakeSamples, 1, 1, DXGI_FORMAT_R32_TYPELESS, {1, 0}, D3D11_USAGE_DEFAULT,
         D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE};
     check(g.device->CreateTexture2D(&bake, nullptr, g.bakeDepth.GetAddressOf()), "Creating the coverage bake target");
     const D3D11_DEPTH_STENCIL_VIEW_DESC bakeTarget{DXGI_FORMAT_D32_FLOAT, D3D11_DSV_DIMENSION_TEXTURE2D};
@@ -1621,7 +1631,10 @@ void recordAmbient(Gpu& g, UINT slot, const TraceConstants& trace)
     list->SetComputeRoot32BitConstants(0, sizeof(constants) / 4, &constants, 0);
     list->SetComputeRootShaderResourceView(1, g.top->GetGPUVirtualAddress());
     list->SetComputeRootShaderResourceView(2, g.materialTable->GetGPUVirtualAddress() + UINT64{slot} * MaxMaterialDraws * 8);
-    list->SetComputeRootDescriptorTable(3, a.descriptors->GetGPUDescriptorHandleForHeapStart());
+    list->SetComputeRootShaderResourceView(3, g.cacheTable->GetGPUVirtualAddress() + UINT64{slot} * (MaxInstances - 2) * 8);
+    list->SetComputeRootShaderResourceView(4, g.cache->coordinates());
+    list->SetComputeRootShaderResourceView(5, g.templates->coordinates());
+    list->SetComputeRootDescriptorTable(6, a.descriptors->GetGPUDescriptorHandleForHeapStart());
     list->Dispatch((constants.size[0] + 7) / 8, (constants.size[1] + 7) / 8, 1);
     list->EndQuery(a.timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot * 2 + 1);
     list->ResolveQueryData(a.timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot * 2, 2, a.timestampReadback.Get(), slot * 2 * sizeof(UINT64));
@@ -2384,11 +2397,10 @@ std::uint64_t objectKey(Gpu& g, ID3D11DeviceContext* context, std::uint32_t inst
 std::uint64_t cacheKey(std::uint64_t object, std::uint64_t draw) { return (object ^ draw) * 1099511628211ull; }
 
 // Whether the cache can stand in for a static draw, so the view need not capture it: it holds the
-// draw's geometry. The ambient occlusion rays see only the view's own geometry, so the view keeps
-// its draws while they run.
+// draw's geometry.
 bool cacheStandsIn(const Gpu& g, std::uint64_t object, std::uint64_t draw)
 {
-    return offscreenGeometry && !ambientWanted() && object && !g.movers.contains(object) && g.cache->contains(cacheKey(object, draw));
+    return offscreenGeometry && object && !g.movers.contains(object) && g.cache->contains(cacheKey(object, draw));
 }
 
 void standIn(std::uint64_t object, std::uint64_t draw, bool masked)
@@ -2468,11 +2480,12 @@ std::uint64_t foliageMesh(ID3D11DeviceContext* context, std::uint32_t count, std
 }
 
 // Whether the trees' copies can stand in for a foliage draw of this mesh, so the view need not
-// capture it: its template is cached and placed. The ambient occlusion rays see only the view's own
-// geometry, so the view keeps the foliage while they run.
+// capture it: its template is cached and placed. The copies keep the wind of their template's frame
+// and only occlude ambient light from a distance, so the view keeps the meshes near the camera while
+// the ambient occlusion rays run.
 bool copiesStandIn(const Gpu& g, std::uint64_t mesh)
 {
-    if (!offscreenGeometry || ambientWanted()) return false;
+    if (!offscreenGeometry || (ambientWanted() && g.nearFoliage.contains(mesh))) return false;
 
     const auto model = g.foliageTemplates.find(mesh);
     return model != g.foliageTemplates.end() && model->second.reference != NoInstance && g.templates->find(model->second.cacheKey);
@@ -2586,7 +2599,7 @@ UINT bake(Gpu& g, ID3D11DeviceContext* context, ID3D11PixelShader* pixelShader, 
     const BakeConstants constants{{slot % AtlasSlots * SlotSize, slot / AtlasSlots * SlotSize}, {}};
     inOwnState(g, [&]
     {
-        const D3D11_VIEWPORT viewport{0, 0, SlotSize, SlotSize, 0, 1};
+        const D3D11_VIEWPORT viewport{0, 0, SlotSize * BakeSamples, SlotSize * BakeSamples, 0, 1};
         g.context->ClearDepthStencilView(g.bakeTarget.Get(), D3D11_CLEAR_DEPTH, 1, 0);
         g.context->RSSetViewports(1, &viewport);
         g.context->RSSetState(g.noCull.Get());

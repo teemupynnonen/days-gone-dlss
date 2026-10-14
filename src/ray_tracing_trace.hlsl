@@ -46,6 +46,15 @@ float3 Unproject(float2 screen, float depth)
     return world.xyz / world.w;
 }
 
+// 1 where no captured geometry of the given instances lies between the point and the sun. The
+// instanced foliage (mask 4) repeats the trees on screen, wind and level of detail aside, so it only
+// occludes from `near` on: its copy of a tree never shadows that tree's own leaves.
+float TraceSun(float3 start, uint mask, float near)
+{
+    if (Occluded(start, Sun.xyz, mask & 3, 0, 1e30)) return 0;
+    return (mask & 4) && Occluded(start, Sun.xyz, 4, near, 1e30) ? 0 : 1;
+}
+
 [RootSignature(TraceRootSignature)]
 [numthreads(8, 8, 1)]
 void main(uint2 pixel : SV_DispatchThreadID)
@@ -126,6 +135,6 @@ void main(uint2 pixel : SV_DispatchThreadID)
     // closer to the pixel than the foliage's `near` leaves the view with it, bar the screen's edges,
     // so the check keeps the view's geometry that close.
     float near = 30 + length(surface - eye) * 2e-3;
-    float offscreen = OffscreenCheck && !Occluded(start, 1, 0, near) ? TraceSun(start, 6, near) : 0;
+    float offscreen = OffscreenCheck && !Occluded(start, Sun.xyz, 1, 0, near) ? TraceSun(start, 6, near) : 0;
     SunOutput[pixel] = float4(TraceSun(start, 7, near), lit, known, offscreen);
 }

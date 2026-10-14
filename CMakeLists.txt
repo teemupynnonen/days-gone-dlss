@@ -112,7 +112,7 @@ add_custom_command(OUTPUT "${GENERATED_DIR}/ray_tracing_ao.h"
     COMMAND "${CMAKE_COMMAND}" -E make_directory "${GENERATED_DIR}"
     COMMAND "${DXC_EXECUTABLE}" -nologo -T cs_6_5 -E main -Vn AmbientTraceShader -Fh "${GENERATED_DIR}/ray_tracing_ao.h"
         "${CMAKE_SOURCE_DIR}/src/ray_tracing_ao.hlsl"
-    DEPENDS src/ray_tracing_ao.hlsl src/ray_tracing_coverage.hlsli
+    DEPENDS src/ray_tracing_ao.hlsl src/ray_tracing_scene.hlsli
     VERBATIM
 )
 add_custom_command(OUTPUT "${GENERATED_DIR}/ray_tracing_bounce.h"

@@ -1,6 +1,6 @@
-// Ray queries through the whole captured scene: alpha testing and sun visibility. The including
-// shader declares Scene, Materials, Coordinates, Coverage, CachedDraws, CacheCoordinates and
-// TemplateCoordinates, and MaskedBase, MaterialDraws and Sun among its constants, as
+// Ray queries through the whole captured scene: alpha testing and occlusion. The including shader
+// declares Scene, Materials, Coordinates, Coverage, CachedDraws, CacheCoordinates and
+// TemplateCoordinates, and MaskedBase and MaterialDraws among its constants, as
 // ray_tracing_trace.hlsl does.
 
 static const uint AtlasSlots = 32, SlotSize = 256; // Coverage slots per atlas row, texels per slot side
@@ -61,25 +61,16 @@ template<uint Flags> void Resolve(inout RayQuery<Flags> query)
             query.CommitNonOpaqueTriangleHit();
 }
 
-// Whether captured geometry of the given instances lies between `near` and `far` towards the sun.
-bool Occluded(float3 start, uint mask, float near, float far)
+// Whether captured geometry of the given instances lies between `near` and `far` along `direction`.
+bool Occluded(float3 start, float3 direction, uint mask, float near, float far)
 {
     RayDesc ray;
     ray.Origin = start;
-    ray.Direction = Sun.xyz;
+    ray.Direction = direction;
     ray.TMin = near;
     ray.TMax = far;
     RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> query;
     query.TraceRayInline(Scene, RAY_FLAG_NONE, mask, ray);
     Resolve(query);
     return query.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
-}
-
-// 1 where no captured geometry of the given instances lies between the point and the sun. The
-// instanced foliage (mask 4) repeats the trees on screen, wind and level of detail aside, so it only
-// occludes from `near` on: its copy of a tree never shadows that tree's own leaves.
-float TraceSun(float3 start, uint mask, float near)
-{
-    if (Occluded(start, mask & 3, 0, 1e30)) return 0;
-    return (mask & 4) && Occluded(start, 4, near, 1e30) ? 0 : 1;
 }
