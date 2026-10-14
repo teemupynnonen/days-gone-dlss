@@ -11,6 +11,9 @@
 //
 // SDR: DLSS runs in LDR mode on the square-root encoding. HDR: highlights exceed 1, so the prepare
 // pass squares the colour and DLSS runs in HDR mode on linear values; `Linear` marks its output.
+//
+// GAME_VERSION (107 or 113) selects the game build's composite: 1.07 has no film grain after the
+// vignette, a simpler upscale composite and a different HDR encoding (docs/DIFFERENCES.md).
 namespace days_gone_dlss::upscaler::shaders
 {
 inline constexpr char Common[] = R"(
@@ -49,13 +52,23 @@ float3 EncodeSrgb(float3 color)
     return min(1.055 * pow(max(color, 0.003131), 1.0 / 2.4) - 0.055, color * 12.92);
 }
 
+#if GAME_VERSION == 107
+// Bend's 1.07 HDR output: a log fit of ST 2084 with 1.0 at 200 nits and a quadratic toe.
+float3 EncodeHdr(float3 color)
+{
+    float3 curve = saturate(log2(color * 0.5 + 0.00263665011) * 0.0765511990 + 0.655820012);
+    float3 toe = saturate(0.141420007 - color * 0.353549987);
+    return saturate(color * 16384) * (toe * toe + curve);
+}
+#else
 // Bend's HDR output: a soft toe into ST 2084, with 1.0 at 200 nits.
-float3 EncodePq(float3 color)
+float3 EncodeHdr(float3 color)
 {
     float3 x = color * 0.02 + (exp2(color * -40.96) - 1) * 0.00045;
     float3 p = pow(abs(x), 0.1593017578125);
     return pow((18.8515625 * p + 0.8359375) / (18.6875 * p + 1), 78.84375);
 }
+#endif
 
 // AMD FidelityFX RCAS (FsrRcasF in ffx_fsr1.h, MIT: AMD-FidelityFX-LICENSE.txt) on square-root encoded
 // colour: b, d, f and h are the pixels above, left, right and below e. Its noise filter is left out
@@ -164,10 +177,11 @@ cbuffer OutputParameters : register(b1)
 {
     int2 OutputOrigin;
     uint DebugView;
-    uint Hdr;     // The HDR variant: brightness in Composite[5].xy, blend flag in .z, PQ output
+    uint Hdr;     // The HDR variant: brightness constants (1.13: Composite[5], 1.07: [3]) and HDR output
     float2 RenderScale;
     uint Linear;  // DLSS output is linear rather than square-root encoded
     float Sharpness;
+    uint Filtered; // _01/_11, which filter the history: 1.13 sharpens it, 1.07 resamples it about the centre
 };
 Texture2D<float4> Interface : register(t0);
 Texture2D<float4> Upscaled : register(t1);
@@ -203,6 +217,20 @@ float4 main(float2 uv : TEXCOORD0, float4 position : SV_Position) : SV_Target
             BiasInput.Load(source));
         color = encoded * encoded;
     }
+#if GAME_VERSION == 107
+    // No auxiliary history or grain. The filtering variants sample the history and the vignette at
+    // uv scaled about the centre by 1 - 4a, with a = 1 / history size - 1 / output size from the two
+    // rows after the brightness. Only the vignette follows: DLSS output is already at output size.
+    float2 vignetteUv = uv;
+    if (Filtered)
+    {
+        uint row = Hdr ? 4 : 3;
+        float2 a = (1 - Composite[row + 1].zw * Composite[row].xy) * Composite[row].zw;
+        vignetteUv = (uv - 0.5) * (1 - 4 * a) + 0.5;
+    }
+    color = Vignette(color, vignetteUv, Composite[0], Composite[1], Composite[2], Hdr ? Composite[3].x : 1);
+    float interfaceBrightness = Hdr ? Composite[3].y : 1;
+#else
     else if (asuint(Hdr ? Composite[5].z : Composite[5].x) != 0)
     {
         float3 auxiliary = Auxiliary.SampleLevel(Bilinear, uv * Composite[6].xy * Composite[6].zw, 0).xyz;
@@ -211,9 +239,11 @@ float4 main(float2 uv : TEXCOORD0, float4 position : SV_Position) : SV_Target
     }
     color = Vignette(color, uv, Composite[2], Composite[3], Composite[4], Hdr ? Composite[5].x : 1)
         * Grain(uv + Composite[0].xy, Composite[1]);
+    float interfaceBrightness = Hdr ? Composite[5].y : 1;
+#endif
     float4 ui = Interface.Load(int3(pixel, 0));
-    color = color * (1 - ui.a) + ui.rgb * (Hdr ? Composite[5].y : 1);
-    return float4(Hdr ? EncodePq(color) : EncodeSrgb(color), 0);
+    color = color * (1 - ui.a) + ui.rgb * interfaceBrightness;
+    return float4(Hdr ? EncodeHdr(color) : EncodeSrgb(color), 0);
 }
 )";
 
@@ -263,14 +293,17 @@ void main(uint2 pixel : SV_DispatchThreadID)
             Encoded(at + int2(1, 0)), Encoded(at + int2(0, 1)), Sharpness, linearColor);
         color = linearColor ? encoded * encoded : encoded;
     }
-    // The full-resolution TAA applies grain before and after decoding; keep both.
+    // The full-resolution TAA applies grain before decoding, and 1.13 again after the vignette.
     float grain = Grain(center * Temporal[Hdr ? 6 : 5].zw + Temporal[0].xy, Temporal[1]);
     color = linearColor ? color * (grain * grain) : (color * grain) * (color * grain);
     float2 uv = center * Temporal[Hdr ? 7 : 6].zw;
-    color = Vignette(color, uv, Temporal[2], Temporal[3], Temporal[4], Hdr ? Temporal[5].x : 1) * Grain(uv + Temporal[0].xy, Temporal[1]);
+    color = Vignette(color, uv, Temporal[2], Temporal[3], Temporal[4], Hdr ? Temporal[5].x : 1);
+#if GAME_VERSION != 107
+    color *= Grain(uv + Temporal[0].xy, Temporal[1]);
+#endif
     float4 ui = Interface[pixel];
     color = color * (1 - ui.a) + ui.rgb * (Hdr ? Temporal[5].y : 1);
-    float3 encoded = Hdr ? EncodePq(color) : EncodeSrgb(color);
+    float3 encoded = Hdr ? EncodeHdr(color) : EncodeSrgb(color);
     Output[pixel] = float4(encoded, encoded.r);
 }
 )";

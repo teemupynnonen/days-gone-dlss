@@ -16,7 +16,7 @@
 
 extern "C" __declspec(dllexport) const char* NAME = "Days Gone DLSS";
 extern "C" __declspec(dllexport) const char* DESCRIPTION =
-    "NVIDIA DLSS Super Resolution and DLAA in place of Days Gone's temporal anti-aliasing (Steam build 19221447).";
+    "NVIDIA DLSS Super Resolution and DLAA in place of Days Gone's temporal anti-aliasing (game versions 1.13 and 1.07).";
 
 namespace
 {
@@ -35,15 +35,6 @@ ID3D11DeviceContext* wrappedContext{};
 ID3D11DeviceContext* native(command_list* list)
 {
     return reinterpret_cast<ID3D11DeviceContext*>(list->get_native());
-}
-
-bool supportedGame()
-{
-    const auto base = reinterpret_cast<const std::uint8_t*>(GetModuleHandleW(nullptr));
-    const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
-    const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
-    return nt->Signature == IMAGE_NT_SIGNATURE && nt->FileHeader.TimeDateStamp == 0x68754D46
-        && nt->OptionalHeader.SizeOfImage == 0x93F0000;
 }
 
 // Settings and the log live beside the add-on, as ReShade keeps its own.
@@ -167,7 +158,7 @@ void onPresent(command_queue*, swapchain* chain, const rect*, const rect*, uint3
         {
             const auto status = MH_Initialize();
             if (status != MH_OK && status != MH_ERROR_ALREADY_INITIALIZED) throw std::runtime_error(MH_StatusToString(status));
-            upscaler::initialize(reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr)), dataDirectory());
+            upscaler::initialize(dataDirectory());
             engineReady = true;
         }
         catch (const std::exception& error)
@@ -193,7 +184,9 @@ void onOverlay(effect_runtime*)
 
 extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon, HMODULE reshadeModule)
 {
-    if (!supportedGame() || !reshade::register_addon(addon, reshadeModule)) return false;
+    if (!upscaler::selectBuild(reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr)))
+        || !reshade::register_addon(addon, reshadeModule))
+        return false;
     self = addon;
     // The view hook and pending RHI commands point into this module; keep it loaded until exit.
     HMODULE pinned{};

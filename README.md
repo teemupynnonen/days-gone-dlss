@@ -4,7 +4,8 @@ Adds NVIDIA DLSS Super Resolution and DLAA to Days Gone, with SDR and HDR suppor
 
 ## Requirements
 
-- Days Gone on Windows, **Steam build 19221447**. Other builds are untested.
+- Days Gone on Windows, Steam version **1.13** (build 19221447) or **1.07** (the `days_gone_classic`
+  beta, build 10034136). The add-on detects which one is running and stays unloaded on others.
 - An **NVIDIA RTX GPU** and an up-to-date driver.
 - [ReShade 6.8+ with full add-on support](https://reshade.me/#download).
 
@@ -21,7 +22,8 @@ Adds NVIDIA DLSS Super Resolution and DLAA to Days Gone, with SDR and HDR suppor
 ## Use
 
 Choose modes and presets in the overlay. Leave the other settings at their defaults to
-start with. DLSS controls the game's Render Scale while enabled; **Off** restores it.
+start with. On 1.07, if foliage shimmers in Performance or lower modes, turn off
+**Screen-space indirect lighting**. DLSS controls the game's Render Scale while enabled; **Off** restores it.
 Settings are saved in `DaysGoneDLSS.ini` beside the add-on.
 
 To **update**, close the game and replace the ZIP's files. Keep your INI to retain settings.
@@ -31,7 +33,7 @@ You can also remove its INI, log, and `DaysGoneDLSS` documentation folder.
 
 ## Problems
 
-If the add-on is missing, check the install path, game build, and ReShade's full add-on
+If the add-on is missing, check the install path, game version, and ReShade's full add-on
 support. For DLSS errors, check the overlay status and your NVIDIA driver.
 
 Report issues with `DaysGoneDLSS.log` and `ReShade.log` from the game executable's folder,

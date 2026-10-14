@@ -69,6 +69,13 @@ void drawMenu(float scale)
         changed = true;
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Added to the automatic mip bias for the render scale. Lower is sharper but can shimmer. Default: 0.");
+    if (state.indirectLightingOption)
+    {
+        changed |= ImGui::Checkbox("Screen-space indirect lighting", &wanted.indirectLighting);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Bounced light between nearby surfaces, from the game's highest settings. It is noisy and can make\n"
+                "foliage shimmer at lower DLSS render resolutions. Off renders as the game's lower settings do. Default: on.");
+    }
     if (changed) applySettings(wanted);
 
     ImGui::Spacing();
@@ -92,11 +99,12 @@ void drawMenu(float scale)
     ImGui::SameLine();
     diagnosticsChanged |= ImGui::Checkbox("Invert jitter Y", &options.invertJitterY);
     diagnosticsChanged |= ImGui::Checkbox("Motion vectors include jitter", &options.jitteredMotion);
-    diagnosticsChanged |= ImGui::Checkbox("Correct full-resolution ambient occlusion", &options.fullResolutionAmbientOcclusion);
+    diagnosticsChanged |= ImGui::Checkbox("Correct ambient occlusion weights", &options.fullResolutionAmbientOcclusion);
     const char* views[]{"Final image", "Motion vectors", "Depth", "DLSS input colour", "Current colour bias"};
     ImGui::SetNextItemWidth(220 * scale);
     diagnosticsChanged |= ImGui::Combo("Debug view", &options.debugView, views, static_cast<int>(std::size(views)));
     if (diagnosticsChanged) applyDiagnostics(options);
+    ImGui::Text("Game version %s", state.gameBuild.c_str());
     ImGui::Text("NGX context: %s", state.wrappedContext ? "ReShade wrapper" : "native");
     ImGui::Text("Frames: %llu evaluated, %llu on game TAA", static_cast<unsigned long long>(state.evaluations),
         static_cast<unsigned long long>(state.fallbacks));

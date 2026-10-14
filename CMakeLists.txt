@@ -98,7 +98,7 @@ add_library(dxbc_hash STATIC "${DXBC_HASH_DIR}/DxilHash.cpp")
 target_compile_definitions(dxbc_hash PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 
 add_library(days_gone_dlss SHARED src/upscaler.cpp src/upscaler_settings.cpp src/upscaler_menu.cpp src/upscaler_addon.cpp
-    src/ambient_occlusion.cpp src/shader_bytecode.cpp)
+    src/ambient_occlusion.cpp src/indirect_lighting.cpp src/shader_bytecode.cpp)
 target_include_directories(days_gone_dlss PRIVATE src)
 target_include_directories(days_gone_dlss SYSTEM PRIVATE "${RESHADE_DIR}/include" "${RESHADE_DIR}/imgui")
 target_link_libraries(days_gone_dlss PRIVATE minhook ngx dxbc_hash d3d11 dxgi d3dcompiler)

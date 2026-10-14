@@ -44,9 +44,18 @@ and local settings are excluded. ReShade is installed separately by the player.
 | `tests/upscaler_tests.cpp` | Settings tests |
 | `src/shader_bytecode.*` | Bounded DXBC parsing and checksum updates |
 | `src/ambient_occlusion.*`, `tests/ambient_occlusion_tests.cpp` | AO reconstruction weight correction and WARP regression tests |
+| `src/indirect_lighting.*` | Identifies 1.07's screen-space indirect lighting passes |
 
 The shader rendering test uses authored HLSL on WARP to check the AO near-integer
 rounding regression. No extracted game shaders are required by the tests.
+
+## Game versions
+
+The add-on supports 1.13 (Steam build 19221447) and 1.07 (Steam beta `days_gone_classic`, build
+10034136), identified by the executable's PE header when the add-on loads. `Builds[]` in
+`src/upscaler.cpp` holds each build's addresses, FViewInfo layout and shader checksums, and the
+runtime HLSL is compiled with `GAME_VERSION` 113 or 107. The rest of this document describes 1.13;
+[DIFFERENCES.md](DIFFERENCES.md) lists what 1.07 does differently.
 
 ## How Bend renders anti-aliasing
 
@@ -133,9 +142,16 @@ percent screen percentage. The jitter is added to the projection with +Y up.
   Original DXBC instructions and constants are retained; only the rounding instruction and
   the necessary container sizes, offsets and checksum change. No extracted game shaders are
   included in the distribution.
+- **Indirect lighting (1.07).** 1.07's screen-space indirect lighting traces a new random ray per
+  pixel every frame and leaves the noise to its TAA, which DLSS shows as boiling below Balanced.
+  With the "Screen-space indirect lighting" setting off, the add-on skips its four passes while
+  DLSS runs and clears the result the lighting reads to black, as the game does when SSIL is off.
+  DIFFERENCES.md has the details.
 
 Any frame the replacement cannot handle uses the game's TAA and logs why once. If the upscale
 composite does not follow a replaced TAA, DLSS stops instead of showing a stale history.
+
+1.13's addresses follow; DIFFERENCES.md has 1.07's.
 
 | Address (RVA) | Purpose |
 | --- | --- |
