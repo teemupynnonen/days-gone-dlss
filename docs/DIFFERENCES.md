@@ -71,14 +71,15 @@ The motion maths, velocity encoding and packed format are identical.
 | Vignette tint, shape, edge | rows 2, 3, 4 | rows 0, 1, 2 |
 | HDR scene and UI brightness | row 5 | row 3 |
 | Film grain | after the vignette | none |
-| Auxiliary history blend | when enabled by row 5 | none |
+| Auxiliary history blend | when row 5 flags it, e.g. on every cutscene cut | none |
 | `_01`/`_11` history filter | 5-tap sharpen | 6-tap hexagon blur, uv scaled about the centre by 1 − 4a |
 | HDR encoding | PQ | log fit |
 | Variant while upscaling | `_00`/`_10` at 95–110 %, else `_01`/`_11` | `_01`/`_11` |
 
 `a` = 1 / history size − 1 / output size, from the two rows after the HDR brightness. The add-on
 evaluates 1.07's vignette at the same scaled uv but does not scale the image itself; DLSS replaces
-the game's filter, as it does 1.13's sharpening.
+the game's filter, as it does 1.13's sharpening. The add-on leaves out 1.13's auxiliary history
+blend: the game's TAA writes that history and does not run under DLSS.
 
 **Ambient occlusion.** 1.07 renders AO at half resolution with the same settings that give full
 resolution in 1.13: it uses the checkerboard permutation of `FComputeAmbientCS` (1.13's `<true>`),

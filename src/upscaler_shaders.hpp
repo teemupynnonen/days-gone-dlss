@@ -17,21 +17,6 @@
 namespace days_gone_dlss::upscaler::shaders
 {
 inline constexpr char Common[] = R"(
-// Bend's YCoCg history encoding: Y, Co * 0.5 + 0.5, Cg * 0.5 + 0.5.
-float3 ToYCoCg(float3 rgb)
-{
-    float y = rgb.r * 0.25 + rgb.g * 0.5 + rgb.b * 0.25;
-    float co = rgb.r * 0.5 - rgb.b * 0.5;
-    float cg = rgb.g * 0.5 - rgb.r * 0.25 - rgb.b * 0.25;
-    return float3(y, co * 0.5 + 0.5, cg * 0.5 + 0.5);
-}
-
-float3 FromYCoCg(float3 ycocg)
-{
-    float co = ycocg.y * 2 - 1, cg = ycocg.z * 2 - 1;
-    return float3(ycocg.x + co - cg, ycocg.x + cg, ycocg.x - co - cg);
-}
-
 // Multiplicative film grain; scale.x is the strength and scale.y its bias (0, 1 disables it).
 float Grain(float2 position, float4 scale)
 {
@@ -185,12 +170,10 @@ cbuffer OutputParameters : register(b1)
 };
 Texture2D<float4> Interface : register(t0);
 Texture2D<float4> Upscaled : register(t1);
-Texture2D<float4> Auxiliary : register(t2);
-Texture2D<float2> MotionInput : register(t3);
-Texture2D<float> DepthInput : register(t4);
-Texture2D<float4> ColorInput : register(t5);
-Texture2D<float> BiasInput : register(t6);
-SamplerState Bilinear : register(s0);
+Texture2D<float2> MotionInput : register(t2);
+Texture2D<float> DepthInput : register(t3);
+Texture2D<float4> ColorInput : register(t4);
+Texture2D<float> BiasInput : register(t5);
 
 float3 Encoded(int2 local, int2 last)
 {
@@ -231,12 +214,9 @@ float4 main(float2 uv : TEXCOORD0, float4 position : SV_Position) : SV_Target
     color = Vignette(color, vignetteUv, Composite[0], Composite[1], Composite[2], Hdr ? Composite[3].x : 1);
     float interfaceBrightness = Hdr ? Composite[3].y : 1;
 #else
-    else if (asuint(Hdr ? Composite[5].z : Composite[5].x) != 0)
-    {
-        float3 auxiliary = Auxiliary.SampleLevel(Bilinear, uv * Composite[6].xy * Composite[6].zw, 0).xyz;
-        encoded = FromYCoCg(auxiliary + (ToYCoCg(encoded) - auxiliary) * 0.25);
-        color = encoded * encoded;
-    }
+    // When row 5 flags it, e.g. on every cutscene cut, the game blends in 75% of an auxiliary history
+    // that its own TAA writes. That TAA does not run under DLSS, so the blend would show a stale
+    // texture as a white flash; leave it out.
     color = Vignette(color, uv, Composite[2], Composite[3], Composite[4], Hdr ? Composite[5].x : 1)
         * Grain(uv + Composite[0].xy, Composite[1]);
     float interfaceBrightness = Hdr ? Composite[5].y : 1;
