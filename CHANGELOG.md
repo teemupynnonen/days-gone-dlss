@@ -1,5 +1,10 @@
 # Days Gone DLSS changelog
 
+## 1.4.1
+
+- Fix a white flash at every camera cut in cutscenes on Days Gone 1.13. The game's upscaling
+  blended in a texture that only its own anti-aliasing updates, which does not run with DLSS.
+
 ## 1.4.0
 
 - Support Days Gone 1.07, the version before the Remastered update (Steam beta
