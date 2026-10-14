@@ -59,9 +59,10 @@ void persistence(const fs::path& root)
     expect(loadSettings(path) == Settings{}, "A first launch keeps the game's own anti-aliasing.");
     expect(!fs::exists(path), "Loading defaults must not create a settings file.");
 
-    const Settings chosen{Quality::Custom, 0.625f, Preset::K, -0.25f, 0.4f};
+    const Settings chosen{Quality::Custom, 0.625f, Preset::K, -0.25f, 0.4f, false};
     saveSettings(path, chosen);
-    expect(loadSettings(path) == chosen, "Restart restores the mode, custom scale, preset, texture bias and sharpening.");
+    expect(loadSettings(path) == chosen,
+        "Restart restores the mode, custom scale, preset, texture bias, sharpening and indirect lighting.");
     for (int i = 0; i < static_cast<int>(Quality::Count); ++i)
     {
         auto mode = chosen;
@@ -78,6 +79,7 @@ void persistence(const fs::path& root)
         Settings::MaxSharpness}, "Unknown modes and reserved presets fall back to defaults; bias and sharpening are clamped.");
     write(path, "quality=dlaa\n");
     expect(loadSettings(path).sharpness == Settings::DefaultSharpness, "Settings saved before sharpening get its default.");
+    expect(loadSettings(path).indirectLighting, "Settings saved before the indirect lighting option keep it on.");
     write(path, "sharpness=-1\n");
     expect(loadSettings(path).sharpness == 0, "Negative sharpening turns it off.");
     write(path, "custom_scale=0.05\n");

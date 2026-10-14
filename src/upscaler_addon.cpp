@@ -17,7 +17,7 @@
 
 extern "C" __declspec(dllexport) const char* NAME = "Days Gone DLSS";
 extern "C" __declspec(dllexport) const char* DESCRIPTION =
-    "NVIDIA DLSS Super Resolution and DLAA in place of Days Gone's temporal anti-aliasing (Steam build 19221447).";
+    "NVIDIA DLSS Super Resolution and DLAA in place of Days Gone's temporal anti-aliasing (game versions 1.13 and 1.07).";
 
 namespace
 {
@@ -29,6 +29,7 @@ constexpr GUID UnwrappedObject{0x7f2c9a11, 0x3b4e, 0x4d6a, {0x81, 0x2f, 0x5e, 0x
 
 HMODULE self{};
 bool engineReady{}, engineFailed{};
+bool rayTracing{}; // The game build supports the ray-tracing experiment; nothing calls into it otherwise.
 ID3D11Device* nativeDevice{};
 ID3D11DeviceContext* nativeContext{};
 ID3D11DeviceContext* wrappedContext{};
@@ -36,15 +37,6 @@ ID3D11DeviceContext* wrappedContext{};
 ID3D11DeviceContext* native(command_list* list)
 {
     return reinterpret_cast<ID3D11DeviceContext*>(list->get_native());
-}
-
-bool supportedGame()
-{
-    const auto base = reinterpret_cast<const std::uint8_t*>(GetModuleHandleW(nullptr));
-    const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
-    const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
-    return nt->Signature == IMAGE_NT_SIGNATURE && nt->FileHeader.TimeDateStamp == 0x68754D46
-        && nt->OptionalHeader.SizeOfImage == 0x93F0000;
 }
 
 // Settings and the log live beside the add-on, as ReShade keeps its own.
@@ -106,7 +98,7 @@ void onDestroyCommandQueue(command_queue* queue)
 {
     if (reinterpret_cast<ID3D11DeviceContext*>(queue->get_native()) != nativeContext) return;
     upscaler::detach();
-    ray_tracing::release();
+    if (rayTracing) ray_tracing::release();
     nativeContext = wrappedContext = nullptr;
     nativeDevice = nullptr;
 }
@@ -121,6 +113,7 @@ void onInitPipeline(device* device, pipeline_layout, uint32_t count, const pipel
         auto* object = reinterpret_cast<IUnknown*>(pipeline.handle);
         if (subobjects[i].type == pipeline_subobject_type::compute_shader || subobjects[i].type == pipeline_subobject_type::pixel_shader)
             upscaler::shaderCreated(shader->code, shader->code_size, object);
+        if (!rayTracing) continue;
         if (subobjects[i].type == pipeline_subobject_type::pixel_shader)
             ray_tracing::pixelShaderCreated(shader->code, shader->code_size, object);
         else if (subobjects[i].type == pipeline_subobject_type::vertex_shader)
@@ -151,19 +144,19 @@ void onPushDescriptors(command_list* list, shader_stage stages, pipeline_layout,
 
 bool onDispatch(command_list* list, uint32_t x, uint32_t y, uint32_t z)
 {
-    ray_tracing::dispatch(native(list));
+    if (rayTracing) ray_tracing::dispatch(native(list));
     return upscaler::dispatch(native(list), x, y, z);
 }
 
 bool onDraw(command_list* list, uint32_t vertices, uint32_t instances, uint32_t first, uint32_t firstInstance)
 {
-    if (ray_tracing::draw(native(list), vertices, instances, first, 0, firstInstance, false)) return true;
+    if (rayTracing && ray_tracing::draw(native(list), vertices, instances, first, 0, firstInstance, false)) return true;
     return instances == 1 && !firstInstance && upscaler::draw(native(list), vertices, first, 0, false);
 }
 
 bool onDrawIndexed(command_list* list, uint32_t indices, uint32_t instances, uint32_t first, int32_t offset, uint32_t firstInstance)
 {
-    if (ray_tracing::draw(native(list), indices, instances, first, offset, firstInstance, true)) return true;
+    if (rayTracing && ray_tracing::draw(native(list), indices, instances, first, offset, firstInstance, true)) return true;
     return instances == 1 && !firstInstance && upscaler::draw(native(list), indices, first, offset, true);
 }
 
@@ -180,7 +173,7 @@ void onPresent(command_queue*, swapchain* chain, const rect*, const rect*, uint3
         {
             const auto status = MH_Initialize();
             if (status != MH_OK && status != MH_ERROR_ALREADY_INITIALIZED) throw std::runtime_error(MH_StatusToString(status));
-            upscaler::initialize(reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr)), dataDirectory());
+            upscaler::initialize(dataDirectory());
             engineReady = true;
         }
         catch (const std::exception& error)
@@ -194,30 +187,26 @@ void onPresent(command_queue*, swapchain* chain, const rect*, const rect*, uint3
     if (!upscaler::attached() && upscaler::wanted() && nativeContext)
         upscaler::attach(nativeDevice, nativeContext, wrappedContext);
     upscaler::endFrame();
-    if (nativeContext)
+    if (rayTracing && nativeContext)
         ray_tracing::present(nativeContext, reinterpret_cast<ID3D11Texture2D*>(chain->get_current_back_buffer().handle));
 }
 
 // F9 switches the ray-traced features off and on, for A/B comparison with the overlay closed.
 void onReshadePresent(effect_runtime* runtime)
 {
-    if (engineReady && runtime->is_key_pressed(VK_F9)) ray_tracing::toggleFeatures();
+    if (engineReady && rayTracing && runtime->is_key_pressed(VK_F9)) ray_tracing::toggleFeatures();
 }
 
 void onReshadeOverlay(effect_runtime*)
 {
-    if (engineReady) ray_tracing::drawIndicator();
+    if (engineReady && rayTracing) ray_tracing::drawIndicator();
 }
 
 void onOverlay(effect_runtime*)
 {
     if (engineFailed) ImGui::TextWrapped("Days Gone DLSS could not start; see ReShade.log.");
     else if (!engineReady) ImGui::TextUnformatted("Days Gone DLSS starts with the first frame.");
-    else
-    {
-        upscaler::drawMenu(1.0f);
-        ray_tracing::drawMenu(1.0f);
-    }
+    else upscaler::drawMenu(1.0f);
 }
 }
 
@@ -271,7 +260,10 @@ LONG CALLBACK logFatalException(EXCEPTION_POINTERS* info)
 extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon, HMODULE reshadeModule)
 {
     AddVectoredExceptionHandler(1, logFatalException); // TEMPORARY
-    if (!supportedGame() || !reshade::register_addon(addon, reshadeModule)) return false;
+    if (!upscaler::selectBuild(reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr)))
+        || !reshade::register_addon(addon, reshadeModule))
+        return false;
+    rayTracing = upscaler::rayTracingSupported();
     self = addon;
     // The view hook and pending RHI commands point into this module; keep it loaded until exit.
     HMODULE pinned{};
@@ -299,7 +291,7 @@ extern "C" __declspec(dllexport) void AddonUninit(HMODULE addon, HMODULE reshade
     upscaler::disable();
     // ReShade unloads add-ons when its last device goes; the next load reports the game's device again.
     upscaler::detach();
-    ray_tracing::release();
+    if (rayTracing) ray_tracing::release();
     nativeContext = wrappedContext = nullptr;
     nativeDevice = nullptr;
     reshade::unregister_overlay("Days Gone DLSS", onOverlay);

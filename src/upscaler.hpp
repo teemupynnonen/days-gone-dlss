@@ -30,7 +30,8 @@ struct Diagnostics
 struct Status
 {
     bool active{}, failed{}, ngxFailed{}, shadersReady{}, planned{}, running{}, wrappedContext{};
-    std::string failure, ngxMessage, lastFallback;
+    bool indirectLightingOption{}; // The game build has the indirect lighting setting (1.07)
+    std::string gameBuild, failure, ngxMessage, lastFallback;
     unsigned renderWidth{}, renderHeight{}, outputWidth{}, outputHeight{};
     std::uint64_t evaluations{}, fallbacks{};
     float jitter[2]{};
@@ -39,11 +40,19 @@ struct Status
     float mipBias{};
     unsigned ambientShaders{}, ambientShaderFailures{};
     std::array<std::string, 9> shaders;
+    unsigned shadersRecognised{};
+    bool shaderMismatch{}; // A game shader has unexpected bytecode, so DLSS stays off.
 };
 
 // ---- Engine side ----
-// Outside the loader lock, after MinHook is initialized: settings, console variables, view hook.
-void initialize(std::uintptr_t imageBase, const std::filesystem::path& directory);
+// Recognises the game build from the executable's PE header, before the game creates its shaders.
+// Returns the build's name, or nullptr when the executable is not a supported build.
+const char* selectBuild(std::uintptr_t imageBase) noexcept;
+// The ray-tracing experiment only knows the selected build's view layout on 1.13.
+bool rayTracingSupported() noexcept;
+// Outside the loader lock, after MinHook is initialized and a build is selected: settings, console
+// variables, view hook.
+void initialize(const std::filesystem::path& directory);
 // Keeps the render scale and jitter in step with DLSS; called at present.
 void tick() noexcept;
 // Restores the engine's render settings and stops replacing the game's TAA.

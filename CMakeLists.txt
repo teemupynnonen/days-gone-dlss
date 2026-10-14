@@ -126,7 +126,8 @@ add_custom_target(ray_tracing_shaders DEPENDS "${GENERATED_DIR}/ray_tracing_trac
     "${GENERATED_DIR}/ray_tracing_bounce.h")
 
 add_library(days_gone_dlss SHARED src/upscaler.cpp src/upscaler_settings.cpp src/upscaler_menu.cpp src/upscaler_addon.cpp
-    src/ambient_occlusion.cpp src/shader_bytecode.cpp src/ray_tracing.cpp src/ray_tracing_menu.cpp src/alpha_test.cpp)
+    src/ambient_occlusion.cpp src/indirect_lighting.cpp src/shader_bytecode.cpp src/ray_tracing.cpp
+    src/ray_tracing_menu.cpp src/alpha_test.cpp)
 add_dependencies(days_gone_dlss ray_tracing_shaders)
 target_include_directories(days_gone_dlss PRIVATE src "${GENERATED_DIR}")
 target_include_directories(days_gone_dlss SYSTEM PRIVATE "${RESHADE_DIR}/include" "${RESHADE_DIR}/imgui")

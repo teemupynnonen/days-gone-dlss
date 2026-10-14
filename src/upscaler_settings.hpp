@@ -22,6 +22,8 @@ struct Settings
     float mipBiasOffset{};
     // RCAS strength on the DLSS output; 0 leaves it unsharpened.
     float sharpness{DefaultSharpness};
+    // 1.07's screen-space indirect lighting while DLSS runs; off renders as the game's lower presets do.
+    bool indirectLighting{true};
 
     bool operator==(const Settings&) const = default;
 };

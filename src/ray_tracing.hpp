@@ -105,7 +105,10 @@ void select(View view);
 void enable(const Features& features);
 // The A/B key: switches every enabled feature off, or back on.
 void toggleFeatures();
-void drawMenu(float scale);
+// The features, as a section of the DLSS overlay window.
+void drawMenu();
+// The debug view and statistics, inside the window's Diagnostics section.
+void drawDiagnostics(float width);
 // A short note of the A/B state after the key is pressed, drawn even with the overlay closed.
 void drawIndicator();
 }

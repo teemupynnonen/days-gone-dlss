@@ -1,6 +1,7 @@
 #include "upscaler.hpp"
 #include "upscaler_shaders.hpp"
 #include "ambient_occlusion.hpp"
+#include "indirect_lighting.hpp"
 #include "ray_tracing.hpp"
 #include "shader_bytecode.hpp"
 
@@ -23,6 +24,7 @@
 #include <mutex>
 #include <new>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -36,32 +38,22 @@ namespace
 using Microsoft::WRL::ComPtr;
 using Address = std::uintptr_t;
 
-// Steam build 19221447; docs/DEVELOPMENT.md lists what each address is.
-constexpr Address PreVisibilityFrameSetupRva = 0x20E6920;
-constexpr unsigned char PreVisibilityPrefix[]{0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x18, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55};
-// FMemStackBase page allocation for RHI commands (the slow path of every AllocCommand).
-constexpr Address AllocateCommandPageRva = 0x19C0EA0;
-constexpr unsigned char AllocateCommandPagePrefix[]{0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x10, 0x48, 0x89,
-    0x74, 0x24, 0x18, 0x48, 0x89, 0x7C, 0x24, 0x20, 0x41, 0x56, 0x48, 0x83};
+// Shared by both supported builds.
 // FRHICommandListBase: CommandLink, bExecuting, NumCommands and the command memory stack.
 constexpr std::size_t CommandLinkOffset = 0x08, ExecutingOffset = 0x10, CommandCountOffset = 0x14, CommandMemoryOffset = 0x30;
-// TConsoleVariableData pointers for r.ScreenPercentage and r.TemporalAASamples: {game thread, render thread}.
-constexpr Address ScreenPercentageDataRva = 0x4ADCA50, TemporalSamplesDataRva = 0x4CD0620;
-// FSceneRenderer views and the FViewInfo fields read here.
-constexpr std::size_t RendererViews = 0x80, RendererViewCount = 0x88, ViewInfoSize = 0x2D50;
-constexpr std::size_t ViewRectOffset = 0xB28, UnscaledViewRectOffset = 0xB38, TranslatedViewProjectionOffset = 0xC20,
-    PreViewTranslationOffset = 0xCB4, ViewOriginOffset = 0xCC0,
-    TemporalJitterOffset = 0x10F0, ScreenPercentageOffset = 0x1744, CameraCutOffset = 0x1755, AntiAliasingOffset = 0x1760,
-    ViewStateOffset = 0x1CE0;
+// FSceneRenderer views.
+constexpr std::size_t RendererViews = 0x80, RendererViewCount = 0x88;
 constexpr std::uint8_t BendTemporalAA = 3;
 constexpr int MaxViews = 4;
 // TRefCountPtr to the native ID3D11ComputeShader/ID3D11PixelShader inside Bend's FD3D11 shader objects.
 constexpr std::size_t NativeShaderOffset = 0x98;
-constexpr char MismatchStatus[] = "bytecode does not match build 19221447";
+constexpr char MismatchStatus[] = "bytecode does not match this game build";
 // Any GUID identifies a custom-engine NGX project.
 constexpr char NgxProjectId[] = "8d3b6f2e-5c1a-4e7b-9f0d-2a6c4b8e1d73";
 constexpr GUID FullResolutionAmbientShader{0x761c968b, 0xb189, 0x4ae7, {0x89, 0xab, 0xb0, 0x4d, 0xae, 0x84, 0xfb, 0x32}};
 constexpr GUID AmbientTextureSlot{0x292946db, 0x06c3, 0x43e7, {0x90, 0x34, 0xc4, 0x6b, 0x29, 0xb7, 0xcf, 0x51}};
+// Which IndirectLightingPass a game shader is, one byte.
+constexpr GUID IndirectLightingPassMarker{0x3e81c5d2, 0x6a47, 0x4b0f, {0x92, 0x1d, 0x48, 0xe6, 0x0b, 0x7c, 0xa5, 0x13}};
 std::atomic<unsigned> ambientShaders{}, ambientShaderFailures{};
 std::uint64_t ambientDraws{};
 
@@ -70,29 +62,128 @@ enum class Pass : std::uint8_t { None, TemporalFull, TemporalUpscale, Composite,
 struct ShaderSlot
 {
     const char* name;
-    Address cacheRva; // The engine's cached global-shader lookup, filled on first use.
     bool compute;
     Pass pass;
-    bool hdr; // HDR output variant: PQ encoding and brightness constants
-    std::array<std::uint8_t, 16> checksum; // DXBC header hash from GlobalShaderCache-PCD3D_SM5.bin.
+    bool hdr; // HDR output variant: HDR encoding and brightness constants
+    bool filtered{}; // Composite variant that filters the history (CompositePixel's Filtered)
 };
 
 // The upscaling TAA is shared by SDR and HDR; its composite pass differs.
 constexpr ShaderSlot Shaders[]{
-    {"TBendSMAATemporalAACS_T1X_0000", 0x4CA41C8, true, Pass::TemporalFull, false, dxbcHash("6e855e67ebcbdd2ec77695de2f6121c5")},
-    {"TBendSMAATemporalAACS_T1X_0010", 0x4CA41E8, true, Pass::TemporalFull, true, dxbcHash("8ebd31f25f6c9edfd50ae51903a9f2c7")},
-    {"TBendSMAATemporalAACS_T1X_0001", 0x4CA4208, true, Pass::TemporalUpscale, false, dxbcHash("2ca645b20725c8f56b8e091fea9eb20a")},
-    {"TBendSMAABufferCopyPS_00", 0x4CA41A8, false, Pass::Composite, false, dxbcHash("d406a2061d2c4102c4793a90784656f6")},
-    {"TBendSMAABufferCopyPS_01", 0x4CA4198, false, Pass::Composite, false, dxbcHash("92fac8c168f8330fc67c25a8ebb1650d")},
-    {"TBendSMAABufferCopyPS_10", 0x4CA4178, false, Pass::Composite, true, dxbcHash("66c0f2b635fc2f0d9e2d86c5e731b13a")},
-    {"TBendSMAABufferCopyPS_11", 0x4CA4168, false, Pass::Composite, true, dxbcHash("214506ef0606197b6d402ec92f4aa56b")},
-    {"FDepthResolveCS<false>", 0x4C46000, true, Pass::DepthResolve, false, dxbcHash("39b02a2fa20098b2b7aac54c68b4b9cd")},
-    {"FDepthResolveCS<true>", 0x4C46010, true, Pass::DepthResolve, false, dxbcHash("3ceef14a17dc9fa2a9c8274ef8601ddd")},
+    {"TBendSMAATemporalAACS_T1X_0000", true, Pass::TemporalFull, false},
+    {"TBendSMAATemporalAACS_T1X_0010", true, Pass::TemporalFull, true},
+    {"TBendSMAATemporalAACS_T1X_0001", true, Pass::TemporalUpscale, false},
+    {"TBendSMAABufferCopyPS_00", false, Pass::Composite, false},
+    {"TBendSMAABufferCopyPS_01", false, Pass::Composite, false, true},
+    {"TBendSMAABufferCopyPS_10", false, Pass::Composite, true},
+    {"TBendSMAABufferCopyPS_11", false, Pass::Composite, true, true},
+    {"FDepthResolveCS<false>", true, Pass::DepthResolve, false},
+    {"FDepthResolveCS<true>", true, Pass::DepthResolve, false},
 };
 constexpr std::size_t NoSlot = std::size(Shaders);
 
+struct GameShader
+{
+    Address cacheRva; // The engine's cached global-shader lookup, filled on first use.
+    std::array<std::uint8_t, 16> checksum; // DXBC header hash from GlobalShaderCache-PCD3D_SM5.bin.
+};
+
+// FViewInfo's size and the fields read here.
+struct ViewLayout
+{
+    std::size_t size, rect, unscaledRect, temporalJitter, screenPercentage, cameraCut, antiAliasing, viewState;
+};
+
+// The FViewInfo fields only ray tracing reads, mapped for 1.13 alone.
+struct RayTracingViewLayout
+{
+    std::size_t translatedViewProjection, preViewTranslation, viewOrigin;
+};
+
+// What differs between the supported executables. docs/DEVELOPMENT.md lists what each address is;
+// docs/DIFFERENCES.md lists how the builds differ.
+struct GameBuild
+{
+    const char* name;
+    int version; // GAME_VERSION in upscaler_shaders.hpp
+    std::uint32_t timeDateStamp, sizeOfImage; // PE header fields identifying the executable
+    Address preVisibilityFrameSetup;
+    std::span<const unsigned char> preVisibilityPrefix;
+    // FMemStackBase page allocation for RHI commands (the slow path of every AllocCommand).
+    Address allocateCommandPage;
+    std::span<const unsigned char> allocateCommandPagePrefix;
+    // TConsoleVariableData pointers for r.ScreenPercentage and r.TemporalAASamples: {game thread, render thread}.
+    Address screenPercentageData, temporalSamplesData;
+    ViewLayout view;
+    std::array<GameShader, std::size(Shaders)> shaders; // In Shaders[] order
+    const RayTracingViewLayout* rayTracingView; // Null where the ray-tracing experiment is unsupported
+};
+
+constexpr RayTracingViewLayout RayTracingView113{0xC20, 0xCB4, 0xCC0};
+
+constexpr unsigned char PreVisibilityPrefix113[]{0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x18, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55};
+constexpr unsigned char AllocateCommandPagePrefix113[]{0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x10, 0x48, 0x89,
+    0x74, 0x24, 0x18, 0x48, 0x89, 0x7C, 0x24, 0x20, 0x41, 0x56, 0x48, 0x83};
+constexpr unsigned char PreVisibilityPrefix107[]{0x40, 0x55, 0x57, 0x41, 0x54, 0x41, 0x57, 0x48, 0x8D, 0xAC, 0x24, 0x38, 0xFF,
+    0xFF, 0xFF, 0x48, 0x81, 0xEC, 0xC8, 0x01, 0x00, 0x00};
+constexpr unsigned char AllocateCommandPagePrefix107[]{0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x10, 0x48, 0x89,
+    0x74, 0x24, 0x18, 0x57, 0x48, 0x83, 0xEC, 0x30, 0x8D, 0x9A, 0xFF, 0xFF};
+
+constexpr GameBuild Builds[]{
+    {"1.13 (Steam build 19221447)", 113, 0x68754D46, 0x93F0000, 0x20E6920, PreVisibilityPrefix113, 0x19C0EA0,
+        AllocateCommandPagePrefix113, 0x4ADCA50, 0x4CD0620, {0x2D50, 0xB28, 0xB38, 0x10F0, 0x1744, 0x1755, 0x1760, 0x1CE0},
+        {{
+            {0x4CA41C8, dxbcHash("6e855e67ebcbdd2ec77695de2f6121c5")},
+            {0x4CA41E8, dxbcHash("8ebd31f25f6c9edfd50ae51903a9f2c7")},
+            {0x4CA4208, dxbcHash("2ca645b20725c8f56b8e091fea9eb20a")},
+            {0x4CA41A8, dxbcHash("d406a2061d2c4102c4793a90784656f6")},
+            {0x4CA4198, dxbcHash("92fac8c168f8330fc67c25a8ebb1650d")},
+            {0x4CA4178, dxbcHash("66c0f2b635fc2f0d9e2d86c5e731b13a")},
+            {0x4CA4168, dxbcHash("214506ef0606197b6d402ec92f4aa56b")},
+            {0x4C46000, dxbcHash("39b02a2fa20098b2b7aac54c68b4b9cd")},
+            {0x4C46010, dxbcHash("3ceef14a17dc9fa2a9c8274ef8601ddd")},
+        }},
+        &RayTracingView113},
+    // Steam beta days_gone_classic. Its shaders come from the _P patch pak's global shader cache.
+    {"1.07 (Steam build 10034136)", 107, 0x60EDC8B2, 0x64B6000, 0x1E3B9F0, PreVisibilityPrefix107, 0x1771BB0,
+        AllocateCommandPagePrefix107, 0x428B180, 0x4480F10, {0x2270, 0x48, 0x58, 0x610, 0xC64, 0xC75, 0xC80, 0x1200},
+        {{
+            {0x4455ED8, dxbcHash("7833e521684c1b0a3090b22a5a7ad680")},
+            {0x4455EF8, dxbcHash("8aea2a831cad8814f2b51e68ae438ca5")},
+            {0x4455F18, dxbcHash("2ca645b20725c8f56b8e091fea9eb20a")},
+            {0x4455EB8, dxbcHash("9fb381e491f6ef1d54570a37881e675c")},
+            {0x4455EA8, dxbcHash("4d9d301887c45d3ed58dc19749441612")},
+            {0x4455E88, dxbcHash("6cf29e1495b9d31a33a420e049ad3484")},
+            {0x4455E78, dxbcHash("a5660967d928130e281ef47140c516ff")},
+            {0x43F95B0, dxbcHash("01543fdea254a83ccead7257543e3210")},
+            {0x43F95C0, dxbcHash("80603de287d3c95e0e8208e55be06c58")},
+        }},
+        nullptr},
+};
+
+const GameBuild* findBuild(Address imageBase)
+{
+    const auto* base = reinterpret_cast<const std::uint8_t*>(imageBase);
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || nt->Signature != IMAGE_NT_SIGNATURE) return nullptr;
+
+    for (const auto& build : Builds)
+        if (nt->FileHeader.TimeDateStamp == build.timeDateStamp && nt->OptionalHeader.SizeOfImage == build.sizeOfImage)
+            return &build;
+    return nullptr;
+}
+
 struct PrepareConstants { std::uint32_t renderSize[2], linear, padding; };
-struct PixelConstants { std::int32_t outputOrigin[2]; std::uint32_t debugView, hdr; float renderScale[2]; std::uint32_t linear; float sharpness; };
+struct PixelConstants
+{
+    std::int32_t outputOrigin[2];
+    std::uint32_t debugView, hdr;
+    float renderScale[2];
+    std::uint32_t linear;
+    float sharpness;
+    std::uint32_t filtered, padding[3];
+};
 struct ComputeConstants { std::uint32_t outputSize[2], debugView, hdr, linear; float sharpness; std::uint32_t padding[2]; };
 
 struct ViewCapture
@@ -139,6 +230,8 @@ Settings settings;
 Diagnostics diagnostics;
 std::filesystem::path dataDirectory, settingsPath;
 Address imageBase{};
+// Chosen when the add-on loads, before the game creates its shaders.
+const GameBuild* build{};
 
 std::atomic<bool> active{}, releaseRequested{}, released{true}, hooked{};
 // Published by the render thread when DLSS can run: render width over output width, and jitter phases.
@@ -317,7 +410,8 @@ void executeViewCommand(Address, ViewCommand* command)
         executingView = command->view;
     }
     const auto& view = command->view;
-    ray_tracing::beginView(view.clipFromWorld, view.rect, view.unscaled, view.preViewTranslation, view.cameraKnown);
+    if (build->rayTracingView)
+        ray_tracing::beginView(view.clipFromWorld, view.rect, view.unscaled, view.preViewTranslation, view.cameraKnown);
 }
 
 // Mirrors the engine's AllocCommand: append to the last memory page, or let the engine add a page.
@@ -354,11 +448,12 @@ void preVisibility(Address renderer, Address commandList)
     const auto count = views ? std::clamp(*reinterpret_cast<const std::int32_t*>(renderer + RendererViewCount), 0, MaxViews) : 0;
     std::array<float, MaxViews> saved{};
     const bool fullJitter = replacing.load(std::memory_order_relaxed);
+    const auto& layout = build->view;
     auto temporal = [&](int index)
     {
-        const auto view = views + static_cast<Address>(index) * ViewInfoSize;
-        return *reinterpret_cast<const std::uint8_t*>(view + AntiAliasingOffset) == BendTemporalAA
-            && *reinterpret_cast<const Address*>(view + ViewStateOffset);
+        const auto view = views + static_cast<Address>(index) * layout.size;
+        return *reinterpret_cast<const std::uint8_t*>(view + layout.antiAliasing) == BendTemporalAA
+            && *reinterpret_cast<const Address*>(view + layout.viewState);
     };
     // Below 70, 50 and 30 percent the engine caps TAA jitter at 8, 4 and 2 phases. DLSS needs the
     // full Halton sequence that r.TemporalAASamples asks for, so present full scale for this call.
@@ -366,7 +461,7 @@ void preVisibility(Address renderer, Address commandList)
         for (int i = 0; i < count; ++i)
             if (temporal(i))
             {
-                auto& percentage = *reinterpret_cast<float*>(views + static_cast<Address>(i) * ViewInfoSize + ScreenPercentageOffset);
+                auto& percentage = *reinterpret_cast<float*>(views + static_cast<Address>(i) * layout.size + layout.screenPercentage);
                 saved[i] = percentage;
                 percentage = 100.0f;
             }
@@ -374,22 +469,27 @@ void preVisibility(Address renderer, Address commandList)
     for (int i = 0; i < count; ++i)
     {
         if (!temporal(i)) continue;
-        const auto view = views + static_cast<Address>(i) * ViewInfoSize;
-        if (fullJitter) *reinterpret_cast<float*>(view + ScreenPercentageOffset) = saved[i];
+        const auto view = views + static_cast<Address>(i) * layout.size;
+        if (fullJitter) *reinterpret_cast<float*>(view + layout.screenPercentage) = saved[i];
         ViewCapture capture;
-        std::memcpy(capture.rect, reinterpret_cast<const void*>(view + ViewRectOffset), sizeof(capture.rect));
-        std::memcpy(capture.unscaled, reinterpret_cast<const void*>(view + UnscaledViewRectOffset), sizeof(capture.unscaled));
-        std::memcpy(capture.jitter, reinterpret_cast<const void*>(view + TemporalJitterOffset), sizeof(capture.jitter));
-        std::memcpy(capture.clipFromWorld, reinterpret_cast<const void*>(view + TranslatedViewProjectionOffset), sizeof(capture.clipFromWorld));
-        std::memcpy(capture.preViewTranslation, reinterpret_cast<const void*>(view + PreViewTranslationOffset), sizeof(capture.preViewTranslation));
-        float origin[3]{};
-        std::memcpy(origin, reinterpret_cast<const void*>(view + ViewOriginOffset), sizeof(origin));
-        capture.cameraKnown = std::abs(capture.preViewTranslation[0] + origin[0]) < 1 && std::abs(capture.preViewTranslation[1] + origin[1]) < 1
-            && std::abs(capture.preViewTranslation[2] + origin[2]) < 1;
-        static bool reported{};
-        if (!capture.cameraKnown && !std::exchange(reported, true))
-            log("FViewMatrices::PreViewTranslation does not mirror ViewOrigin; ray tracing keeps no geometry from earlier frames.");
-        capture.cameraCut = *reinterpret_cast<const std::uint8_t*>(view + CameraCutOffset) != 0;
+        std::memcpy(capture.rect, reinterpret_cast<const void*>(view + layout.rect), sizeof(capture.rect));
+        std::memcpy(capture.unscaled, reinterpret_cast<const void*>(view + layout.unscaledRect), sizeof(capture.unscaled));
+        std::memcpy(capture.jitter, reinterpret_cast<const void*>(view + layout.temporalJitter), sizeof(capture.jitter));
+        capture.cameraCut = *reinterpret_cast<const std::uint8_t*>(view + layout.cameraCut) != 0;
+        if (const auto* rayTracing = build->rayTracingView)
+        {
+            std::memcpy(capture.clipFromWorld, reinterpret_cast<const void*>(view + rayTracing->translatedViewProjection),
+                sizeof(capture.clipFromWorld));
+            std::memcpy(capture.preViewTranslation, reinterpret_cast<const void*>(view + rayTracing->preViewTranslation),
+                sizeof(capture.preViewTranslation));
+            float origin[3]{};
+            std::memcpy(origin, reinterpret_cast<const void*>(view + rayTracing->viewOrigin), sizeof(origin));
+            capture.cameraKnown = std::abs(capture.preViewTranslation[0] + origin[0]) < 1
+                && std::abs(capture.preViewTranslation[1] + origin[1]) < 1 && std::abs(capture.preViewTranslation[2] + origin[2]) < 1;
+            static bool reported{};
+            if (!capture.cameraKnown && !std::exchange(reported, true))
+                log("FViewMatrices::PreViewTranslation does not mirror ViewOrigin; ray tracing keeps no geometry from earlier frames.");
+        }
         capture.thread = GetCurrentThreadId();
         {
             std::lock_guard lock(viewMutex);
@@ -403,7 +503,7 @@ void preVisibility(Address renderer, Address commandList)
             capture.sequence = ++captureSequence;
             capturedView = capture;
         }
-        if (fullJitter || ray_tracing::wanted()) enqueueView(commandList, capture);
+        if (fullJitter || (build->rayTracingView && ray_tracing::wanted())) enqueueView(commandList, capture);
     }
 }
 
@@ -489,8 +589,9 @@ void identifyShaders()
             if (foundInCache[slot] || shaderStatus[slot] == MismatchStatus) continue;
         }
         const auto& shader = Shaders[slot];
+        const auto& checksum = build->shaders[slot].checksum;
         Address resource{}, rhi{};
-        if (!safeRead(imageBase + shader.cacheRva, resource) || !resource || !safeRead(resource + 8, rhi) || !rhi
+        if (!safeRead(imageBase + build->shaders[slot].cacheRva, resource) || !resource || !safeRead(resource + 8, rhi) || !rhi
             || !readable(rhi, NativeShaderOffset + 8))
             continue;
         ComPtr<IUnknown> native;
@@ -514,7 +615,7 @@ void identifyShaders()
             if (safeRead(rhi + offset + 8, length) && length > 32 && safeRead(candidate, header)
                 && !std::memcmp(header.data(), "DXBC", 4))
             {
-                if (std::equal(shader.checksum.begin(), shader.checksum.end(), header.begin() + 4)) verified = true;
+                if (std::equal(checksum.begin(), checksum.end(), header.begin() + 4)) verified = true;
                 else mismatch = true;
             }
         }
@@ -568,8 +669,10 @@ ComPtr<ID3DBlob> compile(std::string_view source, const char* name, const char* 
 {
     std::string text(shaders::Common);
     text += source;
+    const auto version = std::to_string(build->version);
+    const D3D_SHADER_MACRO defines[]{{"GAME_VERSION", version.c_str()}, {}};
     ComPtr<ID3DBlob> code, errors;
-    const auto result = D3DCompile(text.data(), text.size(), name, nullptr, nullptr, "main", profile,
+    const auto result = D3DCompile(text.data(), text.size(), name, defines, nullptr, "main", profile,
         D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, code.GetAddressOf(), errors.GetAddressOf());
     if (FAILED(result))
         throw std::runtime_error(std::string("Shader ") + name + " did not compile: "
@@ -577,14 +680,15 @@ ComPtr<ID3DBlob> compile(std::string_view source, const char* name, const char* 
     return code;
 }
 
-ComPtr<ID3D11Buffer> constantBuffer(UINT size)
+ComPtr<ID3D11Buffer> constantBuffer(UINT size, const void* initial = nullptr)
 {
     D3D11_BUFFER_DESC description{};
     description.ByteWidth = size;
     description.Usage = D3D11_USAGE_DEFAULT;
     description.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    const D3D11_SUBRESOURCE_DATA data{initial};
     ComPtr<ID3D11Buffer> buffer;
-    check(device->CreateBuffer(&description, nullptr, buffer.GetAddressOf()), "Creating a DLSS constant buffer");
+    check(device->CreateBuffer(&description, initial ? &data : nullptr, buffer.GetAddressOf()), "Creating a DLSS constant buffer");
     return buffer;
 }
 
@@ -1030,12 +1134,13 @@ template<class Call> void composite(ID3D11DeviceContext* context, Call&& call)
     ID3D11PixelShader* gamePixelShader = currentPixelShader;
     const auto slot = slotOf(gamePixelShader);
     const bool hdr = slot != NoSlot && Shaders[slot].hdr;
+    const bool filtered = slot != NoSlot && Shaders[slot].filtered;
     if (hdr != hdrOutput) log(std::string("The game switched to ") + (hdr ? "HDR" : "SDR") + " output.");
     hdrOutput = hdr;
     context->PSGetShaderResources(1, static_cast<UINT>(gameInputs.size()), gameInputs.data());
     context->PSGetConstantBuffers(1, 1, &gameConstants);
     const PixelConstants constants{{frame.outputOrigin[0], frame.outputOrigin[1]}, static_cast<std::uint32_t>(options.debugView), hdr,
-        {frame.renderScale[0], frame.renderScale[1]}, frame.linear, frame.sharpness};
+        {frame.renderScale[0], frame.renderScale[1]}, frame.linear, frame.sharpness, filtered, {}};
     context->UpdateSubresource(pixelConstants.Get(), 0, nullptr, &constants, 0, 0);
     ID3D11ShaderResourceView* ours[]{outputTarget.view.Get(), gameInputs[1], motionTarget.view.Get(), depthTarget.view.Get(),
         colorTarget.view.Get(), biasTarget.view.Get()};
@@ -1108,6 +1213,28 @@ void bindAmbientLighting(ID3D11DeviceContext* context)
         if (++ambientDraws == 1) log("First full-resolution ambient lighting correction drawn.");
     }
     context->PSSetShader(shader, nullptr, 0);
+}
+
+// With the indirect lighting setting off on 1.07, skips its passes while DLSS replaces the TAA.
+// The game itself runs without them below its highest settings, binding a black texture for the
+// lighting to read; clearing the result the lighting reads (the vertical blur's output) gives the
+// same. Returns false for any other shader, or when the setting is on.
+bool skipIndirectLighting(ID3D11DeviceContext* context, ID3D11ComputeShader* shader)
+{
+    auto pass = IndirectLightingPass::None;
+    UINT size = sizeof(pass);
+    if (!shader || FAILED(shader->GetPrivateData(IndirectLightingPassMarker, &size, &pass)) || pass == IndirectLightingPass::None
+        || currentSettings().indirectLighting || currentDiagnostics().gameTemporalAA)
+        return false;
+
+    if (pass == IndirectLightingPass::VerticalBlur)
+    {
+        ComPtr<ID3D11UnorderedAccessView> result;
+        context->CSGetUnorderedAccessViews(0, 1, result.GetAddressOf());
+        constexpr float black[4]{};
+        if (result) context->ClearUnorderedAccessViewFloat(result.Get(), black);
+    }
+    return true;
 }
 
 void releaseRenderer()
@@ -1226,13 +1353,27 @@ void applyDiagnostics(const Diagnostics& options)
     diagnostics = options;
 }
 
-void initialize(std::uintptr_t base, const std::filesystem::path& directory)
+const char* selectBuild(std::uintptr_t base) noexcept
+{
+    build = findBuild(base);
+    imageBase = build ? base : 0;
+    return build ? build->name : nullptr;
+}
+
+bool rayTracingSupported() noexcept
+{
+    return build && build->rayTracingView;
+}
+
+void initialize(const std::filesystem::path& directory)
 {
     {
         std::lock_guard lock(logMutex);
         logFile.open(directory / "DaysGoneDLSS.log", std::ios::app);
     }
-    imageBase = base;
+    if (!build) throw std::runtime_error("This DaysGone.exe is not a supported build.");
+    log(std::string("Days Gone ") + build->name + " detected.");
+    const auto base = imageBase;
     dataDirectory = directory;
     settingsPath = directory / "DaysGoneDLSS.ini";
     try
@@ -1245,20 +1386,23 @@ void initialize(std::uintptr_t base, const std::filesystem::path& directory)
     Address screenData{}, samplesData{};
     float percentage{};
     std::int32_t samples{};
-    if (!safeRead(base + ScreenPercentageDataRva, screenData) || !safeRead(screenData, percentage)
-        || !safeRead(base + TemporalSamplesDataRva, samplesData) || !safeRead(samplesData, samples)
+    if (!safeRead(base + build->screenPercentageData, screenData) || !safeRead(screenData, percentage)
+        || !safeRead(base + build->temporalSamplesData, samplesData) || !safeRead(samplesData, samples)
         || !std::isfinite(percentage) || percentage <= 0 || percentage > 400 || samples < 0 || samples > 255)
-        throw std::runtime_error("r.ScreenPercentage or r.TemporalAASamples is not where build 19221447 keeps it.");
+        throw std::runtime_error(std::string("r.ScreenPercentage or r.TemporalAASamples is not where ") + build->name + " keeps it.");
     screenPercentage = reinterpret_cast<float*>(screenData);
     temporalSamples = reinterpret_cast<std::int32_t*>(samplesData);
 
-    const auto allocator = reinterpret_cast<const void*>(base + AllocateCommandPageRva);
-    if (std::memcmp(allocator, AllocateCommandPagePrefix, sizeof(AllocateCommandPagePrefix)))
-        throw std::runtime_error("The RHI command allocator does not match build 19221447.");
-    allocateCommandPage = reinterpret_cast<AllocateCommandPage>(base + AllocateCommandPageRva);
-    preVisibilityAddress = reinterpret_cast<void*>(base + PreVisibilityFrameSetupRva);
-    if (std::memcmp(preVisibilityAddress, PreVisibilityPrefix, sizeof(PreVisibilityPrefix)))
-        throw std::runtime_error("FSceneRenderer::PreVisibilityFrameSetup does not match build 19221447.");
+    const auto matches = [&](Address rva, std::span<const unsigned char> prefix)
+    {
+        return !std::memcmp(reinterpret_cast<const void*>(base + rva), prefix.data(), prefix.size());
+    };
+    if (!matches(build->allocateCommandPage, build->allocateCommandPagePrefix))
+        throw std::runtime_error(std::string("The RHI command allocator does not match ") + build->name + ".");
+    allocateCommandPage = reinterpret_cast<AllocateCommandPage>(base + build->allocateCommandPage);
+    if (!matches(build->preVisibilityFrameSetup, build->preVisibilityPrefix))
+        throw std::runtime_error(std::string("FSceneRenderer::PreVisibilityFrameSetup does not match ") + build->name + ".");
+    preVisibilityAddress = reinterpret_cast<void*>(base + build->preVisibilityFrameSetup);
     if (const auto status = MH_CreateHook(preVisibilityAddress, reinterpret_cast<void*>(&preVisibility),
         reinterpret_cast<void**>(&originalPreVisibility)); status != MH_OK)
         throw std::runtime_error(std::string("Hooking PreVisibilityFrameSetup: ") + MH_StatusToString(status));
@@ -1391,6 +1535,7 @@ bool dispatch(ID3D11DeviceContext* context, unsigned x, unsigned y, unsigned z) 
         const auto slot = slotOf(shader.Get());
         const auto pass = slot == NoSlot ? Pass::None : Shaders[slot].pass;
         if (pass != Pass::None) ++recognisedDispatches;
+        else return skipIndirectLighting(context, shader.Get());
         if (pass == Pass::DepthResolve) computeMotion(context, x, y);
         else if ((pass == Pass::TemporalFull || pass == Pass::TemporalUpscale) && z == 1)
         {
@@ -1481,10 +1626,10 @@ bool biasSamplers(ID3D11DeviceContext* context, unsigned count, ID3D11SamplerSta
 
 void shaderCreated(const void* code, std::size_t size, IUnknown* shader) noexcept
 {
-    if (!code || size < 20 || !shader || std::memcmp(code, "DXBC", 4)) return;
+    if (!build || !code || size < 20 || !shader || std::memcmp(code, "DXBC", 4)) return;
     const auto* bytes = static_cast<const std::uint8_t*>(code);
     for (std::size_t slot = 0; slot < std::size(Shaders); ++slot)
-        if (std::equal(Shaders[slot].checksum.begin(), Shaders[slot].checksum.end(), bytes + 4))
+        if (const auto& checksum = build->shaders[slot].checksum; std::equal(checksum.begin(), checksum.end(), bytes + 4))
         {
             try { remember(slot, ComPtr<IUnknown>(shader), "created, bytecode verified"); }
             catch (...) {}
@@ -1504,6 +1649,13 @@ void shaderCreated(const void* code, std::size_t size, IUnknown* shader) noexcep
             check(original->SetPrivateDataInterface(FullResolutionAmbientShader, replacement.Get()), "Storing the ambient lighting shader");
             check(original->SetPrivateData(AmbientTextureSlot, sizeof(patch.textureSlot), &patch.textureSlot), "Storing the ambient texture slot");
             ++ambientShaders;
+        }
+        const auto lightingPass = indirectLightingPass(code, size);
+        if (lightingPass != IndirectLightingPass::None)
+        {
+            ComPtr<ID3D11ComputeShader> compute;
+            check(shader->QueryInterface(IID_PPV_ARGS(&compute)), "Querying an indirect lighting pass");
+            check(compute->SetPrivateData(IndirectLightingPassMarker, sizeof(lightingPass), &lightingPass), "Marking an indirect lighting pass");
         }
     }
     catch (const std::exception& error)
@@ -1540,7 +1692,7 @@ static void reloadDiagnostics()
         else if (key == "debug_view" && value >= 0 && value <= 4) options.debugView = value;
         else if (key == "game_taa") options.gameTemporalAA = value != 0;
         else if (key == "full_resolution_ao") options.fullResolutionAmbientOcclusion = value != 0;
-        else if (key == "ray_tracing_view" && value >= 0 && value <= 9) ray_tracing::select(static_cast<ray_tracing::View>(value));
+        else if (key == "ray_tracing_view" && build->rayTracingView && value >= 0 && value <= 9) ray_tracing::select(static_cast<ray_tracing::View>(value));
         else if (key == "ray_tracing_sun_shadows")
         {
             features.sunShadows = value != 0;
@@ -1573,7 +1725,7 @@ static void reloadDiagnostics()
             featuresRead = true;
         }
     }
-    if (featuresRead) ray_tracing::enable(features);
+    if (featuresRead && build->rayTracingView) ray_tracing::enable(features);
     applyDiagnostics(options);
     log("Diagnostics: invert jitter X " + std::to_string(options.invertJitterX) + ", Y " + std::to_string(options.invertJitterY)
         + ", jittered motion " + std::to_string(options.jitteredMotion) + ", debug view " + std::to_string(options.debugView)
@@ -1624,6 +1776,8 @@ void endFrame() noexcept
 Status status()
 {
     Status result;
+    result.gameBuild = build ? build->name : "unsupported";
+    result.indirectLightingOption = build && build->version == 107;
     result.active = active;
     result.failed = failed;
     result.failure = failure;
@@ -1655,7 +1809,13 @@ Status status()
     result.ambientShaderFailures = ambientShaderFailures.load();
     std::lock_guard lock(shaderMutex);
     for (std::size_t slot = 0; slot < std::size(Shaders); ++slot)
-        result.shaders[slot] = std::string(Shaders[slot].name) + ": " + (shaderStatus[slot].empty() ? "not seen yet" : shaderStatus[slot]);
+    {
+        const auto& shaderState = shaderStatus[slot];
+        result.shaders[slot] = std::string(Shaders[slot].name) + ": " + (shaderState.empty() ? "not seen yet" : shaderState);
+        if (shaderState == MismatchStatus) result.shaderMismatch = true;
+        else if (!shaderState.empty()) ++result.shadersRecognised;
+    }
+
     return result;
 }
 }

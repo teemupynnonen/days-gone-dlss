@@ -41,16 +41,26 @@ and local settings are excluded. ReShade is installed separately by the player.
 | `src/upscaler_shaders.hpp` | HLSL for the input preparation and the SDR/HDR composites |
 | `src/upscaler_addon.cpp` | ReShade add-on: events, exports, settings location |
 | `src/upscaler_menu.cpp` | Settings window in the ReShade overlay |
+| `src/menu_style.hpp` | Colours, tooltips and status lines the overlay's sections share |
 | `src/upscaler_settings.cpp`, `src/upscaler_settings.hpp` | Modes, render scales and `DaysGoneDLSS.ini` |
 | `tests/upscaler_tests.cpp` | Settings tests |
 | `src/shader_bytecode.*` | Bounded DXBC parsing and checksum updates |
 | `src/ambient_occlusion.*`, `tests/ambient_occlusion_tests.cpp` | AO reconstruction weight correction and WARP regression tests |
+| `src/indirect_lighting.*` | Identifies 1.07's screen-space indirect lighting passes |
 | `src/ray_tracing*`, `src/alpha_test.*`, `tests/ray_tracing_tests.cpp` | Ray-tracing experiment: geometry capture, alpha-test baking, DXR trace, sun shadows, global illumination and debug views |
 
 The shader rendering test uses authored HLSL on WARP to check the AO near-integer
 rounding regression. The ray-tracing test needs a DXR 1.1 GPU and is skipped without one: it
 captures authored draws, including an alpha-tested quad with a per-vertex fade drawn with a
 narrowed depth range, and requires the traced pixels to match the rasterised coverage and depth. No extracted game shaders are required by the tests.
+
+## Game versions
+
+The add-on supports 1.13 (Steam build 19221447) and 1.07 (Steam beta `days_gone_classic`, build
+10034136), identified by the executable's PE header when the add-on loads. `Builds[]` in
+`src/upscaler.cpp` holds each build's addresses, FViewInfo layout and shader checksums, and the
+runtime HLSL is compiled with `GAME_VERSION` 113 or 107. The rest of this document describes 1.13;
+[DIFFERENCES.md](DIFFERENCES.md) lists what 1.07 does differently.
 
 ## How Bend renders anti-aliasing
 
@@ -137,9 +147,16 @@ percent screen percentage. The jitter is added to the projection with +Y up.
   Original DXBC instructions and constants are retained; only the rounding instruction and
   the necessary container sizes, offsets and checksum change. No extracted game shaders are
   included in the distribution.
+- **Indirect lighting (1.07).** 1.07's screen-space indirect lighting traces a new random ray per
+  pixel every frame and leaves the noise to its TAA, which DLSS shows as boiling below Balanced.
+  With the "Screen-space indirect lighting" setting off, the add-on skips its four passes while
+  DLSS runs and clears the result the lighting reads to black, as the game does when SSIL is off.
+  DIFFERENCES.md has the details.
 
 Any frame the replacement cannot handle uses the game's TAA and logs why once. If the upscale
 composite does not follow a replaced TAA, DLSS stops instead of showing a stale history.
+
+1.13's addresses follow; DIFFERENCES.md has 1.07's.
 
 | Address (RVA) | Purpose |
 | --- | --- |
@@ -158,11 +175,11 @@ Bend TAA), view state `+0x1CE0`.
 
 ## Ray-tracing experiment
 
-A path-tracing experiment, off by default and not part of a release. Stage 1 traces the game's own
-geometry; stage 2 adds ray-traced sun shadows, ambient occlusion and one bounce of sunlight to the
-game's lighting. **Ray
-tracing (experimental)** in the overlay has a checkbox per feature that changes the image and a
-debug view selector. F9 switches every feature off and back on for A/B comparison, with a note in
+A path-tracing experiment, off by default and not part of a release. It runs on 1.13 only; on 1.07
+the add-on never calls into it. Stage 1 traces the game's own geometry; stage 2 adds ray-traced sun
+shadows, ambient occlusion and one bounce of sunlight to the game's lighting. **Ray tracing
+(experimental)** in the overlay has a status line and a checkbox per feature that changes the image;
+the debug view selector and statistics are under **Diagnostics**. F9 switches every feature off and back on for A/B comparison, with a note in
 the corner for two seconds; the work goes on underneath, so switching back is instant.
 `DaysGoneDLSS-diagnostics.ini` is read when it changes, with or without DLSS, and takes:
 
