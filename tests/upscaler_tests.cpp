@@ -59,10 +59,12 @@ void persistence(const fs::path& root)
     expect(loadSettings(path) == Settings{}, "A first launch keeps the game's own anti-aliasing.");
     expect(!fs::exists(path), "Loading defaults must not create a settings file.");
 
-    const Settings chosen{Quality::Custom, 0.625f, Preset::K, -0.25f, 0.4f, false, FrameGeneration::X4};
+    Settings chosen{Quality::Custom, 0.625f, Preset::K, -0.25f, 0.4f, false, FrameGeneration::X4};
+    chosen.rayTracing.sunShadows = chosen.rayTracing.softSunShadows = chosen.rayTracing.lightShadows = true;
+    chosen.rayTracing.offscreenGeometry = false;
     saveSettings(path, chosen);
-    expect(loadSettings(path) == chosen,
-        "Restart restores the mode, custom scale, preset, texture bias, sharpening, indirect lighting and frame generation.");
+    expect(loadSettings(path) == chosen, "Restart restores the mode, custom scale, preset, texture bias, sharpening, indirect "
+        "lighting, frame generation and ray tracing.");
     for (int i = 0; i < static_cast<int>(Quality::Count); ++i)
     {
         auto mode = chosen;
@@ -87,6 +89,7 @@ void persistence(const fs::path& root)
     write(path, "quality=dlaa\n");
     expect(loadSettings(path).sharpness == Settings::DefaultSharpness, "Settings saved before sharpening get its default.");
     expect(loadSettings(path).indirectLighting, "Settings saved before the indirect lighting option keep it on.");
+    expect(loadSettings(path).rayTracing == days_gone_dlss::ray_tracing::Features{}, "Settings saved before ray tracing keep it off.");
     write(path, "sharpness=-1\n");
     expect(loadSettings(path).sharpness == 0, "Negative sharpening turns it off.");
     write(path, "custom_scale=0.05\n");

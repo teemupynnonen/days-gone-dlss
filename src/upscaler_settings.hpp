@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ray_tracing.hpp"
+
 #include <cstdint>
 #include <filesystem>
 #include <string_view>
@@ -30,6 +32,8 @@ struct Settings
     // DLSS Frame Generation. The game then presents through Direct3D 12, which is set up with its
     // swap chain at startup, so turning it on applies after a restart.
     FrameGeneration frameGeneration{FrameGeneration::Off};
+    // The ray-tracing experiment's features, applied at startup on 1.13.
+    ray_tracing::Features rayTracing;
 
     bool operator==(const Settings&) const = default;
 };

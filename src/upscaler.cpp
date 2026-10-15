@@ -1534,6 +1534,7 @@ void initialize(const std::filesystem::path& directory, bool withFrameGeneration
         settings = loadSettings(settingsPath);
     }
     catch (const std::exception& error) { log("Could not load upscaler settings: " + std::string(error.what())); }
+    if (build->rayTracingView) ray_tracing::enable(currentSettings().rayTracing);
 
     Address screenData{}, samplesData{};
     float percentage{};

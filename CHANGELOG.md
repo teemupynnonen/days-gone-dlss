@@ -1,10 +1,18 @@
 # Days Gone DLSS changelog
 
-## Unreleased
+## 1.5.0
 
-- Add NVIDIA DLSS Frame Generation: 2x to 6x, or Dynamic to reach the display's refresh rate,
-  with NVIDIA Reflex. The game then presents through Direct3D 12 by way of NVIDIA Streamline;
-  turning it on takes a restart. Needs an RTX 40 (2x) or RTX 50 GPU and DLSS or DLAA on.
+- Add NVIDIA DLSS Frame Generation: 2x to 6x, or Dynamic to reach the display's refresh rate.
+  It turns on NVIDIA Reflex, and the overlay shows the latency. The game then presents through
+  Direct3D 12 by way of NVIDIA Streamline; turning it on takes a restart. Needs an RTX 40 (2x) or
+  RTX 50 GPU, Windows' hardware-accelerated GPU scheduling, and DLSS or DLAA on.
+- Add experimental ray tracing on Days Gone 1.13: sun shadows, ambient occlusion, global
+  illumination and shadows for the game's lamps, fires and flashlight. Each is a checkbox under
+  **Ray tracing (experimental)**, off by default, with soft shadow, bounce light and half-rate
+  options, saved with the other settings. F9 switches it off and on to compare with the game. It
+  costs a lot of performance.
+  Only 1.13 is supported, and there are no plans to support other versions.
+- Diagnostics shows what each ray-tracing feature costs, and can measure it.
 
 ## 1.4.1
 

@@ -11,6 +11,7 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <utility>
 
 namespace days_gone_dlss::upscaler
 {
@@ -20,6 +21,19 @@ constexpr std::string_view QualityKeys[]{"off", "dlaa", "quality", "balanced", "
 static_assert(std::size(QualityKeys) == static_cast<std::size_t>(Quality::Count));
 constexpr std::string_view FrameGenerationKeys[]{"off", "2x", "3x", "4x", "5x", "6x", "dynamic"};
 static_assert(std::size(FrameGenerationKeys) == static_cast<std::size_t>(FrameGeneration::Count));
+// The same keys DaysGoneDLSS-diagnostics.ini takes.
+constexpr std::pair<std::string_view, bool ray_tracing::Features::*> RayTracingKeys[]{
+    {"ray_tracing_sun_shadows", &ray_tracing::Features::sunShadows},
+    {"ray_tracing_replace_canopy_shadows", &ray_tracing::Features::replaceCanopyShadows},
+    {"ray_tracing_soft_sun_shadows", &ray_tracing::Features::softSunShadows},
+    {"ray_tracing_offscreen_geometry", &ray_tracing::Features::offscreenGeometry},
+    {"ray_tracing_ambient_occlusion", &ray_tracing::Features::ambientOcclusion},
+    {"ray_tracing_half_ambient_rays", &ray_tracing::Features::halfAmbientRays},
+    {"ray_tracing_global_illumination", &ray_tracing::Features::globalIllumination},
+    {"ray_tracing_light_shadows", &ray_tracing::Features::lightShadows},
+    {"ray_tracing_soft_light_shadows", &ray_tracing::Features::softLightShadows},
+    {"ray_tracing_light_bounce", &ray_tracing::Features::lightBounce},
+};
 
 std::string_view trim(std::string_view text)
 {
@@ -170,6 +184,13 @@ Settings loadSettings(const std::filesystem::path& path)
             if (found != std::end(FrameGenerationKeys))
                 settings.frameGeneration = static_cast<FrameGeneration>(found - std::begin(FrameGenerationKeys));
         }
+        else
+        {
+            const auto found = std::find_if(std::begin(RayTracingKeys), std::end(RayTracingKeys),
+                [&](const auto& entry) { return entry.first == key; });
+            int enabled{};
+            if (found != std::end(RayTracingKeys) && number(value, enabled)) settings.rayTracing.*found->second = enabled != 0;
+        }
     }
     if (input.bad()) throw std::runtime_error("Cannot read upscaler settings.");
     return settings;
@@ -198,6 +219,7 @@ void saveSettings(const std::filesystem::path& path, const Settings& settings)
             << "\nsharpness=" << settings.sharpness
             << "\nindirect_lighting=" << (settings.indirectLighting ? 1 : 0)
             << "\nframe_generation=" << FrameGenerationKeys[static_cast<std::size_t>(settings.frameGeneration)] << '\n';
+        for (const auto& [key, feature] : RayTracingKeys) output << key << '=' << (settings.rayTracing.*feature ? 1 : 0) << '\n';
         output.close();
         if (!output) throw std::runtime_error("Cannot write upscaler settings.");
         // Keep the last complete file if writing or replacing it fails.

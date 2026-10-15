@@ -26,8 +26,16 @@ Adds NVIDIA DLSS Super Resolution, DLAA, Frame generation and Reflex to Days Gon
 Choose modes and presets in the overlay. Leave the other settings at their defaults to
 start with.
 
+On 1.07, if foliage shimmers in Performance or lower modes, turn off **Screen-space indirect lighting**.
+DLSS controls the game's Render Scale while enabled; **Off** restores it.
+
 **Frame generation** 2x to 6x, or Dynamic. It needs DLSS or DLAA on. It also turns on NVIDIA Reflex.
-**Screen-space indirect lighting**. DLSS controls the game's Render Scale while enabled; **Off** restores it.
+Turning it on or off takes a restart.
+
+**Ray tracing (experimental)**, on 1.13 only: sun shadows, ambient occlusion, global illumination
+and light shadows, each with its own checkbox. It costs a lot of performance. F9 switches it off
+and on to compare with the game.
+
 Settings are saved in `DaysGoneDLSS.ini` beside the add-on.
 
 To **update**, close the game and replace the ZIP's files. Keep your INI to retain settings.

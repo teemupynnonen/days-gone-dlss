@@ -1,6 +1,7 @@
 // Ray-tracing experiment sections of the ReShade overlay window, and its A/B indicator.
 #include "ray_tracing.hpp"
 #include "menu_style.hpp"
+#include "upscaler.hpp"
 
 #include <Windows.h>
 #include <imgui.h>
@@ -197,6 +198,15 @@ void drawStatus(const Status& state)
     else if (!state.tracedFrames) statusLine(Yellow, "Waiting for the first traced frame.");
     else statusLine(Green, "Ray tracing active. F9 switches it off to compare with the game.");
 }
+
+// Applies the features and keeps them in DaysGoneDLSS.ini for the next start.
+void save(const Features& features)
+{
+    enable(features);
+    auto wanted = upscaler::currentSettings();
+    wanted.rayTracing = features;
+    upscaler::applySettings(wanted);
+}
 }
 
 void drawMenu()
@@ -211,55 +221,55 @@ void drawMenu()
     ImGui::Separator();
 
     auto features = state.features;
-    if (ImGui::Checkbox("Ray-traced sun shadows", &features.sunShadows)) enable(features);
+    if (ImGui::Checkbox("Ray-traced sun shadows", &features.sunShadows)) save(features);
     tooltip("Adds sun shadows traced from the geometry on screen and the game's shadow casters around it to the game's own shadows.");
 
     ImGui::Indent();
     ImGui::BeginDisabled(!features.sunShadows);
-    if (ImGui::Checkbox("Replace the game's soft tree shadows", &features.replaceCanopyShadows)) enable(features);
+    if (ImGui::Checkbox("Replace the game's soft tree shadows", &features.replaceCanopyShadows)) save(features);
     ImGui::EndDisabled();
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
         ImGui::SetTooltip("Leaves out the game's soft shadow under tree canopies, so only the traced trees and leaves shadow there.\n"
             "Needs the ray-traced sun shadows.");
     ImGui::BeginDisabled(!features.sunShadows);
-    if (ImGui::Checkbox("Soft sun shadows", &features.softSunShadows)) enable(features);
+    if (ImGui::Checkbox("Soft sun shadows", &features.softSunShadows)) save(features);
     ImGui::EndDisabled();
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
         ImGui::SetTooltip("Traces toward points across the sun's or moon's disc, so shadows soften away from what casts them, as\n"
             "the light shadows' soft option does. Filtered over frames and neighbouring pixels. Needs the ray-traced sun shadows.");
-    if (ImGui::Checkbox("Off-screen objects and trees", &features.offscreenGeometry)) enable(features);
+    if (ImGui::Checkbox("Off-screen objects and trees", &features.offscreenGeometry)) save(features);
     tooltip("Also traces cached static objects and copies of the trees around the camera, so their shadows stay when they\n"
         "leave the view. Off: only what is on screen and the game's shadow casters cast.");
     ImGui::Unindent();
 
-    if (ImGui::Checkbox("Ray-traced ambient occlusion", &features.ambientOcclusion)) enable(features);
+    if (ImGui::Checkbox("Ray-traced ambient occlusion", &features.ambientOcclusion)) save(features);
     tooltip("Traces ambient occlusion from the same geometry and keeps the darker of it and the game's screen-space\n"
         "occlusion, filtered by the game's own blur and accumulation.");
 
     ImGui::Indent();
     ImGui::BeginDisabled(!features.ambientOcclusion);
-    if (ImGui::Checkbox("Half the rays", &features.halfAmbientRays)) enable(features);
+    if (ImGui::Checkbox("Half the rays", &features.halfAmbientRays)) save(features);
     ImGui::EndDisabled();
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
         ImGui::SetTooltip("Each pixel traces two of its four directions and takes the other two from its neighbour: about half the\n"
             "cost, a little more noise. Needs the ray-traced ambient occlusion.");
     ImGui::Unindent();
-    if (ImGui::Checkbox("Ray-traced global illumination", &features.globalIllumination)) enable(features);
+    if (ImGui::Checkbox("Ray-traced global illumination", &features.globalIllumination)) save(features);
     tooltip("Adds sunlight bounced once off the same geometry to the game's lighting, accumulated over frames and filtered.");
-    if (ImGui::Checkbox("Ray-traced light shadows", &features.lightShadows)) enable(features);
+    if (ImGui::Checkbox("Ray-traced light shadows", &features.lightShadows)) save(features);
     tooltip("Traces the shadows of the game's lamps, fires and flashlight from the same geometry in place of their shadow\n"
         "maps. Lights the game draws without shadows get them too. Up to 16 lights a frame; the rest keep the game's.");
 
     ImGui::Indent();
     ImGui::BeginDisabled(!features.lightShadows);
-    if (ImGui::Checkbox("Soft shadows", &features.softLightShadows)) enable(features);
+    if (ImGui::Checkbox("Soft shadows", &features.softLightShadows)) save(features);
     ImGui::EndDisabled();
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
         ImGui::SetTooltip("Traces toward points across each light's size, so shadows soften away from what casts them. Lights the\n"
             "game gives no size get one: fires and bulbs by their reach, lamps 5 cm. Filtered over a few frames and\n"
             "neighbouring pixels. Needs the ray-traced light shadows.");
     ImGui::BeginDisabled(!features.lightShadows);
-    if (ImGui::Checkbox("Bounce light", &features.lightBounce)) enable(features);
+    if (ImGui::Checkbox("Bounce light", &features.lightBounce)) save(features);
     ImGui::EndDisabled();
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
         ImGui::SetTooltip("Adds the lights' light bounced once off the same geometry, accumulated over frames and filtered, so\n"

@@ -32,7 +32,7 @@ From the repository root, after building and testing:
 cpack --config build/release/CPackConfig.cmake -B build/release
 ```
 
-This produces `build/release/DaysGoneDLSS-1.4.1.zip` and its `.sha256` checksum. CPack
+This produces `build/release/DaysGoneDLSS-1.5.0.zip` and its `.sha256` checksum. CPack
 packages only the `addon` component, so SDK headers, static libraries, tests, debug symbols,
 and local settings are excluded. ReShade is installed separately by the player.
 
@@ -229,14 +229,16 @@ Bend TAA), view state `+0x1CE0`.
 
 ## Ray-tracing experiment
 
-A path-tracing experiment, off by default and not part of a release. It runs on 1.13 only; on 1.07
+A path-tracing experiment, off by default and released as experimental. It runs on 1.13 only; on 1.07
 the add-on never calls into it. Stage 1 traces the game's own geometry; stage 2 adds ray-traced sun
 shadows, ambient occlusion, one bounce of sunlight, and shadows and a bounce for the game's local
 lights to the game's lighting. **Ray tracing
 (experimental)** in the overlay has a status line and a checkbox per feature that changes the image;
 the debug view selector and statistics are under **Diagnostics**. F9 switches every feature off and back on for A/B comparison, with a note in
 the corner for two seconds; the work goes on underneath, so switching back is instant.
-`DaysGoneDLSS-diagnostics.ini` is read when it changes, with or without DLSS, and takes:
+The checkboxes are saved in `DaysGoneDLSS.ini` under the keys below and applied at startup.
+`DaysGoneDLSS-diagnostics.ini` is read when it changes, with or without DLSS, overrides them without
+saving them, and takes:
 
 | Key | Default | Effect |
 | --- | --- | --- |
