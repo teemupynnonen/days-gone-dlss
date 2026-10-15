@@ -3,6 +3,7 @@
 // follow DLSS evaluations, such as RenoDX, see it like a game's own DLSS.
 #include "upscaler.hpp"
 #include "presenter.hpp"
+#include "ray_tracing.hpp"
 
 #include <Windows.h>
 #include <Psapi.h>
@@ -29,6 +30,7 @@ constexpr GUID UnwrappedObject{0x7f2c9a11, 0x3b4e, 0x4d6a, {0x81, 0x2f, 0x5e, 0x
 
 HMODULE self{};
 bool engineReady{}, engineFailed{};
+bool rayTracing{}; // The game build supports the ray-tracing experiment; nothing calls into it otherwise.
 ID3D11Device* nativeDevice{};
 ID3D11DeviceContext* nativeContext{};
 ID3D11DeviceContext* wrappedContext{};
@@ -97,6 +99,7 @@ void onDestroyCommandQueue(command_queue* queue)
 {
     if (reinterpret_cast<ID3D11DeviceContext*>(queue->get_native()) != nativeContext) return;
     upscaler::detach();
+    if (rayTracing) ray_tracing::release();
     nativeContext = wrappedContext = nullptr;
     nativeDevice = nullptr;
 }
@@ -105,11 +108,20 @@ void onInitPipeline(device* device, pipeline_layout, uint32_t count, const pipel
 {
     if (device->get_api() != device_api::d3d11) return;
     for (uint32_t i = 0; i < count; ++i)
+    {
+        const auto* shader = static_cast<const shader_desc*>(subobjects[i].data);
+        if (!shader) continue;
+        auto* object = reinterpret_cast<IUnknown*>(pipeline.handle);
         if (subobjects[i].type == pipeline_subobject_type::compute_shader || subobjects[i].type == pipeline_subobject_type::pixel_shader)
-        {
-            const auto* shader = static_cast<const shader_desc*>(subobjects[i].data);
-            if (shader) upscaler::shaderCreated(shader->code, shader->code_size, reinterpret_cast<IUnknown*>(pipeline.handle));
-        }
+            upscaler::shaderCreated(shader->code, shader->code_size, object);
+        if (!rayTracing) continue;
+        if (subobjects[i].type == pipeline_subobject_type::pixel_shader)
+            ray_tracing::pixelShaderCreated(shader->code, shader->code_size, object);
+        else if (subobjects[i].type == pipeline_subobject_type::vertex_shader)
+            ray_tracing::vertexShaderCreated(shader->code, shader->code_size, object);
+        else if (subobjects[i].type == pipeline_subobject_type::compute_shader)
+            ray_tracing::computeShaderCreated(shader->code, shader->code_size, object);
+    }
 }
 
 void onBindPipeline(command_list* list, pipeline_stage stages, pipeline pipeline)
@@ -133,21 +145,25 @@ void onPushDescriptors(command_list* list, shader_stage stages, pipeline_layout,
 
 bool onDispatch(command_list* list, uint32_t x, uint32_t y, uint32_t z)
 {
+    if (rayTracing) ray_tracing::dispatch(native(list));
     return upscaler::dispatch(native(list), x, y, z);
 }
 
 bool onDraw(command_list* list, uint32_t vertices, uint32_t instances, uint32_t first, uint32_t firstInstance)
 {
+    if (rayTracing && ray_tracing::draw(native(list), vertices, instances, first, 0, firstInstance, false)) return true;
     return instances == 1 && !firstInstance && upscaler::draw(native(list), vertices, first, 0, false);
 }
 
 bool onDrawIndexed(command_list* list, uint32_t indices, uint32_t instances, uint32_t first, int32_t offset, uint32_t firstInstance)
 {
+    if (rayTracing && ray_tracing::draw(native(list), indices, instances, first, offset, firstInstance, true)) return true;
     return instances == 1 && !firstInstance && upscaler::draw(native(list), indices, first, offset, true);
 }
 
-// Once per game frame, as the game presents. Returns what frame generation needs from the frame.
-frame_generation::Inputs frame()
+// Once per game frame, as the game presents into `backBuffer`. Returns what frame generation needs
+// from the frame.
+frame_generation::Inputs frame(ID3D11Texture2D* backBuffer)
 {
     if (!engineReady && !engineFailed)
     {
@@ -175,6 +191,8 @@ frame_generation::Inputs frame()
     frame_generation::select(mode == upscaler::FrameGeneration::Off || dynamic ? 0 : static_cast<unsigned>(mode) + 1, dynamic);
     const auto inputs = upscaler::frameGenerationInputs();
     upscaler::endFrame();
+    if (rayTracing && nativeContext) ray_tracing::present(nativeContext, backBuffer);
+
     return inputs;
 }
 
@@ -185,7 +203,18 @@ void onPresent(command_queue*, swapchain* chain, const rect*, const rect*, uint3
     if (chain->get_device()->get_api() != device_api::d3d11
         || (nativeDevice && reinterpret_cast<ID3D11Device*>(chain->get_device()->get_native()) != nativeDevice))
         return;
-    frame();
+    frame(reinterpret_cast<ID3D11Texture2D*>(chain->get_current_back_buffer().handle));
+}
+
+// F9 switches the ray-traced features off and on, for A/B comparison with the overlay closed.
+void onReshadePresent(effect_runtime* runtime)
+{
+    if (engineReady && rayTracing && runtime->is_key_pressed(VK_F9)) ray_tracing::toggleFeatures();
+}
+
+void onReshadeOverlay(effect_runtime*)
+{
+    if (engineReady && rayTracing) ray_tracing::drawIndicator();
 }
 
 void onOverlay(effect_runtime*)
@@ -207,11 +236,60 @@ bool frameGenerationEnabled()
 }
 }
 
+// TEMPORARY: where fatal exceptions happen, before the engine's crash handler ends the process.
+std::string where(DWORD64 address)
+{
+    HMODULE module{};
+    wchar_t path[MAX_PATH]{};
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(address), &module) || !GetModuleFileNameW(module, path, MAX_PATH))
+        return std::to_string(address);
+    char text[160]{};
+    std::snprintf(text, sizeof(text), "%ls+0x%llx", std::filesystem::path(path).filename().c_str(),
+        static_cast<unsigned long long>(address - reinterpret_cast<DWORD64>(module)));
+    return text;
+}
+
+LONG CALLBACK logFatalException(EXCEPTION_POINTERS* info)
+{
+    static int logged{};
+    const auto code = info->ExceptionRecord->ExceptionCode;
+    if ((code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_STACK_OVERFLOW && code != EXCEPTION_ILLEGAL_INSTRUCTION
+            && code != EXCEPTION_INT_DIVIDE_BY_ZERO && code != 0xC0000374 && code != 0xC0000409) || ++logged > 4)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    char head[160]{};
+    std::snprintf(head, sizeof(head), "DEBUG exception 0x%08lx, data %llx %llx; stack:", code,
+        static_cast<unsigned long long>(info->ExceptionRecord->NumberParameters > 0 ? info->ExceptionRecord->ExceptionInformation[0] : 0),
+        static_cast<unsigned long long>(info->ExceptionRecord->NumberParameters > 1 ? info->ExceptionRecord->ExceptionInformation[1] : 0));
+    std::string text = head;
+    CONTEXT context = *info->ContextRecord;
+    for (int frame = 0; frame < 20 && context.Rip; ++frame)
+    {
+        text += " " + where(context.Rip);
+        DWORD64 imageBase{};
+        auto* function = RtlLookupFunctionEntry(context.Rip, &imageBase, nullptr);
+        if (!function)
+        {
+            context.Rip = *reinterpret_cast<DWORD64*>(context.Rsp);
+            context.Rsp += 8;
+            continue;
+        }
+        void* handlerData{};
+        DWORD64 establisher{};
+        RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, context.Rip, function, &context, &handlerData, &establisher, nullptr);
+    }
+    upscaler::log(text);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon, HMODULE reshadeModule)
 {
+    AddVectoredExceptionHandler(1, logFatalException); // TEMPORARY
     if (!upscaler::selectBuild(reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr)))
         || !reshade::register_addon(addon, reshadeModule))
         return false;
+    rayTracing = upscaler::rayTracingSupported();
     self = addon;
     // The view hook and pending RHI commands point into this module; keep it loaded until exit.
     HMODULE pinned{};
@@ -227,6 +305,8 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon, HMODULE reshadeMo
     reshade::register_event<reshade::addon_event::draw>(onDraw);
     reshade::register_event<reshade::addon_event::draw_indexed>(onDrawIndexed);
     reshade::register_event<reshade::addon_event::present>(onPresent);
+    reshade::register_event<reshade::addon_event::reshade_present>(onReshadePresent);
+    reshade::register_event<reshade::addon_event::reshade_overlay>(onReshadeOverlay);
     reshade::register_overlay("Days Gone DLSS", onOverlay);
     if (engineReady) upscaler::resume();
     return true;
@@ -238,6 +318,7 @@ extern "C" __declspec(dllexport) void AddonUninit(HMODULE addon, HMODULE reshade
     upscaler::disable();
     // ReShade unloads add-ons when its last device goes; the next load reports the game's device again.
     upscaler::detach();
+    if (rayTracing) ray_tracing::release();
     nativeContext = wrappedContext = nullptr;
     nativeDevice = nullptr;
     reshade::unregister_overlay("Days Gone DLSS", onOverlay);

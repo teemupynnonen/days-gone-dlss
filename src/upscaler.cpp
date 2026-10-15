@@ -2,6 +2,8 @@
 #include "upscaler_shaders.hpp"
 #include "ambient_occlusion.hpp"
 #include "indirect_lighting.hpp"
+#include "ray_tracing.hpp"
+#include "shader_bytecode.hpp"
 
 #include <Windows.h>
 #include <Psapi.h>
@@ -57,15 +59,6 @@ std::uint64_t ambientDraws{};
 
 enum class Pass : std::uint8_t { None, TemporalFull, TemporalUpscale, Composite, DepthResolve };
 
-constexpr std::uint8_t nibble(char value) { return static_cast<std::uint8_t>(value <= '9' ? value - '0' : value - 'a' + 10); }
-constexpr std::array<std::uint8_t, 16> dxbcHash(const char (&hex)[33])
-{
-    std::array<std::uint8_t, 16> result{};
-    for (std::size_t i = 0; i < result.size(); ++i)
-        result[i] = static_cast<std::uint8_t>(nibble(hex[i * 2]) << 4 | nibble(hex[i * 2 + 1]));
-    return result;
-}
-
 struct ShaderSlot
 {
     const char* name;
@@ -102,6 +95,12 @@ struct ViewLayout
     std::size_t size, rect, unscaledRect, temporalJitter, screenPercentage, cameraCut, antiAliasing, viewState, projection;
 };
 
+// The FViewInfo fields only ray tracing reads, mapped for 1.13 alone.
+struct RayTracingViewLayout
+{
+    std::size_t translatedViewProjection, preViewTranslation, viewOrigin;
+};
+
 // From ProjMatrix: TranslatedViewMatrix, TranslatedViewProjectionMatrix, ViewOrigin and the jitter
 // PreVisibilityFrameSetup adds to the projection (2 * jitter / view size). Each capture checks them by
 // rebuilding the translated view-projection.
@@ -132,7 +131,10 @@ struct GameBuild
     Address screenPercentageData, temporalSamplesData;
     ViewLayout view;
     std::array<GameShader, std::size(Shaders)> shaders; // In Shaders[] order
+    const RayTracingViewLayout* rayTracingView; // Null where the ray-tracing experiment is unsupported
 };
+
+constexpr RayTracingViewLayout RayTracingView113{0xC20, 0xCB4, 0xCC0};
 
 constexpr unsigned char PreVisibilityPrefix113[]{0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x18, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55};
 constexpr unsigned char AllocateCommandPagePrefix113[]{0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x10, 0x48, 0x89,
@@ -159,7 +161,8 @@ constexpr GameBuild Builds[]{
             {0x4CA4168, dxbcHash("214506ef0606197b6d402ec92f4aa56b")},
             {0x4C46000, dxbcHash("39b02a2fa20098b2b7aac54c68b4b9cd")},
             {0x4C46010, dxbcHash("3ceef14a17dc9fa2a9c8274ef8601ddd")},
-        }}},
+        }},
+        &RayTracingView113},
     // Steam beta days_gone_classic. Its shaders come from the _P patch pak's global shader cache.
     {"1.07 (Steam build 10034136)", 107, 0x60EDC8B2, 0x64B6000, 0x1E3B9F0, PreVisibilityPrefix107, 0x1771BB0,
         AllocateCommandPagePrefix107, 0x1C5770, EngineTickPrefix107, 0x4217B88, 0x428B180, 0x4480F10, {0x2270, 0x48, 0x58, 0x610, 0xC64, 0xC75, 0xC80, 0x1200, 0x80},
@@ -173,7 +176,8 @@ constexpr GameBuild Builds[]{
             {0x4455E78, dxbcHash("a5660967d928130e281ef47140c516ff")},
             {0x43F95B0, dxbcHash("01543fdea254a83ccead7257543e3210")},
             {0x43F95C0, dxbcHash("80603de287d3c95e0e8208e55be06c58")},
-        }}},
+        }},
+        nullptr},
 };
 
 const GameBuild* findBuild(Address imageBase)
@@ -211,6 +215,10 @@ struct ViewCapture
     frame_generation::Camera camera;
     bool cameraKnown{}; // The camera fields passed their check
     std::uint32_t frame{}; // The view family's FrameNumber
+    float clipFromWorld[16]{}; // Jittered translated-world to clip, as the base pass draws with it
+    // Translated world is world plus this, the negated camera position; known when it matches ViewOrigin.
+    float preViewTranslation[3]{};
+    bool translationKnown{};
 };
 
 struct Target
@@ -398,12 +406,6 @@ std::string failure;
 std::uint64_t dispatchCalls{}, foreignDispatches{}, recognisedDispatches{}, resets{};
 ID3D11DeviceContext* lastForeignContext{};
 
-void log(std::string_view message)
-{
-    std::lock_guard lock(logMutex);
-    if (logFile) logFile << GetTickCount64() << " [thread " << GetCurrentThreadId() << "] " << message << std::endl;
-}
-
 void logOnce(const std::string& key, std::string_view message)
 {
     if (loggedOnce.emplace(key, true).second) log(message);
@@ -448,8 +450,13 @@ std::filesystem::path moduleDirectory()
 
 void executeViewCommand(Address, ViewCommand* command)
 {
-    std::lock_guard lock(viewMutex);
-    executingView = command->view;
+    {
+        std::lock_guard lock(viewMutex);
+        executingView = command->view;
+    }
+    const auto& view = command->view;
+    if (build->rayTracingView)
+        ray_tracing::beginView(view.clipFromWorld, view.rect, view.unscaled, view.preViewTranslation, view.translationKnown);
 }
 
 // Mirrors the engine's AllocCommand: append to the last memory page, or let the engine add a page.
@@ -540,6 +547,20 @@ void preVisibility(Address renderer, Address commandList)
         capture.cameraKnown = readCamera(view, capture.camera);
         capture.frame = *reinterpret_cast<const std::uint32_t*>(*reinterpret_cast<const Address*>(view) + FamilyFrameNumberOffset);
         frame_generation::beginRender(capture.frame);
+        if (const auto* rayTracing = build->rayTracingView)
+        {
+            std::memcpy(capture.clipFromWorld, reinterpret_cast<const void*>(view + rayTracing->translatedViewProjection),
+                sizeof(capture.clipFromWorld));
+            std::memcpy(capture.preViewTranslation, reinterpret_cast<const void*>(view + rayTracing->preViewTranslation),
+                sizeof(capture.preViewTranslation));
+            float origin[3]{};
+            std::memcpy(origin, reinterpret_cast<const void*>(view + rayTracing->viewOrigin), sizeof(origin));
+            capture.translationKnown = std::abs(capture.preViewTranslation[0] + origin[0]) < 1
+                && std::abs(capture.preViewTranslation[1] + origin[1]) < 1 && std::abs(capture.preViewTranslation[2] + origin[2]) < 1;
+            static bool reported{};
+            if (!capture.translationKnown && !std::exchange(reported, true))
+                log("FViewMatrices::PreViewTranslation does not mirror ViewOrigin; ray tracing keeps no geometry from earlier frames.");
+        }
         capture.thread = GetCurrentThreadId();
         {
             std::lock_guard lock(viewMutex);
@@ -553,7 +574,7 @@ void preVisibility(Address renderer, Address commandList)
             capture.sequence = ++captureSequence;
             capturedView = capture;
         }
-        if (fullJitter) enqueueView(commandList, capture);
+        if (fullJitter || (build->rayTracingView && ray_tracing::wanted())) enqueueView(commandList, capture);
     }
 }
 
@@ -1432,6 +1453,11 @@ void updatePlan(const Settings& wanted)
 }
 }
 
+void log(std::string_view message)
+{
+    std::lock_guard lock(logMutex);
+    if (logFile) logFile << GetTickCount64() << " [thread " << GetCurrentThreadId() << "] " << message << std::endl;
+}
 
 Settings currentSettings()
 {
@@ -1469,6 +1495,11 @@ const char* selectBuild(std::uintptr_t base) noexcept
     build = findBuild(base);
     imageBase = build ? base : 0;
     return build ? build->name : nullptr;
+}
+
+bool rayTracingSupported() noexcept
+{
+    return build && build->rayTracingView;
 }
 
 // Reflex's sleep and simulation markers belong to the game thread. Without this hook frame
@@ -1790,11 +1821,27 @@ void shaderCreated(const void* code, std::size_t size, IUnknown* shader) noexcep
     }
 }
 
+// While ray tracing runs or its costs are shown, DaysGoneDLSS-performance.txt beside the log holds
+// them, rewritten every second, so they can be read without the overlay.
+static void writePerformanceReport()
+{
+    static std::uint64_t written{};
+    const auto now = GetTickCount64();
+    if (now - written < 1000) return;
+
+    written = now;
+    const auto state = ray_tracing::status();
+    if (!ray_tracing::wanted() && !state.performanceOverlay && !state.measurement.running) return;
+
+    std::ofstream(dataDirectory / "DaysGoneDLSS-performance.txt", std::ios::trunc) << ray_tracing::performanceReport();
+}
+
 // Developer override: DaysGoneDLSS-diagnostics.ini beside the settings is re-read when it changes, so
 // jitter and motion conventions can be compared on a running game without the overlay.
 static void reloadDiagnostics()
 {
     static std::filesystem::file_time_type seen{};
+    static int measureRequest{};
     std::error_code error;
     const auto path = dataDirectory / "DaysGoneDLSS-diagnostics.ini";
     const auto modified = std::filesystem::last_write_time(path, error);
@@ -1802,6 +1849,8 @@ static void reloadDiagnostics()
     seen = modified;
     std::ifstream input(path);
     auto options = currentDiagnostics();
+    auto features = ray_tracing::status().features;
+    bool featuresRead{};
     std::string line;
     while (std::getline(input, line))
     {
@@ -1815,7 +1864,69 @@ static void reloadDiagnostics()
         else if (key == "debug_view" && value >= 0 && value <= 4) options.debugView = value;
         else if (key == "game_taa") options.gameTemporalAA = value != 0;
         else if (key == "full_resolution_ao") options.fullResolutionAmbientOcclusion = value != 0;
+        else if (key == "ray_tracing_view" && build->rayTracingView && value >= 0 && value <= 9) ray_tracing::select(static_cast<ray_tracing::View>(value));
+        else if (key == "ray_tracing_sun_shadows")
+        {
+            features.sunShadows = value != 0;
+            featuresRead = true;
+        }
+        else if (key == "ray_tracing_ambient_occlusion")
+        {
+            features.ambientOcclusion = value != 0;
+            featuresRead = true;
+        }
+        else if (key == "ray_tracing_half_ambient_rays")
+        {
+            features.halfAmbientRays = value != 0;
+            featuresRead = true;
+        }
+        else if (key == "ray_tracing_replace_canopy_shadows")
+        {
+            features.replaceCanopyShadows = value != 0;
+            featuresRead = true;
+        }
+        else if (key == "ray_tracing_offscreen_geometry")
+        {
+            features.offscreenGeometry = value != 0;
+            featuresRead = true;
+        }
+        else if (key == "dlss_quality" && value >= 0 && value < static_cast<int>(Quality::Count)) // TEMPORARY: the menu's mode change
+        {
+            auto wanted = currentSettings();
+            wanted.quality = static_cast<Quality>(value);
+            applySettings(wanted);
+        }
+        else if (key == "ray_tracing_global_illumination")
+        {
+            features.globalIllumination = value != 0;
+            featuresRead = true;
+        }
+        else if (key == "ray_tracing_light_shadows")
+        {
+            features.lightShadows = value != 0;
+            featuresRead = true;
+        }
+        else if (key == "ray_tracing_soft_light_shadows")
+        {
+            features.softLightShadows = value != 0;
+            featuresRead = true;
+        }
+        else if (key == "ray_tracing_light_bounce")
+        {
+            features.lightBounce = value != 0;
+            featuresRead = true;
+        }
+        else if (key == "ray_tracing_soft_sun_shadows")
+        {
+            features.softSunShadows = value != 0;
+            featuresRead = true;
+        }
+        else if (key == "ray_tracing_performance_overlay" && build->rayTracingView) ray_tracing::showPerformance(value != 0);
+        // A new number starts a measurement, so rewriting the file with the same one does not.
+        else if (key == "ray_tracing_measure_cost" && build->rayTracingView && value && value != std::exchange(measureRequest, value))
+            ray_tracing::measureCosts();
     }
+    if (featuresRead && build->rayTracingView) ray_tracing::enable(features);
     applyDiagnostics(options);
     log("Diagnostics: invert jitter X " + std::to_string(options.invertJitterX) + ", Y " + std::to_string(options.invertJitterY)
         + ", jittered motion " + std::to_string(options.jitteredMotion) + ", debug view " + std::to_string(options.debugView)
@@ -1858,8 +1969,11 @@ void endFrame() noexcept
             if (!released.exchange(true) && hooked) releaseRenderer();
             return;
         }
+        // The ray-tracing switches live in the same file and work without DLSS.
+        static std::uint64_t presents{};
+        if (active && ++presents % 30 == 0) reloadDiagnostics();
+        if (active && build->rayTracingView) writePerformanceReport();
         if (!active || !hooked) return;
-        if (frame.index % 30 == 0) reloadDiagnostics();
         const auto wanted = currentSettings();
         // Missing slots cost one memory read each until the engine fills its caches.
         identifyShaders();

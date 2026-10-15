@@ -511,7 +511,7 @@ HRESULT SwapChain::present(UINT interval, UINT flags)
     // A test present only asks whether the window is visible; nothing was rendered for it.
     if (flags & DXGI_PRESENT_TEST) return chain->Present(interval, flags);
 
-    const auto inputs = onFrame ? onFrame() : frame_generation::Inputs{};
+    const auto inputs = onFrame ? onFrame(backBuffer.Get()) : frame_generation::Inputs{};
     if (overlay) reshade::update_and_present_effect_runtime(overlay);
     try { copyFrame(inputs); }
     catch (const Failure& failure)

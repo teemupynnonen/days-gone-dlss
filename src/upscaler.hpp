@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <string_view>
 
 struct ID3D11Device;
 struct ID3D11DeviceContext;
@@ -48,6 +49,8 @@ struct Status
 // Recognises the game build from the executable's PE header, before the game creates its shaders.
 // Returns the build's name, or nullptr when the executable is not a supported build.
 const char* selectBuild(std::uintptr_t imageBase) noexcept;
+// The ray-tracing experiment only knows the selected build's view layout on 1.13.
+bool rayTracingSupported() noexcept;
 // Outside the loader lock, after MinHook is initialized and a build is selected: settings, console
 // variables, view hook. With frame generation also the game thread's frame, for Reflex.
 void initialize(const std::filesystem::path& directory, bool withFrameGeneration);
@@ -61,6 +64,8 @@ void resume() noexcept;
 void shutdown() noexcept;
 // True while a DLSS mode is selected; the add-on attaches to Direct3D lazily.
 bool wanted() noexcept;
+// Appends a line to DaysGoneDLSS.log beside the add-on, from any thread.
+void log(std::string_view message);
 
 // ---- Render side, on the thread executing Direct3D work ----
 // `context` is the native immediate context every call below runs on. `ngxContext` is what NGX

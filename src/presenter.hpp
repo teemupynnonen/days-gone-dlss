@@ -13,8 +13,9 @@
 namespace days_gone_dlss::presenter
 {
 // The add-on's work for each game frame, on the presenting thread, before the frame leaves
-// Direct3D 11. Returns what frame generation needs from the frame.
-using FrameCallback = frame_generation::Inputs (*)();
+// Direct3D 11, which the game rendered into `backBuffer`. Returns what frame generation needs from
+// the frame.
+using FrameCallback = frame_generation::Inputs (*)(ID3D11Texture2D* backBuffer);
 
 // At add-on load, before the game creates its swap chain. Takes over the game's next swap chain when
 // frame generation can run; Streamline is loaded from `directory`. Later calls do nothing.

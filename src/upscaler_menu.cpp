@@ -1,6 +1,8 @@
 // DLSS settings UI, drawn as a ReShade overlay window.
 #include "upscaler.hpp"
+#include "menu_style.hpp"
 #include "presenter.hpp"
+#include "ray_tracing.hpp"
 
 #include <imgui.h>
 #include <reshade.hpp> // Routes ImGui calls through ReShade's overlay.
@@ -11,19 +13,7 @@ namespace days_gone_dlss::upscaler
 {
 namespace
 {
-const ImVec4 Grey{0.6f, 0.6f, 0.6f, 1}, Green{0.45f, 0.85f, 0.45f, 1}, Yellow{0.95f, 0.8f, 0.35f, 1}, Red{0.95f, 0.4f, 0.4f, 1};
-
-void tooltip(const char* text)
-{
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", text);
-}
-
-void statusLine(const ImVec4& colour, const std::string& text)
-{
-    ImGui::PushStyleColor(ImGuiCol_Text, colour);
-    ImGui::TextWrapped("%s", text.c_str());
-    ImGui::PopStyleColor();
-}
+using namespace menu;
 
 // One coloured line on what DLSS is doing right now.
 void drawStatus(const Status& state, Quality quality)
@@ -206,7 +196,21 @@ void drawMenu(float scale)
     ImGui::Separator();
     if (drawSettings(wanted, state, width)) applySettings(wanted);
 
+    if (rayTracingSupported())
+    {
+        ImGui::Spacing();
+        ray_tracing::drawMenu();
+    }
+
     ImGui::Spacing();
-    if (ImGui::CollapsingHeader("Diagnostics")) drawDiagnostics(state, width);
+    if (ImGui::CollapsingHeader("Diagnostics"))
+    {
+        drawDiagnostics(state, width);
+        if (rayTracingSupported())
+        {
+            ImGui::Spacing();
+            ray_tracing::drawDiagnostics(width);
+        }
+    }
 }
 }
