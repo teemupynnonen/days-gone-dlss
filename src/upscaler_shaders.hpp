@@ -181,7 +181,14 @@ float3 Encoded(int2 local, int2 last)
     return Linear ? sqrt(max(color, 0)) : color;
 }
 
-float4 main(float2 uv : TEXCOORD0, float4 position : SV_Position) : SV_Target
+// The second target, when bound, takes the frame before the UI for frame generation.
+struct Output
+{
+    float4 color : SV_Target0;
+    float4 hudless : SV_Target1;
+};
+
+Output main(float2 uv : TEXCOORD0, float4 position : SV_Position)
 {
     int2 pixel = int2(position.xy);
     int2 local = pixel - OutputOrigin;
@@ -221,9 +228,12 @@ float4 main(float2 uv : TEXCOORD0, float4 position : SV_Position) : SV_Target
         * Grain(uv + Composite[0].xy, Composite[1]);
     float interfaceBrightness = Hdr ? Composite[5].y : 1;
 #endif
+    Output result;
+    result.hudless = float4(Hdr ? EncodeHdr(color) : EncodeSrgb(color), 0);
     float4 ui = Interface.Load(int3(pixel, 0));
     color = color * (1 - ui.a) + ui.rgb * interfaceBrightness;
-    return float4(Hdr ? EncodeHdr(color) : EncodeSrgb(color), 0);
+    result.color = float4(Hdr ? EncodeHdr(color) : EncodeSrgb(color), 0);
+    return result;
 }
 )";
 
@@ -247,6 +257,8 @@ Texture2D<float> DepthInput : register(t4);
 Texture2D<float4> ColorInput : register(t5);
 Texture2D<float> BiasInput : register(t6);
 RWTexture2D<float4> Output : register(u0);
+// When bound, the frame before the UI for frame generation.
+RWTexture2D<float4> Hudless : register(u1);
 
 float3 Encoded(int2 pixel)
 {
@@ -281,6 +293,7 @@ void main(uint2 pixel : SV_DispatchThreadID)
 #if GAME_VERSION != 107
     color *= Grain(uv + Temporal[0].xy, Temporal[1]);
 #endif
+    Hudless[pixel] = float4(Hdr ? EncodeHdr(color) : EncodeSrgb(color), 0);
     float4 ui = Interface[pixel];
     color = color * (1 - ui.a) + ui.rgb * (Hdr ? Temporal[5].y : 1);
     float3 encoded = Hdr ? EncodeHdr(color) : EncodeSrgb(color);

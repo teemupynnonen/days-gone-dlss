@@ -79,6 +79,27 @@ download_pinned("${RESHADE_DIR}"
     "${imgui}/LICENSE.txt|imgui/LICENSE.txt|c80c5789748d955c4a650562baa0d750494e2c7128c2ca66aaebe2e3c4e198bf"
 )
 
+# NVIDIA Streamline SDK 2.14.1 for DLSS Frame Generation. Only its release archive carries the
+# frame generation plugin, so the archive is downloaded once and the headers, the license and the
+# x64 runtime files are extracted. The add-on loads Streamline at run time; nothing is linked.
+set(STREAMLINE_VERSION 2.14.1)
+set(STREAMLINE_DIR "${CMAKE_BINARY_DIR}/_deps/streamline-sdk-${STREAMLINE_VERSION}")
+set(STREAMLINE_RUNTIME sl.interposer.dll sl.common.dll sl.dlss_g.dll sl.reflex.dll sl.pcl.dll nvngx_dlssg.dll)
+if(NOT EXISTS "${STREAMLINE_DIR}/license.txt")
+    set(archive "${CMAKE_BINARY_DIR}/_deps/streamline-sdk-v${STREAMLINE_VERSION}.zip")
+    message(STATUS "Downloading the Streamline SDK ${STREAMLINE_VERSION}")
+    file(DOWNLOAD "https://github.com/NVIDIA-RTX/Streamline/releases/download/v${STREAMLINE_VERSION}/streamline-sdk-v${STREAMLINE_VERSION}.zip"
+        "${archive}" EXPECTED_HASH SHA256=92c4d954631a1710da86ca3fa8d5034f2b9503838c95fc4ae977ae149319781b TLS_VERIFY ON STATUS status)
+    list(GET status 0 code)
+    if(NOT code EQUAL 0)
+        message(FATAL_ERROR "Could not download the Streamline SDK: ${status}")
+    endif()
+    list(TRANSFORM STREAMLINE_RUNTIME PREPEND "bin/x64/" OUTPUT_VARIABLE runtime)
+    file(ARCHIVE_EXTRACT INPUT "${archive}" DESTINATION "${STREAMLINE_DIR}" PATTERNS "include/*" license.txt ${runtime})
+    file(REMOVE "${archive}")
+endif()
+list(TRANSFORM STREAMLINE_RUNTIME PREPEND "${STREAMLINE_DIR}/bin/x64/" OUTPUT_VARIABLE STREAMLINE_FILES)
+
 add_library(ngx STATIC IMPORTED)
 set_target_properties(ngx PROPERTIES
     IMPORTED_LOCATION "${DLSS_SDK_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib"
@@ -98,10 +119,10 @@ add_library(dxbc_hash STATIC "${DXBC_HASH_DIR}/DxilHash.cpp")
 target_compile_definitions(dxbc_hash PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 
 add_library(days_gone_dlss SHARED src/upscaler.cpp src/upscaler_settings.cpp src/upscaler_menu.cpp src/upscaler_addon.cpp
-    src/ambient_occlusion.cpp src/indirect_lighting.cpp src/shader_bytecode.cpp)
+    src/ambient_occlusion.cpp src/indirect_lighting.cpp src/shader_bytecode.cpp src/presenter.cpp src/frame_generation.cpp)
 target_include_directories(days_gone_dlss PRIVATE src)
-target_include_directories(days_gone_dlss SYSTEM PRIVATE "${RESHADE_DIR}/include" "${RESHADE_DIR}/imgui")
-target_link_libraries(days_gone_dlss PRIVATE minhook ngx dxbc_hash d3d11 dxgi d3dcompiler)
+target_include_directories(days_gone_dlss SYSTEM PRIVATE "${RESHADE_DIR}/include" "${RESHADE_DIR}/imgui" "${STREAMLINE_DIR}/include")
+target_link_libraries(days_gone_dlss PRIVATE minhook ngx dxbc_hash d3d11 d3d12 dxgi d3dcompiler)
 target_compile_features(days_gone_dlss PRIVATE cxx_std_20)
 target_compile_definitions(days_gone_dlss PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX ImTextureID=ImU64)
 target_compile_options(days_gone_dlss PRIVATE /W4 /WX /permissive- /utf-8)
@@ -112,16 +133,17 @@ set_target_properties(days_gone_dlss PROPERTIES
     SUFFIX .addon64
     CXX_EXTENSIONS OFF
 )
-# NGX loads the model DLL from the add-on's directory.
+# NGX loads the model DLL, and the add-on Streamline, from the add-on's directory.
 add_custom_command(TARGET days_gone_dlss POST_BUILD
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-        "${DLSS_SDK_DIR}/lib/Windows_x86_64/rel/nvngx_dlss.dll" "$<TARGET_FILE_DIR:days_gone_dlss>/nvngx_dlss.dll"
+        "${DLSS_SDK_DIR}/lib/Windows_x86_64/rel/nvngx_dlss.dll" ${STREAMLINE_FILES} "$<TARGET_FILE_DIR:days_gone_dlss>"
 )
 
 install(TARGETS days_gone_dlss RUNTIME DESTINATION . COMPONENT addon)
 install(FILES README.md CHANGELOG.md LICENSE DESTINATION DaysGoneDLSS COMPONENT addon)
-install(FILES "${DLSS_SDK_DIR}/lib/Windows_x86_64/rel/nvngx_dlss.dll" DESTINATION . COMPONENT addon)
+install(FILES "${DLSS_SDK_DIR}/lib/Windows_x86_64/rel/nvngx_dlss.dll" ${STREAMLINE_FILES} DESTINATION . COMPONENT addon)
 install(FILES "${DLSS_SDK_DIR}/LICENSE.txt" DESTINATION DaysGoneDLSS RENAME NVIDIA-DLSS-LICENSE.txt COMPONENT addon)
+install(FILES "${STREAMLINE_DIR}/license.txt" DESTINATION DaysGoneDLSS RENAME NVIDIA-Streamline-LICENSE.txt COMPONENT addon)
 install(FILES "${minhook_SOURCE_DIR}/LICENSE.txt" DESTINATION DaysGoneDLSS RENAME MinHook-LICENSE.txt COMPONENT addon)
 install(FILES "${RESHADE_DIR}/LICENSE.md" DESTINATION DaysGoneDLSS RENAME ReShade-LICENSE.txt COMPONENT addon)
 install(FILES "${RESHADE_DIR}/imgui/LICENSE.txt" DESTINATION DaysGoneDLSS RENAME ImGui-LICENSE.txt COMPONENT addon)

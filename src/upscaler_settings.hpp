@@ -9,6 +9,9 @@ namespace days_gone_dlss::upscaler
 enum class Quality : std::uint8_t { Off, Dlaa, Quality, Balanced, Performance, UltraPerformance, Custom, Count };
 // Values match NVSDK_NGX_DLSS_Hint_Render_Preset; Default lets the DLSS DLL choose per quality mode.
 enum class Preset : std::uint8_t { Default = 0, J = 10, K = 11, L = 12, M = 13 };
+// Frames presented per rendered frame. Dynamic lets DLSS Frame Generation choose, to reach the
+// display's refresh rate.
+enum class FrameGeneration : std::uint8_t { Off, X2, X3, X4, X5, X6, Dynamic, Count };
 
 struct Settings
 {
@@ -24,12 +27,16 @@ struct Settings
     float sharpness{DefaultSharpness};
     // 1.07's screen-space indirect lighting while DLSS runs; off renders as the game's lower presets do.
     bool indirectLighting{true};
+    // DLSS Frame Generation. The game then presents through Direct3D 12, which is set up with its
+    // swap chain at startup, so turning it on applies after a restart.
+    FrameGeneration frameGeneration{FrameGeneration::Off};
 
     bool operator==(const Settings&) const = default;
 };
 
 std::string_view label(Quality quality);
 std::string_view label(Preset preset);
+std::string_view label(FrameGeneration mode);
 bool validPreset(int value);
 
 // Render width divided by output width. DLSS's own optimal sizes take precedence when NGX is ready.
