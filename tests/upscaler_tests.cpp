@@ -59,16 +59,23 @@ void persistence(const fs::path& root)
     expect(loadSettings(path) == Settings{}, "A first launch keeps the game's own anti-aliasing.");
     expect(!fs::exists(path), "Loading defaults must not create a settings file.");
 
-    const Settings chosen{Quality::Custom, 0.625f, Preset::K, -0.25f, 0.4f, false};
+    const Settings chosen{Quality::Custom, 0.625f, Preset::K, -0.25f, 0.4f, false, FrameGeneration::X4};
     saveSettings(path, chosen);
     expect(loadSettings(path) == chosen,
-        "Restart restores the mode, custom scale, preset, texture bias, sharpening and indirect lighting.");
+        "Restart restores the mode, custom scale, preset, texture bias, sharpening, indirect lighting and frame generation.");
     for (int i = 0; i < static_cast<int>(Quality::Count); ++i)
     {
         auto mode = chosen;
         mode.quality = static_cast<Quality>(i);
         saveSettings(path, mode);
         expect(loadSettings(path) == mode, "Every mode survives a restart.");
+    }
+    for (int i = 0; i < static_cast<int>(FrameGeneration::Count); ++i)
+    {
+        auto mode = chosen;
+        mode.frameGeneration = static_cast<FrameGeneration>(i);
+        saveSettings(path, mode);
+        expect(loadSettings(path) == mode, "Every frame generation mode survives a restart.");
     }
 
     write(path, "# DLSS\r\nunknown=future\r\n quality = performance \r\npreset=13\r\nbroken\r\n");

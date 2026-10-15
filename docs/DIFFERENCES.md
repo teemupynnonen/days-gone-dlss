@@ -21,6 +21,8 @@ Only addresses and offsets changed; the code behind them is the same.
 | --- | --- | --- |
 | `FSceneRenderer::PreVisibilityFrameSetup` | `0x20E6920` | `0x1E3B9F0` |
 | RHI command page allocation | `0x19C0EA0` | `0x1771BB0` |
+| `FEngineLoop::Tick` (frame generation) | `0x1BF7F0` | `0x1C5770` |
+| `GFrameNumber` | `0x4A60C44` | `0x4217B88` |
 | `r.ScreenPercentage` data | `0x4ADCA50` | `0x428B180` |
 | `r.TemporalAASamples` data | `0x4CD0620` | `0x4480F10` |
 | TAA `_0000`, `_0010`, `_0001` caches | `0x4CA41C8`, `0x4CA41E8`, `0x4CA4208` | `0x4455ED8`, `0x4455EF8`, `0x4455F18` |
@@ -28,7 +30,7 @@ Only addresses and offsets changed; the code behind them is the same.
 | `FDepthResolveCS<false/true>` caches | `0x4C46000`, `0x4C46010` | `0x43F95B0`, `0x43F95C0` |
 | `"UnrealEngine4"` mutex name | `0x3E23498` | `0x380A7E8` |
 
-The two hooked functions have different prologues; each build carries its own bytes to verify.
+The hooked functions have different prologues; each build carries its own bytes to verify.
 
 FViewInfo is 0xAE0 bytes smaller in 1.07, and every field the add-on reads moved by that amount:
 
@@ -42,10 +44,26 @@ FViewInfo is 0xAE0 bytes smaller in 1.07, and every field the add-on reads moved
 | bCameraCut | `0x1755` | `0xC75` |
 | Anti-aliasing method | `0x1760` | `0xC80` |
 | ViewState | `0x1CE0` | `0x1200` |
+| ProjMatrix (frame generation) | `0xB60` | `0x80` |
+
+1.07's ProjMatrix is inferred from the same shift and not yet confirmed in its code; frame
+generation pauses when the matrices fail their check (DEVELOPMENT.md, Frame generation).
 
 Unchanged: the renderer's views array, the RHI command list layout, the native shader offset in
 Bend's shader objects, the jitter sequence and its phase caps, TAA variant selection and dispatch
 size, and the TAA running after the UI pass.
+
+## Frame timing
+
+1.07 times each frame from the swap chain (`FUN_141ac73a0`, the poll at RVA `0x1AC7524`). It
+stores `GetLastPresentCount` after a present, then polls `GetFrameStatistics` until that count
+shows, sleeping 1 ms between tries, up to a timeout of about 0.4 s. Its frame limiter sleeps by
+these times. 1.13 does not.
+
+Under frame generation the real swap chain's counts include the generated frames. At 2x the
+awaited count never showed, so every frame waited out the timeout, menus included; the other
+multipliers were not affected. The stand-in therefore reports the game's own present count and the
+time of its last present (DEVELOPMENT.md, Frame generation).
 
 ## Shaders
 

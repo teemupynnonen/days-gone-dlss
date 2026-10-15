@@ -18,6 +18,8 @@ namespace
 {
 constexpr std::string_view QualityKeys[]{"off", "dlaa", "quality", "balanced", "performance", "ultra_performance", "custom"};
 static_assert(std::size(QualityKeys) == static_cast<std::size_t>(Quality::Count));
+constexpr std::string_view FrameGenerationKeys[]{"off", "2x", "3x", "4x", "5x", "6x", "dynamic"};
+static_assert(std::size(FrameGenerationKeys) == static_cast<std::size_t>(FrameGeneration::Count));
 
 std::string_view trim(std::string_view text)
 {
@@ -59,6 +61,21 @@ std::string_view label(Preset preset)
     case Preset::K: return "K (transformer)";
     case Preset::L: return "L (Ultra Performance model)";
     case Preset::M: return "M (Performance model)";
+    default: return "Unknown";
+    }
+}
+
+std::string_view label(FrameGeneration mode)
+{
+    switch (mode)
+    {
+    case FrameGeneration::Off: return "Off";
+    case FrameGeneration::X2: return "2x";
+    case FrameGeneration::X3: return "3x";
+    case FrameGeneration::X4: return "4x";
+    case FrameGeneration::X5: return "5x";
+    case FrameGeneration::X6: return "6x";
+    case FrameGeneration::Dynamic: return "Dynamic (display refresh rate)";
     default: return "Unknown";
     }
 }
@@ -147,6 +164,12 @@ Settings loadSettings(const std::filesystem::path& path)
             int enabled{};
             if (number(value, enabled)) settings.indirectLighting = enabled != 0;
         }
+        else if (key == "frame_generation")
+        {
+            const auto found = std::find(std::begin(FrameGenerationKeys), std::end(FrameGenerationKeys), value);
+            if (found != std::end(FrameGenerationKeys))
+                settings.frameGeneration = static_cast<FrameGeneration>(found - std::begin(FrameGenerationKeys));
+        }
     }
     if (input.bad()) throw std::runtime_error("Cannot read upscaler settings.");
     return settings;
@@ -154,8 +177,9 @@ Settings loadSettings(const std::filesystem::path& path)
 
 void saveSettings(const std::filesystem::path& path, const Settings& settings)
 {
-    if (settings.quality >= Quality::Count || !validPreset(static_cast<int>(settings.preset)))
-        throw std::runtime_error("Cannot save an unknown upscaler mode.");
+    if (settings.quality >= Quality::Count || !validPreset(static_cast<int>(settings.preset))
+        || settings.frameGeneration >= FrameGeneration::Count)
+        throw std::runtime_error("Cannot save an unknown upscaler or frame generation mode.");
     if (!std::isfinite(settings.customScale) || settings.customScale < Settings::MinScale || settings.customScale > Settings::MaxScale
         || !std::isfinite(settings.mipBiasOffset) || settings.mipBiasOffset < Settings::MinMipBias
         || settings.mipBiasOffset > Settings::MaxMipBias || !std::isfinite(settings.sharpness) || settings.sharpness < 0
@@ -172,7 +196,8 @@ void saveSettings(const std::filesystem::path& path, const Settings& settings)
             << "\npreset=" << static_cast<int>(settings.preset)
             << "\nmip_bias_offset=" << settings.mipBiasOffset
             << "\nsharpness=" << settings.sharpness
-            << "\nindirect_lighting=" << (settings.indirectLighting ? 1 : 0) << '\n';
+            << "\nindirect_lighting=" << (settings.indirectLighting ? 1 : 0)
+            << "\nframe_generation=" << FrameGenerationKeys[static_cast<std::size_t>(settings.frameGeneration)] << '\n';
         output.close();
         if (!output) throw std::runtime_error("Cannot write upscaler settings.");
         // Keep the last complete file if writing or replacing it fails.

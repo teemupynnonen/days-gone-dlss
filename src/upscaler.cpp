@@ -95,11 +95,21 @@ struct GameShader
     std::array<std::uint8_t, 16> checksum; // DXBC header hash from GlobalShaderCache-PCD3D_SM5.bin.
 };
 
-// FViewInfo's size and the fields read here.
+// FViewInfo's size and the fields read here. `projection` is FViewMatrices::ProjMatrix, which the
+// camera fields below follow.
 struct ViewLayout
 {
-    std::size_t size, rect, unscaledRect, temporalJitter, screenPercentage, cameraCut, antiAliasing, viewState;
+    std::size_t size, rect, unscaledRect, temporalJitter, screenPercentage, cameraCut, antiAliasing, viewState, projection;
 };
+
+// From ProjMatrix: TranslatedViewMatrix, TranslatedViewProjectionMatrix, ViewOrigin and the jitter
+// PreVisibilityFrameSetup adds to the projection (2 * jitter / view size). Each capture checks them by
+// rebuilding the translated view-projection.
+constexpr std::size_t TranslatedViewOffset = 0x80, TranslatedViewProjectionOffset = 0xC0, ViewOriginOffset = 0x160,
+    ProjectionJitterOffset = 0x174;
+// FSceneView starts with its FSceneViewFamily, whose FrameNumber is the GFrameNumber of the tick
+// that rendered it (both builds).
+constexpr std::size_t FamilyFrameNumberOffset = 0x48;
 
 // What differs between the supported executables. docs/DEVELOPMENT.md lists what each address is;
 // docs/DIFFERENCES.md lists how the builds differ.
@@ -113,6 +123,11 @@ struct GameBuild
     // FMemStackBase page allocation for RHI commands (the slow path of every AllocCommand).
     Address allocateCommandPage;
     std::span<const unsigned char> allocateCommandPagePrefix;
+    // FEngineLoop::Tick, the game thread's frame, and GFrameNumber, which BeginRenderingViewFamily
+    // increments once per rendered frame into the view family's FrameNumber.
+    Address engineTick;
+    std::span<const unsigned char> engineTickPrefix;
+    Address frameNumber;
     // TConsoleVariableData pointers for r.ScreenPercentage and r.TemporalAASamples: {game thread, render thread}.
     Address screenPercentageData, temporalSamplesData;
     ViewLayout view;
@@ -124,12 +139,16 @@ constexpr unsigned char AllocateCommandPagePrefix113[]{0x48, 0x89, 0x5C, 0x24, 0
     0x74, 0x24, 0x18, 0x48, 0x89, 0x7C, 0x24, 0x20, 0x41, 0x56, 0x48, 0x83};
 constexpr unsigned char PreVisibilityPrefix107[]{0x40, 0x55, 0x57, 0x41, 0x54, 0x41, 0x57, 0x48, 0x8D, 0xAC, 0x24, 0x38, 0xFF,
     0xFF, 0xFF, 0x48, 0x81, 0xEC, 0xC8, 0x01, 0x00, 0x00};
+constexpr unsigned char EngineTickPrefix113[]{0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x10, 0x48, 0x89, 0x70, 0x18, 0x48, 0x89, 0x78,
+    0x20, 0x55, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57};
+constexpr unsigned char EngineTickPrefix107[]{0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x10, 0x48, 0x89, 0x70, 0x18, 0x55, 0x57, 0x41,
+    0x54, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8D, 0x68, 0xA1, 0x48};
 constexpr unsigned char AllocateCommandPagePrefix107[]{0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x10, 0x48, 0x89,
     0x74, 0x24, 0x18, 0x57, 0x48, 0x83, 0xEC, 0x30, 0x8D, 0x9A, 0xFF, 0xFF};
 
 constexpr GameBuild Builds[]{
     {"1.13 (Steam build 19221447)", 113, 0x68754D46, 0x93F0000, 0x20E6920, PreVisibilityPrefix113, 0x19C0EA0,
-        AllocateCommandPagePrefix113, 0x4ADCA50, 0x4CD0620, {0x2D50, 0xB28, 0xB38, 0x10F0, 0x1744, 0x1755, 0x1760, 0x1CE0},
+        AllocateCommandPagePrefix113, 0x1BF7F0, EngineTickPrefix113, 0x4A60C44, 0x4ADCA50, 0x4CD0620, {0x2D50, 0xB28, 0xB38, 0x10F0, 0x1744, 0x1755, 0x1760, 0x1CE0, 0xB60},
         {{
             {0x4CA41C8, dxbcHash("6e855e67ebcbdd2ec77695de2f6121c5")},
             {0x4CA41E8, dxbcHash("8ebd31f25f6c9edfd50ae51903a9f2c7")},
@@ -143,7 +162,7 @@ constexpr GameBuild Builds[]{
         }}},
     // Steam beta days_gone_classic. Its shaders come from the _P patch pak's global shader cache.
     {"1.07 (Steam build 10034136)", 107, 0x60EDC8B2, 0x64B6000, 0x1E3B9F0, PreVisibilityPrefix107, 0x1771BB0,
-        AllocateCommandPagePrefix107, 0x428B180, 0x4480F10, {0x2270, 0x48, 0x58, 0x610, 0xC64, 0xC75, 0xC80, 0x1200},
+        AllocateCommandPagePrefix107, 0x1C5770, EngineTickPrefix107, 0x4217B88, 0x428B180, 0x4480F10, {0x2270, 0x48, 0x58, 0x610, 0xC64, 0xC75, 0xC80, 0x1200, 0x80},
         {{
             {0x4455ED8, dxbcHash("7833e521684c1b0a3090b22a5a7ad680")},
             {0x4455EF8, dxbcHash("8aea2a831cad8814f2b51e68ae438ca5")},
@@ -189,6 +208,9 @@ struct ViewCapture
     std::int32_t rect[4]{}, unscaled[4]{};
     float jitter[2]{};
     bool cameraCut{};
+    frame_generation::Camera camera;
+    bool cameraKnown{}; // The camera fields passed their check
+    std::uint32_t frame{}; // The view family's FrameNumber
 };
 
 struct Target
@@ -197,6 +219,15 @@ struct Target
     ComPtr<ID3D11ShaderResourceView> view;
     ComPtr<ID3D11UnorderedAccessView> access;
     UINT width{}, height{};
+};
+
+// The composite's colour before the UI, for frame generation: the back buffer's size and format.
+struct Hudless
+{
+    ComPtr<ID3D11Texture2D> texture;
+    ComPtr<ID3D11RenderTargetView> target;
+    ComPtr<ID3D11UnorderedAccessView> access;
+    D3D11_TEXTURE2D_DESC desc{};
 };
 
 struct Plan
@@ -248,6 +279,12 @@ using AllocateCommandPage = void* (*)(Address memory, std::int32_t size);
 PreVisibilityFrameSetup originalPreVisibility{};
 AllocateCommandPage allocateCommandPage{};
 void* preVisibilityAddress{};
+
+// ---- Engine hook (game thread) ----
+using EngineTick = void (*)(Address loop);
+EngineTick originalTick{};
+void* engineTickAddress{};
+const std::uint32_t* frameNumber{}; // GFrameNumber
 std::mutex viewMutex;
 // The latest view seen by the render thread, and the one the RHI executor reached in its command list.
 ViewCapture capturedView, executingView;
@@ -286,6 +323,9 @@ ComPtr<ID3D11ComputeShader> motionShader, prepareShader, compositeComputeShader;
 ComPtr<ID3D11PixelShader> compositePixelShader;
 ComPtr<ID3D11Buffer> prepareConstants, pixelConstants, computeConstants;
 Target motionTarget, depthTarget, biasTarget, colorTarget, outputTarget;
+// Frame generation reads depth, motion and the hudless colour through Direct3D 12, so they are shared.
+bool frameGeneration{};
+Hudless hudless;
 // Identified game shaders: read lock-free on every call, written under the mutex from the render
 // thread or whichever thread the game creates shaders on.
 // The game can create a shader more than once with the same bytecode, so each slot keeps every
@@ -334,6 +374,11 @@ struct Frame
     std::int32_t outputOrigin[2]{};
     float renderScale[2]{1, 1};
     float sharpness{};
+    // For frame generation: the evaluation's render size, jitter and history reset, and whether a
+    // composite wrote the hudless colour.
+    UINT renderSize[2]{};
+    float jitter[2]{};
+    bool reset{}, hudless{};
 } frame;
 // Whether the game's last composite was the HDR variant; the upscaling TAA does not say.
 bool hdrOutput{};
@@ -435,6 +480,29 @@ void enqueueView(Address list, const ViewCapture& view)
     link = &command->next;
 }
 
+// The view's camera for frame generation, trusted only when its matrices rebuild the translated
+// view-projection the engine computed from them.
+bool readCamera(Address view, frame_generation::Camera& camera)
+{
+    const auto matrices = view + build->view.projection;
+    float expected[16]{};
+    std::memcpy(camera.projection, reinterpret_cast<const void*>(matrices), sizeof(camera.projection));
+    std::memcpy(camera.translatedView, reinterpret_cast<const void*>(matrices + TranslatedViewOffset), sizeof(camera.translatedView));
+    std::memcpy(expected, reinterpret_cast<const void*>(matrices + TranslatedViewProjectionOffset), sizeof(expected));
+    std::memcpy(camera.origin, reinterpret_cast<const void*>(matrices + ViewOriginOffset), sizeof(camera.origin));
+    std::memcpy(camera.projectionJitter, reinterpret_cast<const void*>(matrices + ProjectionJitterOffset), sizeof(camera.projectionJitter));
+    for (int row = 0; row < 4; ++row)
+        for (int column = 0; column < 4; ++column)
+        {
+            float product = 0;
+            for (int k = 0; k < 4; ++k) product += camera.translatedView[row * 4 + k] * camera.projection[k * 4 + column];
+            const auto wanted = expected[row * 4 + column];
+            if (!std::isfinite(product) || std::abs(product - wanted) > 1e-3f * std::max(1.0f, std::abs(wanted))) return false;
+        }
+    return std::isfinite(camera.origin[0]) && std::isfinite(camera.origin[1]) && std::isfinite(camera.origin[2])
+        && std::isfinite(camera.projectionJitter[0]) && std::isfinite(camera.projectionJitter[1]);
+}
+
 void preVisibility(Address renderer, Address commandList)
 {
     const auto views = *reinterpret_cast<const Address*>(renderer + RendererViews);
@@ -469,6 +537,9 @@ void preVisibility(Address renderer, Address commandList)
         std::memcpy(capture.unscaled, reinterpret_cast<const void*>(view + layout.unscaledRect), sizeof(capture.unscaled));
         std::memcpy(capture.jitter, reinterpret_cast<const void*>(view + layout.temporalJitter), sizeof(capture.jitter));
         capture.cameraCut = *reinterpret_cast<const std::uint8_t*>(view + layout.cameraCut) != 0;
+        capture.cameraKnown = readCamera(view, capture.camera);
+        capture.frame = *reinterpret_cast<const std::uint32_t*>(*reinterpret_cast<const Address*>(view) + FamilyFrameNumberOffset);
+        frame_generation::beginRender(capture.frame);
         capture.thread = GetCurrentThreadId();
         {
             std::lock_guard lock(viewMutex);
@@ -484,6 +555,16 @@ void preVisibility(Address renderer, Address commandList)
         }
         if (fullJitter) enqueueView(commandList, capture);
     }
+}
+
+// The game thread's frame, for Reflex: it sleeps before the frame starts, so input is read as late
+// as the GPU allows. BeginRenderingViewFamily increments GFrameNumber once during the tick.
+void engineTick(Address loop)
+{
+    const auto number = *frameNumber + 1;
+    frame_generation::beginSimulation(number);
+    originalTick(loop);
+    frame_generation::endSimulation(number);
 }
 
 ViewCapture latestView()
@@ -691,7 +772,7 @@ void createPipeline()
         "Creating the DLSS device context state");
 }
 
-void ensureTarget(Target& target, UINT width, UINT height, DXGI_FORMAT format, const char* name)
+void ensureTarget(Target& target, UINT width, UINT height, DXGI_FORMAT format, const char* name, bool shared = false)
 {
     if (target.texture && target.width == width && target.height == height) return;
     target = {};
@@ -704,11 +785,44 @@ void ensureTarget(Target& target, UINT width, UINT height, DXGI_FORMAT format, c
     description.SampleDesc.Count = 1;
     description.Usage = D3D11_USAGE_DEFAULT;
     description.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+    if (shared) description.MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
     check(device->CreateTexture2D(&description, nullptr, target.texture.GetAddressOf()), name);
     check(device->CreateShaderResourceView(target.texture.Get(), nullptr, target.view.GetAddressOf()), name);
     check(device->CreateUnorderedAccessView(target.texture.Get(), nullptr, target.access.GetAddressOf()), name);
     target.width = width;
     target.height = height;
+}
+
+// Matches the hudless texture to the composite's output, the back buffer. False when that is not a
+// plain 2D texture the hudless copy can follow.
+bool ensureHudless(ID3D11View* output)
+{
+    ComPtr<ID3D11Resource> resource;
+    output->GetResource(resource.GetAddressOf());
+    ComPtr<ID3D11Texture2D> texture;
+    if (FAILED(resource.As(&texture))) return false;
+    D3D11_TEXTURE2D_DESC wanted{};
+    texture->GetDesc(&wanted);
+    if (wanted.ArraySize != 1 || wanted.SampleDesc.Count != 1) return false;
+    if (hudless.texture && hudless.desc.Width == wanted.Width && hudless.desc.Height == wanted.Height && hudless.desc.Format == wanted.Format)
+        return true;
+
+    hudless = {};
+    D3D11_TEXTURE2D_DESC description{};
+    description.Width = wanted.Width;
+    description.Height = wanted.Height;
+    description.MipLevels = 1;
+    description.ArraySize = 1;
+    description.Format = wanted.Format;
+    description.SampleDesc.Count = 1;
+    description.Usage = D3D11_USAGE_DEFAULT;
+    description.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS;
+    description.MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+    check(device->CreateTexture2D(&description, nullptr, hudless.texture.GetAddressOf()), "Creating the hudless texture");
+    check(device->CreateRenderTargetView(hudless.texture.Get(), nullptr, hudless.target.GetAddressOf()), "Creating the hudless texture");
+    check(device->CreateUnorderedAccessView(hudless.texture.Get(), nullptr, hudless.access.GetAddressOf()), "Creating the hudless texture");
+    hudless.desc = description;
+    return true;
 }
 
 // ---- NGX ----
@@ -949,8 +1063,10 @@ void computeMotion(ID3D11DeviceContext* context, UINT groupsX, UINT groupsY)
     logOnce("inputs-motion", "Motion inputs: pixel flags " + describe(pixels.Get()) + "; depth " + describe(depth.Get())
         + "; velocity " + describe(velocity.Get()) + ".");
 
-    ensureTarget(motionTarget, plan->renderWidth, plan->renderHeight, DXGI_FORMAT_R16G16_FLOAT, "Creating the DLSS motion texture");
-    ensureTarget(depthTarget, plan->renderWidth, plan->renderHeight, DXGI_FORMAT_R32_FLOAT, "Creating the DLSS depth texture");
+    ensureTarget(motionTarget, plan->renderWidth, plan->renderHeight, DXGI_FORMAT_R16G16_FLOAT, "Creating the DLSS motion texture",
+        frameGeneration);
+    ensureTarget(depthTarget, plan->renderWidth, plan->renderHeight, DXGI_FORMAT_R32_FLOAT, "Creating the DLSS depth texture",
+        frameGeneration);
     ensureTarget(biasTarget, plan->renderWidth, plan->renderHeight, DXGI_FORMAT_R8_UNORM, "Creating the DLSS colour bias texture");
     inOwnState(context, [&]
     {
@@ -1077,14 +1193,18 @@ bool replaceTemporal(ID3D11DeviceContext* context, std::size_t slot, UINT groups
             ID3D11Buffer* buffers[]{temporal.Get(), computeConstants.Get()};
             ID3D11ShaderResourceView* inputs[]{overlay.Get(), outputTarget.view.Get(), nullptr,
                 motionTarget.view.Get(), depthTarget.view.Get(), colorTarget.view.Get(), biasTarget.view.Get()};
-            ID3D11UnorderedAccessView* outputs[]{gameOutput.Get()};
+            frame.hudless = frameGeneration && ensureHudless(gameOutput.Get());
+            ID3D11UnorderedAccessView* outputs[]{gameOutput.Get(), frame.hudless ? hudless.access.Get() : nullptr};
             context->CSSetShader(compositeComputeShader.Get(), nullptr, 0);
             context->CSSetConstantBuffers(0, 2, buffers);
             context->CSSetShaderResources(0, static_cast<UINT>(std::size(inputs)), inputs);
-            context->CSSetUnorderedAccessViews(0, 1, outputs, nullptr);
+            context->CSSetUnorderedAccessViews(0, static_cast<UINT>(std::size(outputs)), outputs, nullptr);
             context->Dispatch((outputWidth + 7) / 8, (outputHeight + 7) / 8, 1);
         }
         ngx.reset = false;
+        frame.reset = reset;
+        frame.jitter[0] = evaluation.InJitterOffsetX;
+        frame.jitter[1] = evaluation.InJitterOffsetY;
     });
 
     lastEvaluated = frame.index;
@@ -1099,6 +1219,8 @@ bool replaceTemporal(ID3D11DeviceContext* context, std::size_t slot, UINT groups
     frame.renderScale[0] = static_cast<float>(renderWidth) / static_cast<float>(outputWidth);
     frame.renderScale[1] = static_cast<float>(renderHeight) / static_cast<float>(outputHeight);
     frame.sharpness = wanted.sharpness;
+    frame.renderSize[0] = renderWidth;
+    frame.renderSize[1] = renderHeight;
     return true;
 }
 
@@ -1127,7 +1249,21 @@ template<class Call> void composite(ID3D11DeviceContext* context, Call&& call)
     context->PSSetShaderResources(1, static_cast<UINT>(std::size(ours)), ours);
     context->PSSetConstantBuffers(1, 1, &buffer);
     context->PSSetShader(compositePixelShader.Get(), nullptr, 0);
+    // Frame generation's hudless colour is the shader's second output.
+    std::array<ID3D11RenderTargetView*, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT> gameTargets{};
+    ID3D11DepthStencilView* gameDepth{};
+    if (frameGeneration)
+    {
+        context->OMGetRenderTargets(static_cast<UINT>(gameTargets.size()), gameTargets.data(), &gameDepth);
+        frame.hudless = gameTargets[0] && !gameTargets[1] && ensureHudless(gameTargets[0]);
+        ID3D11RenderTargetView* targets[]{gameTargets[0], frame.hudless ? hudless.target.Get() : nullptr};
+        if (frame.hudless) context->OMSetRenderTargets(2, targets, gameDepth);
+    }
     call();
+    if (frame.hudless) context->OMSetRenderTargets(static_cast<UINT>(gameTargets.size()), gameTargets.data(), gameDepth);
+    for (auto* target : gameTargets)
+        if (target) target->Release();
+    if (gameDepth) gameDepth->Release();
     // Restore exactly what the engine's state cache believes is bound.
     context->PSSetShader(gamePixelShader, nullptr, 0);
     context->PSSetShaderResources(1, static_cast<UINT>(gameInputs.size()), gameInputs.data());
@@ -1227,6 +1363,7 @@ void releaseRenderer()
     frame = {};
     biasedSamplers.clear();
     motionTarget = depthTarget = biasTarget = colorTarget = outputTarget = {};
+    hudless = {};
     {
         std::lock_guard lock(shaderMutex);
         for (std::size_t slot = 0; slot < std::size(Shaders); ++slot)
@@ -1334,7 +1471,22 @@ const char* selectBuild(std::uintptr_t base) noexcept
     return build ? build->name : nullptr;
 }
 
-void initialize(const std::filesystem::path& directory)
+// Reflex's sleep and simulation markers belong to the game thread. Without this hook frame
+// generation marks the frame where it is presented, which costs latency but still works.
+static void hookEngineTick(Address base)
+{
+    if (std::memcmp(reinterpret_cast<const void*>(base + build->engineTick), build->engineTickPrefix.data(), build->engineTickPrefix.size()))
+        return log(std::string("FEngineLoop::Tick does not match ") + build->name + "; Reflex marks frames at present.");
+    frameNumber = reinterpret_cast<const std::uint32_t*>(base + build->frameNumber);
+    engineTickAddress = reinterpret_cast<void*>(base + build->engineTick);
+    auto status = MH_CreateHook(engineTickAddress, reinterpret_cast<void*>(&engineTick), reinterpret_cast<void**>(&originalTick));
+    if (status == MH_OK && (status = MH_EnableHook(engineTickAddress)) != MH_OK) MH_RemoveHook(engineTickAddress);
+    if (status == MH_OK) return log("Reflex sleeps and marks the simulation on the game thread.");
+    log(std::string("Hooking FEngineLoop::Tick: ") + MH_StatusToString(status) + "; Reflex marks frames at present.");
+    engineTickAddress = nullptr;
+}
+
+void initialize(const std::filesystem::path& directory, bool withFrameGeneration)
 {
     {
         std::lock_guard lock(logMutex);
@@ -1380,6 +1532,7 @@ void initialize(const std::filesystem::path& directory)
         MH_RemoveHook(preVisibilityAddress);
         throw std::runtime_error(std::string("Enabling the view hook: ") + MH_StatusToString(status));
     }
+    if (withFrameGeneration) hookEngineTick(base);
     releaseRequested = false;
     active = true;
     log("Upscaler ready: r.ScreenPercentage " + std::to_string(percentage) + ", r.TemporalAASamples "
@@ -1442,7 +1595,9 @@ void shutdown() noexcept
     if (hooked && !released) log("The render thread did not present; DLSS resources were not released.");
     if (preVisibilityAddress) MH_DisableHook(preVisibilityAddress);
     preVisibilityAddress = nullptr;
-    log("Upscaler engine hook removed.");
+    if (engineTickAddress) MH_DisableHook(engineTickAddress);
+    engineTickAddress = nullptr;
+    log("Upscaler engine hooks removed.");
 }
 
 bool wanted() noexcept
@@ -1451,11 +1606,12 @@ bool wanted() noexcept
     catch (...) { return false; }
 }
 
-void attach(ID3D11Device* gameDevice, ID3D11DeviceContext* context, ID3D11DeviceContext* wrapped) noexcept
+void attach(ID3D11Device* gameDevice, ID3D11DeviceContext* context, ID3D11DeviceContext* wrapped, bool shareInputs) noexcept
 {
     try
     {
         if (hooked) return;
+        frameGeneration = shareInputs;
         device = gameDevice;
         check(device.As(&device1), "Finding Direct3D 11.1");
         ComPtr<ID3D11DeviceContext> native(context);
@@ -1664,6 +1820,33 @@ static void reloadDiagnostics()
     log("Diagnostics: invert jitter X " + std::to_string(options.invertJitterX) + ", Y " + std::to_string(options.invertJitterY)
         + ", jittered motion " + std::to_string(options.jitteredMotion) + ", debug view " + std::to_string(options.debugView)
         + ", full-resolution AO " + std::to_string(options.fullResolutionAmbientOcclusion) + ".");
+}
+
+frame_generation::Inputs frameGenerationInputs() noexcept
+{
+    frame_generation::Inputs inputs;
+    // The view executed since the last present is the presented frame's; without one the frame
+    // drew no scene, or DLSS does not run.
+    static std::uint64_t reportedSequence{};
+    if (const auto view = currentView(); view.sequence != reportedSequence)
+    {
+        reportedSequence = view.sequence;
+        inputs.frame = view.frame;
+    }
+    if (!frameGeneration || !frame.motion || !frame.hudless || lastEvaluated != frame.index || !lastUsedView.cameraKnown) return inputs;
+
+    inputs.valid = true;
+    inputs.depth = depthTarget.texture.Get();
+    inputs.motion = motionTarget.texture.Get();
+    inputs.hudless = hudless.texture.Get();
+    inputs.renderWidth = frame.renderSize[0];
+    inputs.renderHeight = frame.renderSize[1];
+    inputs.jitter[0] = frame.jitter[0];
+    inputs.jitter[1] = frame.jitter[1];
+    inputs.jitteredMotion = currentDiagnostics().jitteredMotion;
+    inputs.reset = frame.reset;
+    inputs.camera = lastUsedView.camera;
+    return inputs;
 }
 
 void endFrame() noexcept

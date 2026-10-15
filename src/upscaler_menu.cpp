@@ -1,5 +1,6 @@
 // DLSS settings UI, drawn as a ReShade overlay window.
 #include "upscaler.hpp"
+#include "presenter.hpp"
 
 #include <imgui.h>
 #include <reshade.hpp> // Routes ImGui calls through ReShade's overlay.
@@ -113,9 +114,42 @@ bool drawSettings(Settings& wanted, const Status& state, float width)
             "foliage shimmer at lower DLSS render resolutions. Off renders as the game's lower settings do.");
     }
 
+    // Until Streamline reports what the GPU supports, every mode is offered.
+    const auto supported = frame_generation::capabilities();
+    ImGui::SetNextItemWidth(width);
+    if (ImGui::BeginCombo("Frame generation", std::string(label(wanted.frameGeneration)).c_str()))
+    {
+        for (int i = 0; i < static_cast<int>(FrameGeneration::Count); ++i)
+        {
+            const auto mode = static_cast<FrameGeneration>(i);
+            const bool unsupported = mode == FrameGeneration::Dynamic
+                ? supported.maxMultiplier && !supported.dynamic
+                : supported.maxMultiplier && static_cast<unsigned>(i) + 1 > supported.maxMultiplier;
+            if (ImGui::Selectable(std::string(label(mode)).c_str(), mode == wanted.frameGeneration,
+                unsupported ? ImGuiSelectableFlags_Disabled : 0))
+            {
+                wanted.frameGeneration = mode;
+                changed = true;
+            }
+        }
+        ImGui::EndCombo();
+    }
+    tooltip("NVIDIA DLSS Frame Generation: frames generated between those the game renders. 2x needs an RTX 40,\n"
+        "3x to 6x and Dynamic an RTX 50. Dynamic chooses the multiplier that reaches the display's refresh rate.\n"
+        "The game then presents through Direct3D 12, which is set up at startup, so turning it on takes a\n"
+        "restart; other changes apply at once.");
+    if (presenter::active()) statusLine(Grey, frame_generation::status());
+    else if (wanted.frameGeneration != FrameGeneration::Off)
+    {
+        const auto reason = presenter::status();
+        statusLine(Yellow, reason.empty() ? "Restart the game to start frame generation." : reason);
+    }
+
+    // Frame generation starts with the game, so a reset leaves it alone like the mode.
     Settings defaults;
     defaults.quality = wanted.quality;
     defaults.customScale = wanted.customScale;
+    defaults.frameGeneration = wanted.frameGeneration;
     ImGui::BeginDisabled(wanted == defaults);
     if (ImGui::Button("Reset to defaults"))
     {
@@ -123,7 +157,7 @@ bool drawSettings(Settings& wanted, const Status& state, float width)
         changed = true;
     }
     ImGui::EndDisabled();
-    tooltip("Resets everything except the DLSS mode.");
+    tooltip("Resets everything except the DLSS mode and frame generation.");
     ImGui::EndDisabled();
 
     return changed;
