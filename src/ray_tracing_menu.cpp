@@ -57,6 +57,15 @@ void drawMenu()
     if (ImGui::Checkbox("Ray-traced ambient occlusion", &features.ambientOcclusion)) enable(features);
     tooltip("Replaces the game's screen-space ambient occlusion with occlusion traced from the same geometry, filtered by\n"
         "the game's own blur and accumulation.");
+
+    ImGui::Indent();
+    ImGui::BeginDisabled(!features.ambientOcclusion);
+    if (ImGui::Checkbox("Half the rays", &features.halfAmbientRays)) enable(features);
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("Each pixel traces two of its four directions and takes the other two from its neighbour: about half the\n"
+            "cost, a little more noise. Needs the ray-traced ambient occlusion.");
+    ImGui::Unindent();
     if (ImGui::Checkbox("Ray-traced global illumination", &features.globalIllumination)) enable(features);
     tooltip("Adds sunlight bounced once off the same geometry to the game's lighting, accumulated over frames and filtered.");
 }
@@ -80,7 +89,8 @@ void drawDiagnostics(float width)
     if (!ImGui::TreeNode(summary.c_str())) return;
 
     ImGui::Text("G-buffer draws: %u, captured %u (%u alpha-tested)", state.basePassDraws, state.capturedDraws, state.maskedDraws);
-    ImGui::Text("Shadow casters captured from the sun shadow maps: %u", state.casterDraws);
+    ImGui::Text("Shadow casters captured from the sun shadow maps: %u; left to the view: %u, to the cache: %u", state.casterDraws,
+        state.casterDrawsInView, state.casterDrawsInCache);
     ImGui::Text("Cached static draws: %u, %u traced off view; foliage instances: %u", state.cachedDraws, state.tracedCachedDraws,
         state.foliageInstances);
     ImGui::Text("Alpha-tested materials baked: %u; draws without coverage: %u", state.bakedMaterials, state.unbakedDraws);

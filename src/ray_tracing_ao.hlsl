@@ -5,7 +5,7 @@
 // on the normal's side, so only those four are traced. Each gets one cosine-weighted ray from the
 // game's surface into the part of the hemisphere nearest its corner, and occluders within a radius
 // count more the nearer they are. The top bytes hold Bend's depth; Direct3D 11 fills them in.
-#define AmbientRootSignature "RootConstants(num32BitConstants=22, b0), SRV(t0), SRV(t2), SRV(t7), SRV(t8), SRV(t9), " \
+#define AmbientRootSignature "RootConstants(num32BitConstants=23, b0), SRV(t0), SRV(t2), SRV(t7), SRV(t8), SRV(t9), " \
     "DescriptorTable(SRV(t3, numDescriptors=4), UAV(u0))"
 
 cbuffer AmbientParameters : register(b0)
@@ -15,6 +15,7 @@ cbuffer AmbientParameters : register(b0)
     uint2 MaskedBase;     // Per instance: its first alpha-tested vertex in Coordinates
     uint MaterialDraws;   // Entries in Materials
     uint Frame;           // Varies the rays from frame to frame
+    uint HalfRays;        // Each pixel traces two corners and takes the other two from its neighbour
 };
 RaytracingAccelerationStructure Scene : register(t0);
 StructuredBuffer<uint2> Materials : register(t2); // Per alpha-tested draw: first vertex, coverage slot
@@ -109,52 +110,103 @@ float Visibility(float3 start, float3 direction, float radius, float copyDistanc
     return travelled * travelled;
 }
 
+// A corner's visibility in 6 bits, from one cosine-weighted ray into the part of the hemisphere
+// nearer that corner than the other three, drawn by rejection: each takes about a quarter of it. The
+// corner itself if none is drawn.
+uint CornerVisibility(float3 sides[4], uint pair, float3 normal, float3 start, float radius, float copyDistance, inout uint seed)
+{
+    float3 direction = normalize(sides[pair]);
+    for (uint attempt = 0; attempt < 16; ++attempt)
+    {
+        float3 candidate = CosineDirection(normal, Random(seed));
+        float nearness = dot(candidate, sides[pair]);
+        if (all(float4(dot(candidate, sides[0]), dot(candidate, sides[1]), dot(candidate, sides[2]), dot(candidate, sides[3])) <= nearness))
+        {
+            direction = candidate;
+            break;
+        }
+    }
+    return uint(Visibility(start, direction, radius, copyDistance) * 63 + 0.5);
+}
+
+// With HalfRays each pixel traces two of the four corners, the other two in a checkerboard that
+// changes every frame. It takes those two from its horizontal or else its vertical partner in the
+// group, the first that sees the same corners at about the same distance. Without one, its own two
+// stand in for them: tracing them instead would cost a group of threads all four rays wherever one
+// pixel needs them. A pixel shares its corners' visibilities (6 bits each), which corners are on its
+// normal's side (bits 24 to 27) and whether it has a surface (bit 28).
+groupshared uint SharedCorners[8][8];
+groupshared float SharedDistance[8][8];
+
 [RootSignature(AmbientRootSignature)]
 [numthreads(8, 8, 1)]
-void main(uint2 pixel : SV_DispatchThreadID)
+void main(uint2 pixel : SV_DispatchThreadID, uint2 local : SV_GroupThreadID)
 {
-    if (any(pixel >= Size)) return;
-    float depth = GameDepth[pixel];
-    uint packedNormal = Normals[pixel];
-    if (depth <= 0 || !packedNormal)
-    {
-        Output[pixel] = 0;
-        return;
-    }
-
-    float2 screen = (pixel + 0.5) / Size * float2(2, -2) + float2(-1, 1);
-    float3 eye = Unproject(screen, 1), surface = Unproject(screen, depth), normal = DecodeNormal(packedNormal);
-    float viewDistance = length(surface - eye);
-    // Float precision falls with distance, so the start moves further off the surface. Moving toward
-    // the eye as well keeps it in front of the surface where the G-buffer's normal tilts into it.
-    float bias = 0.5 + viewDistance * 1e-3;
-    float3 start = surface + (normal + (eye - surface) / viewDistance) * bias;
-    float radius = Radius + RadiusPerDistance * viewDistance, copyDistance = CopyDistance + CopyDistancePerDistance * viewDistance;
-
-    float3 sides[4];
-    for (uint pair = 0; pair < 4; ++pair) sides[pair] = dot(normal, Corners[pair]) > 0 ? Corners[pair] : -Corners[pair];
-
-    uint2 packed = 0;
-    uint seed = Hash(pixel.x + Hash(pixel.y + Hash(Frame)));
+    // Every thread reaches the barrier below, so none returns before it.
+    bool inside = all(pixel < Size);
+    float depth = inside ? GameDepth[pixel] : 0;
+    uint packedNormal = inside ? Normals[pixel] : 0;
+    bool surface = depth > 0 && packedNormal;
+    float3 normal = DecodeNormal(packedNormal), sides[4];
+    uint sideBits = 0;
     for (uint pair = 0; pair < 4; ++pair)
     {
-        // A cosine-weighted direction nearer this corner than the other three, drawn by rejection: each
-        // takes about a quarter of the hemisphere. The corner itself if none is drawn.
-        float3 direction = normalize(sides[pair]);
-        for (uint attempt = 0; attempt < 16; ++attempt)
+        sides[pair] = dot(normal, Corners[pair]) > 0 ? Corners[pair] : -Corners[pair];
+        if (all(sides[pair] == Corners[pair])) sideBits |= 1u << pair;
+    }
+
+    uint corners[4] = { 0, 0, 0, 0 };
+    uint traced = !HalfRays ? 15 : (pixel.x ^ pixel.y ^ Frame) & 1 ? 12 : 3;
+    float viewDistance = 0, radius = 0, copyDistance = 0;
+    float3 start = 0;
+    uint seed = Hash(pixel.x + Hash(pixel.y + Hash(Frame)));
+    if (surface)
+    {
+        float2 screen = (pixel + 0.5) / Size * float2(2, -2) + float2(-1, 1);
+        float3 eye = Unproject(screen, 1), position = Unproject(screen, depth);
+        viewDistance = length(position - eye);
+        // Float precision falls with distance, so the start moves further off the surface. Moving toward
+        // the eye as well keeps it in front of the surface where the G-buffer's normal tilts into it.
+        float bias = 0.5 + viewDistance * 1e-3;
+        start = position + (normal + (eye - position) / viewDistance) * bias;
+        radius = Radius + RadiusPerDistance * viewDistance;
+        copyDistance = CopyDistance + CopyDistancePerDistance * viewDistance;
+        for (uint pair = 0; pair < 4; ++pair)
+            if (traced >> pair & 1) corners[pair] = CornerVisibility(sides, pair, normal, start, radius, copyDistance, seed);
+    }
+    if (HalfRays)
+    {
+        uint own = surface ? 1u << 28 | sideBits << 24 : 0;
+        for (uint pair = 0; pair < 4; ++pair) own |= corners[pair] << (pair * 6);
+        SharedCorners[local.y][local.x] = own;
+        SharedDistance[local.y][local.x] = viewDistance;
+        GroupMemoryBarrierWithGroupSync();
+
+        uint ownSum = 0;
+        for (uint pair = 0; pair < 4; ++pair) ownSum += corners[pair];
+        uint source = (ownSum + 1) / 2 * 0x41041; // The own two's mean in every corner
+        for (uint side = 0; side < 2; ++side)
         {
-            float3 candidate = CosineDirection(normal, Random(seed));
-            float nearness = dot(candidate, sides[pair]);
-            if (all(float4(dot(candidate, sides[0]), dot(candidate, sides[1]), dot(candidate, sides[2]), dot(candidate, sides[3])) <= nearness))
+            uint2 at = side ? uint2(local.x, local.y ^ 1) : uint2(local.x ^ 1, local.y);
+            uint partner = SharedCorners[at.y][at.x];
+            if ((partner >> 28 & 1) && (partner >> 24 & 15) == sideBits && abs(SharedDistance[at.y][at.x] - viewDistance) <= 0.02 * viewDistance)
             {
-                direction = candidate;
+                source = partner;
                 break;
             }
         }
-        uint value = uint(Visibility(start, direction, radius, copyDistance) * 63 + 0.5);
-        uint slot = pair * 2 + (all(sides[pair] == Corners[pair]) ? 0 : 1);
-        if (slot < 4) packed.x |= value << (slot * 6);
-        else packed.y |= value << (slot * 6 - 24);
+        for (uint pair = 0; pair < 4; ++pair)
+            if (!(traced >> pair & 1)) corners[pair] = source >> (pair * 6) & 63;
     }
+    if (!inside) return;
+
+    uint2 packed = 0;
+    if (surface)
+        for (uint pair = 0; pair < 4; ++pair)
+        {
+            uint slot = pair * 2 + (sideBits >> pair & 1 ? 0 : 1);
+            if (slot < 4) packed.x |= corners[pair] << (slot * 6);
+            else packed.y |= corners[pair] << (slot * 6 - 24);
+        }
     Output[pixel] = uint4(packed, 0, 0);
 }

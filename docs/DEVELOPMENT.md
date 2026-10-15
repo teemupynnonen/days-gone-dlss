@@ -189,6 +189,7 @@ the corner for two seconds; the work goes on underneath, so switching back is in
 | `ray_tracing_replace_canopy_shadows` | 0 | With them, leave out the game's soft shadow under tree canopies |
 | `ray_tracing_offscreen_geometry` | 1 | Also trace cached static draws and copies of the trees, so their shadows stay off screen |
 | `ray_tracing_ambient_occlusion` | 0 | Traced ambient occlusion in place of the game's |
+| `ray_tracing_half_ambient_rays` | 0 | With it, each pixel traces two of its four rays and takes the other two from a neighbour |
 | `ray_tracing_global_illumination` | 0 | One bounce of sunlight added to the game's lighting |
 | `ray_tracing_view` | 0 | A debug view drawn over the image (below) |
 
@@ -251,7 +252,13 @@ the corner for two seconds; the work goes on underneath, so switching back is in
   caster's atlas position and depth give its world position. Those rows are copied on the GPU at
   the resolve, after the shadow passes and before the trace. The casters get their own
   bottom-level structure (instance mask 2): primary rays see only the view's geometry (mask 1),
-  sun rays both.
+  sun rays both. A caster of a static object the view drew this frame is skipped as well: the
+  view's capture holds the object whole, at its own level of detail. So is one the geometry cache
+  holds whole (below). Moving objects cannot be told apart in the shadow maps: their own constants
+  are dynamic, so every one of them gets the same object key from the buffers they share. Their
+  casters are always captured, since another one may be off screen. At the bridge near the start
+  nearly all casters are the player's (about 290,000 vertices, 0.4 ms of build), so the skipped
+  ones save little there.
 - **Cached static geometry.** Casters stop at the shadow distance and leave out what the game
   culls by occlusion, so static draws the view has captured are also kept in a geometry cache,
   each with its own bottom-level structure (`PREFER_FAST_TRACE`) in rings of vertices,
@@ -259,8 +266,10 @@ the corner for two seconds; the work goes on underneath, so switching back is in
   buffers its vertex shader declares (the primitive's own; per-draw constants are dynamic) and its
   instances; draws with a velocity target move and are never cached. Cached draws the view did not
   draw this frame are traced with mask 2. A static draw the cache already holds is not captured
-  again: its entry stands in for it, traced with masks 1 and 2, and the rebuild leaves it out. New
-  entries never evict one standing in that frame; the ring moves past it. The trace reads a
+  again: its entry stands in for it, traced with masks 1 and 2, and the rebuild leaves it out. The
+  cache also stands in for the shadow casters of an object it holds whole: every draw the view last
+  drew of it is cached and none has been evicted since. New entries never evict one standing in
+  that frame, for the view or for casters; the ring moves past it. The trace reads a
   cached hit's vertices from the cache, from the instance's ID on, for its normal. The geometry
   was captured in translated world, so its instance moves by the camera's movement since: the
   view hook reads `PreViewTranslation` (`FViewInfo` + 0xCB4) and checks it against `ViewOrigin`
@@ -271,7 +280,10 @@ the corner for two seconds; the work goes on underneath, so switching back is in
   into the shadow maps (they shadow through the soft canopy map below). The lists are copied and
   read back over four frames: a tree keeps every mesh it was drawn with in the latest frame that
   saw it (trunk, branches and leaves are separate draws, at the LOD of that frame). Each mesh's
-  first instance is cached once as its template, in a cache of its own. Trees within 80 m or seen
+  first instance is cached once as its template, in a cache of its own. A mesh is its draw's
+  shaders, buffers and index range and, when alpha-tested, the textures its alpha test declares:
+  Bend draws the same vertices with many plants' textures (one with 35), and without them one
+  plant's copies stood in for all (pines in place of every other tree). Trees within 80 m or seen
   in the last read-backs are placed as instances of their meshes' templates (mask 4), by
   M_tree·M_reference⁻¹ and the camera's movement. Sun rays test them from 30 cm plus 0.2% of the
   distance on, so a copy never shadows its own tree's leaves. Once a mesh's copy is ready, the
@@ -286,7 +298,9 @@ the corner for two seconds; the work goes on underneath, so switching back is in
   view's and the casters' bottom-level structures and the top-level one (`PREFER_FAST_BUILD`),
   builds the cache's new entries, and traces with inline ray queries
   (`src/ray_tracing_trace.hlsl`, `cs_6_5`). Rays follow the inverse of the jittered matrix, so
-  hits land on the rasterised pixels. Direct3D 11 waits on the GPU for the result.
+  hits land on the rasterised pixels. Direct3D 11 waits on the GPU for the result. Building the
+  view's structure earlier, at the first shadow map draw on a list of its own, saved nothing
+  (0.03 to 0.09 ms more at the bridge): the GPU runs the two devices' work in turn, not side by side.
 - **Sun shadows.** Twelve `FBendSceneDirectionalShadow...ScreenSpaceResolvePS` variants, known by
   checksum, resolve the sun's shadow into an `R8G8_UNORM` target before lighting. Its red channel
   holds the square root of the sun's visibility; lighting squares it and skips the sun at 0. Row
@@ -309,7 +323,12 @@ the corner for two seconds; the work goes on underneath, so switching back is in
   counting only from 30 cm no longer darken the ground, so the view keeps capturing every foliage
   mesh drawn for a tree within 20 m. AO used to make the view capture every static and foliage
   draw: near the bridge (1920×1080, DLSS Balanced) that rebuilt 2.9 instead of 0.4 million
-  triangles and cost 4.9 ms over sun shadows alone, against 0.6 to 1.1 ms now. The result is
+  triangles and cost 4.9 ms over sun shadows alone, against 0.6 to 1.1 ms now. With half the rays,
+  each pixel traces two corners, in a checkerboard that changes every frame, and takes the other
+  two from its horizontal or else vertical neighbour if that sees the same corners within 2% of its
+  distance; otherwise the mean of its own two stands in. Tracing them instead would cost a whole
+  wave of threads all four rays wherever one pixel needs them, which made it slower than full rays.
+  The rays then take 0.47 instead of 0.73 ms at the bridge. The result is
   written in the game's packing; the add-on runs the game's own `BlurAmbientCS` on it and copies
   it over the game's target when lighting first reads it, so the lighting's temporal accumulation
   filters it in place of the screen-space result. The lighting only scales its ambient terms by

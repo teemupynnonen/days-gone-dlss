@@ -463,6 +463,14 @@ RWTexture2D<uint2> Ambient : register(u0);
     expect(open > 0.95, "Open floor stays unoccluded.");
     // At the crease the wall fills half the floor's sky.
     expect(crease < 0.65, "The floor is occluded where it meets the wall.");
+
+    // With half the rays, each pixel takes two of its corners from its neighbour.
+    ray_tracing::Features halfRays{};
+    halfRays.ambientOcclusion = halfRays.halfAmbientRays = true;
+    ray_tracing::enable(halfRays);
+    frame(creaseScene);
+    const auto [halfCrease, halfOpen] = floorVisibility();
+    expect(halfOpen > 0.95 && halfCrease < 0.65, "With half the rays, open floor stays unoccluded and the crease occluded.");
     ray_tracing::enable({});
     frame(creaseScene); // Releases the resources; the game's own occlusion is left alone.
     const auto [gameCrease, gameOpen] = floorVisibility();

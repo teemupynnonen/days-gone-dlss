@@ -1703,6 +1703,11 @@ static void reloadDiagnostics()
             features.ambientOcclusion = value != 0;
             featuresRead = true;
         }
+        else if (key == "ray_tracing_half_ambient_rays")
+        {
+            features.halfAmbientRays = value != 0;
+            featuresRead = true;
+        }
         else if (key == "ray_tracing_replace_canopy_shadows")
         {
             features.replaceCanopyShadows = value != 0;

@@ -170,9 +170,9 @@ constexpr UINT ViewMask = 1, CasterMask = 2, FoliageMask = 4;
 struct AmbientConstants
 {
     float worldFromClip[16];
-    std::uint32_t size[2], maskedBase[2], materialDraws, frame;
+    std::uint32_t size[2], maskedBase[2], materialDraws, frame, halfRays;
 };
-static_assert(sizeof(AmbientConstants) == 22 * 4, "AmbientRootSignature takes 22 root constants");
+static_assert(sizeof(AmbientConstants) == 23 * 4, "AmbientRootSignature takes 23 root constants");
 struct BounceConstants
 {
     float worldFromClip[16], clipFromWorld[16];
@@ -194,8 +194,9 @@ constexpr std::pair<UINT, UINT> LightingRows[]{{2, 33}, {2, 43}, {2, 140}, {1, 5
 // shadow maps, so trees behind the camera would stop shadowing what is in front of it. Each cached
 // draw gets its own bottom-level structure, built once. A frame traces the cached draws of the
 // objects it did not draw itself, and stands the cache in for the static draws it holds: the view
-// skips capturing those, and they are traced as its own geometry. Positions are in the translated
-// world of the frame that drew them: their instances move them by the camera's movement since.
+// skips capturing those, and they are traced as its own geometry. It stands in for the shadow casters
+// of the objects it holds whole too. Positions are in the translated world of the frame that drew
+// them: their instances move them by the camera's movement since.
 class GeometryCache
 {
 public:
@@ -209,8 +210,10 @@ public:
     GeometryCache(ID3D12Device5* device, UINT vertexCapacity, UINT64 structureBytes);
     // Adds the draws not cached yet, within the frame's budget, and picks the entries to trace: the
     // stand-ins as the view's geometry, and those whose object the view did not draw, or all of them, as
-    // shadow casters. `preViewTranslation` places this frame.
-    void plan(const std::vector<Draw>& draws, UINT maskedStart, bool all, const float (&preViewTranslation)[3]);
+    // shadow casters. The entries of `casting`, objects whose shadow casters were left to the cache,
+    // stay this frame. `preViewTranslation` places this frame.
+    void plan(const std::vector<Draw>& draws, UINT maskedStart, bool all, const std::unordered_set<std::uint64_t>& casting,
+        const float (&preViewTranslation)[3]);
     // Copies the added draws' vertices from the frame's vertex buffer and their coordinates from the
     // shared texture, then builds their structures.
     void record(ID3D12GraphicsCommandList4* list, ID3D12Resource* vertices, ID3D12Resource* coordinates);
@@ -221,6 +224,8 @@ public:
     ID3D12Resource* vertexResource() const { return vertexBuffer.Get(); }
     UINT capacity() const { return vertexCapacity; }
     bool contains(std::uint64_t key) const { return byKey.contains(key); }
+    // Whether every draw of the object the view last drew is cached, and none has been evicted since.
+    bool holdsWhole(std::uint64_t object) const { return wholeObjects.contains(object); }
     D3D12_GPU_VIRTUAL_ADDRESS coordinates() const { return coordinateBuffer->GetGPUVirtualAddress(); }
     std::optional<Template> find(std::uint64_t key) const;
     void clear();
@@ -246,7 +251,9 @@ private:
     struct Build { std::list<Entry>::iterator entry; UINT sourceVertex, sourceCoordinate; UINT64 scratchOffset; };
 
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS inputs(const Entry& entry, D3D12_RAYTRACING_GEOMETRY_DESC& geometry) const;
-    std::optional<UINT64> allocate(Ring ring, UINT64 size, const std::unordered_set<std::uint64_t>& inUse);
+    std::optional<UINT64> allocate(Ring ring, UINT64 size, const std::unordered_set<std::uint64_t>& standIns,
+        const std::unordered_set<std::uint64_t>& casting);
+    void evict(std::list<Entry>::iterator entry);
 
     ID3D12Device5* device;
     UINT vertexCapacity;
@@ -254,6 +261,7 @@ private:
     ComPtr<ID3D12Resource> vertexBuffer, coordinateBuffer, structures, scratch, staging;
     std::list<Entry> entries; // Oldest first
     std::unordered_map<std::uint64_t, std::list<Entry>::iterator> byKey;
+    std::unordered_set<std::uint64_t> wholeObjects;
     UINT64 heads[3]{};
     std::vector<Build> builds;
     std::vector<std::pair<const Entry*, UINT>> tracedEntries; // With their instance masks
@@ -262,7 +270,8 @@ private:
 
 
 std::atomic<View> selected{View::Off};
-std::atomic<bool> sunShadows{}, ambientOcclusion{}, replaceCanopyShadows{}, offscreenGeometry{true}, globalIllumination{}, bypassed{}, failed{};
+std::atomic<bool> sunShadows{}, ambientOcclusion{}, halfAmbientRays{}, replaceCanopyShadows{}, offscreenGeometry{true}, globalIllumination{}, bypassed{},
+    failed{};
 std::atomic<std::uint64_t> toggledAt{};
 std::mutex statusMutex;
 Status published;
@@ -288,6 +297,10 @@ struct Capture
     // map) and viewport depth range.
     struct CasterRun { UINT opaqueStart, maskedStart, map; float minDepth, maxDepth; };
     std::vector<CasterRun> casterRuns;
+    // The objects the view drew, captured or left to the cache; their shadow casters are not captured,
+    // nor those of the objects the cache holds whole (`casting`).
+    std::unordered_set<std::uint64_t> viewObjects, casting;
+    unsigned casterDrawsInView{}, casterDrawsInCache{};
     // Per alpha-tested draw: its first vertex in the alpha-tested range and its coverage slot.
     std::vector<std::array<std::uint32_t, 2>> materialDraws;
     LONGLONG captureTicks{};
@@ -528,6 +541,7 @@ Features activeFeatures()
     {
         result.sunShadows = sunShadows;
         result.ambientOcclusion = ambientOcclusion;
+        result.halfAmbientRays = halfAmbientRays;
         result.replaceCanopyShadows = replaceCanopyShadows;
         result.globalIllumination = globalIllumination;
     }
@@ -1306,10 +1320,17 @@ D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS GeometryCache::inputs(const
     return result;
 }
 
-// Allocates from one ring and evicts the entries the range overwrites.
-// Takes the next room in a ring, evicting what was there. Entries standing in for the view this
-// frame are kept: the allocation moves past them. Empty when it cannot.
-std::optional<UINT64> GeometryCache::allocate(Ring ring, UINT64 size, const std::unordered_set<std::uint64_t>& inUse)
+void GeometryCache::evict(std::list<Entry>::iterator entry)
+{
+    byKey.erase(entry->key);
+    wholeObjects.erase(entry->object);
+    entries.erase(entry);
+}
+
+// Takes the next room in a ring, evicting what was there. Entries standing in for the view or for
+// shadow casters this frame are kept: the allocation moves past them. Empty when it cannot.
+std::optional<UINT64> GeometryCache::allocate(Ring ring, UINT64 size, const std::unordered_set<std::uint64_t>& standIns,
+    const std::unordered_set<std::uint64_t>& casting)
 {
     const UINT64 capacity = ring == Ring::Structures ? structureBytes : vertexCapacity;
     auto& head = heads[static_cast<int>(ring)];
@@ -1328,7 +1349,10 @@ std::optional<UINT64> GeometryCache::allocate(Ring ring, UINT64 size, const std:
             const auto [offset, extent] = extentOf(entry);
             return extent && offset < begin + size && begin < offset + extent;
         };
-        const auto kept = std::find_if(entries.begin(), entries.end(), [&](const Entry& entry) { return inUse.contains(entry.key) && overlaps(entry); });
+        const auto kept = std::find_if(entries.begin(), entries.end(), [&](const Entry& entry)
+        {
+            return (standIns.contains(entry.key) || casting.contains(entry.object)) && overlaps(entry);
+        });
         if (kept != entries.end())
         {
             const auto [offset, extent] = extentOf(*kept);
@@ -1338,12 +1362,9 @@ std::optional<UINT64> GeometryCache::allocate(Ring ring, UINT64 size, const std:
 
         for (auto entry = entries.begin(); entry != entries.end();)
         {
-            if (overlaps(*entry))
-            {
-                byKey.erase(entry->key);
-                entry = entries.erase(entry);
-            }
-            else ++entry;
+            const auto next = std::next(entry);
+            if (overlaps(*entry)) evict(entry);
+            entry = next;
         }
         head += size;
         return begin;
@@ -1352,7 +1373,8 @@ std::optional<UINT64> GeometryCache::allocate(Ring ring, UINT64 size, const std:
 }
 
 // A frame adds at most an eighth of each ring, so its own additions never overwrite each other.
-void GeometryCache::plan(const std::vector<Draw>& draws, UINT maskedStart, bool all, const float (&preViewTranslation)[3])
+void GeometryCache::plan(const std::vector<Draw>& draws, UINT maskedStart, bool all, const std::unordered_set<std::uint64_t>& casting,
+    const float (&preViewTranslation)[3])
 {
     builds.clear();
     tracedEntries.clear();
@@ -1384,14 +1406,13 @@ void GeometryCache::plan(const std::vector<Draw>& draws, UINT maskedStart, bool 
 
         if (entries.size() == MaxCachedDraws)
         {
-            if (standIns.contains(entries.front().key)) break;
+            if (standIns.contains(entries.front().key) || casting.contains(entries.front().object)) break;
 
-            byKey.erase(entries.front().key);
-            entries.pop_front();
+            evict(entries.begin());
         }
-        const auto vertexOffset = allocate(Ring::Vertices, draw.vertices, standIns);
-        const auto coordinateOffset = draw.masked ? allocate(Ring::Coordinates, draw.vertices, standIns) : std::optional<UINT64>{0};
-        const auto structureOffset = allocate(Ring::Structures, structureSize, standIns);
+        const auto vertexOffset = allocate(Ring::Vertices, draw.vertices, standIns, casting);
+        const auto coordinateOffset = draw.masked ? allocate(Ring::Coordinates, draw.vertices, standIns, casting) : std::optional<UINT64>{0};
+        const auto structureOffset = allocate(Ring::Structures, structureSize, standIns, casting);
         if (!vertexOffset || !coordinateOffset || !structureOffset) break;
 
         entry.vertexOffset = *vertexOffset;
@@ -1405,6 +1426,21 @@ void GeometryCache::plan(const std::vector<Draw>& draws, UINT maskedStart, bool 
         addedBytes += structureSize;
         scratchBytes += scratchSize;
         stagedRows += rows;
+    }
+
+    // An object is whole once every draw the view drew of it this frame is cached.
+    std::unordered_map<std::uint64_t, bool> whole;
+    for (const auto& draw : draws)
+    {
+        const auto [found, added] = whole.try_emplace(draw.object, true);
+        found->second = found->second && byKey.contains(draw.key);
+    }
+    for (const auto& [object, cached] : whole)
+    {
+        if (!object) continue;
+
+        if (cached) wholeObjects.insert(object);
+        else wholeObjects.erase(object);
     }
 
     std::unordered_set<std::uint64_t> drawn;
@@ -1504,6 +1540,7 @@ void GeometryCache::clear()
 {
     entries.clear();
     byKey.clear();
+    wholeObjects.clear();
     std::fill(std::begin(heads), std::end(heads), UINT64{});
     builds.clear();
     tracedEntries.clear();
@@ -1622,6 +1659,7 @@ void recordAmbient(Gpu& g, UINT slot, const TraceConstants& trace)
     std::copy(std::begin(trace.maskedBase), std::end(trace.maskedBase), constants.maskedBase);
     constants.materialDraws = trace.materialDraws;
     constants.frame = static_cast<std::uint32_t>(g.frames);
+    constants.halfRays = activeFeatures().halfAmbientRays;
     auto* list = g.list.Get();
     ID3D12DescriptorHeap* heaps[]{a.descriptors.Get()};
     list->EndQuery(a.timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot * 2);
@@ -2172,9 +2210,10 @@ bool trace(Gpu& g, const Capture& frame)
     // The shadow caster and off-screen shadow views show everything sun rays can see beyond the view,
     // on screen too.
     const std::vector<GeometryCache::Draw> none;
+    const std::unordered_set<std::uint64_t> noObjects;
     const bool everything = selected == View::ShadowCasters || selected == View::OffscreenShadows;
-    g.cache->plan(frame.cameraKnown ? frame.cacheDraws : none, maskedStart, everything, frame.preViewTranslation);
-    g.templates->plan(frame.cameraKnown ? frame.templateDraws : none, maskedStart, false, frame.preViewTranslation);
+    g.cache->plan(frame.cameraKnown ? frame.cacheDraws : none, maskedStart, everything, frame.casting, frame.preViewTranslation);
+    g.templates->plan(frame.cameraKnown ? frame.templateDraws : none, maskedStart, false, noObjects, frame.preViewTranslation);
     lap(2);
     readFoliage(g);
     lap(3);
@@ -2407,6 +2446,7 @@ void standIn(std::uint64_t object, std::uint64_t draw, bool masked)
 {
     ++capture.standInDraws;
     capture.capturedKeys.insert(draw);
+    capture.viewObjects.insert(object);
     capture.cacheDraws.push_back({cacheKey(object, draw), object, 0, 0, NoMaterial, masked, false, true});
 }
 
@@ -2419,9 +2459,17 @@ void offerToCache(std::uint64_t object, std::uint64_t draw, UINT first, UINT ver
         return;
     }
 
+    capture.viewObjects.insert(object);
     if (moving) g.movers.insert(object);
     if (g.movers.contains(object)) ++capture.movingDraws;
     if (!g.movers.contains(object)) capture.cacheDraws.push_back({cacheKey(object, draw), object, first, vertices, slot, masked});
+}
+
+// Whether the cache can stand in for a static object's shadow casters: it holds the object whole and
+// this frame's cached geometry can be placed.
+bool cacheCasts(const Gpu& g, std::uint64_t object)
+{
+    return offscreenGeometry && capture.cameraKnown && !g.cacheReset && !g.movers.contains(object) && g.cache->holdsWhole(object);
 }
 
 // Bend's foliage: instanced draws whose vertex shader reads each instance's transform (three rows, the
@@ -2449,7 +2497,9 @@ std::optional<FoliageSource> foliageSource(ID3D11DeviceContext* context)
     return source;
 }
 
-// The mesh a foliage draw draws, at its level of detail, whichever instances it draws.
+// The mesh a foliage draw draws, at its level of detail, whichever instances it draws. An alpha-tested
+// mesh's shape is its alpha test's too, and Bend draws the same vertices with many plants' textures
+// (one with 35): those textures are part of the mesh, or one plant's copies would stand in for others.
 std::uint64_t foliageMesh(ID3D11DeviceContext* context, std::uint32_t count, std::uint32_t first, std::int32_t baseVertex, bool masked)
 {
     ComPtr<ID3D11VertexShader> vertexShader;
@@ -2476,6 +2526,21 @@ std::uint64_t foliageMesh(ID3D11DeviceContext* context, std::uint32_t count, std
         if (slot) key = (key ^ reinterpret_cast<std::uint64_t>(streams[slot]) ^ (std::uint64_t{offsets[slot]} << 40)) * 1099511628211ull;
         streams[slot]->Release();
     }
+
+    BakeInput input{};
+    UINT inputSize = sizeof(input);
+    if (!masked || !pixelShader || FAILED(pixelShader->GetPrivateData(BakeInputData, &inputSize, &input))) return key;
+
+    // The textures the alpha test declares, as its coverage is baked from them.
+    std::array<ID3D11ShaderResourceView*, 32> views{};
+    const auto declared = static_cast<UINT>(32 - std::countl_zero(input.textures));
+    context->PSGetShaderResources(0, declared, views.data());
+    for (UINT slot = 0; slot < declared; ++slot)
+    {
+        if (input.textures & (1u << slot)) key = (key ^ reinterpret_cast<std::uint64_t>(views[slot])) * 1099511628211ull;
+        if (views[slot]) views[slot]->Release();
+    }
+
     return key;
 }
 
@@ -2807,7 +2872,11 @@ std::optional<UINT> shadowMapDraw(ID3D11DeviceContext* context, ID3D11DepthStenc
 // Captures a shadow caster: geometry off screen or hidden from the view still shadows it. Casters
 // follow the view's geometry, which the base pass has finished drawing. Most casters repeat a draw
 // already captured, on screen or in another of the maps (those near the view are drawn into more
-// than one): those are skipped.
+// than one): those are skipped. So are the casters of a static object the view drew, which its
+// capture holds whole at the view's level of detail, and of one the cache holds whole, which is
+// traced from there. Moving objects are not told apart (their own constants are dynamic, and every
+// one of them has the same object key), so their casters are captured: another one may be off
+// screen. The views of what sun rays see beyond the view keep every caster.
 void captureShadowCaster(ID3D11DeviceContext* context, UINT map, const D3D11_VIEWPORT& viewport, std::uint32_t count,
     std::uint32_t instances, std::uint32_t first, std::int32_t baseVertex, std::uint32_t firstInstance, bool indexed)
 {
@@ -2815,6 +2884,22 @@ void captureShadowCaster(ID3D11DeviceContext* context, UINT map, const D3D11_VIE
     if (capture.capturedKeys.contains(key))
     {
         ++capture.repeatedCasterDraws;
+        return;
+    }
+
+    const bool beyondView = selected == View::ShadowCasters || selected == View::OffscreenShadows;
+    const auto object = beyondView ? 0 : objectKey(*gpu, context, instances, firstInstance);
+    if (object && !gpu->movers.contains(object) && capture.viewObjects.contains(object))
+    {
+        ++capture.casterDrawsInView;
+        capture.capturedKeys.insert(key);
+        return;
+    }
+    if (object && cacheCasts(*gpu, object))
+    {
+        ++capture.casterDrawsInCache;
+        capture.casting.insert(object);
+        capture.capturedKeys.insert(key);
         return;
     }
 
@@ -3135,6 +3220,8 @@ void publish(const Capture& frame, bool traced)
     published.unsupportedDraws = frame.unsupportedDraws;
     published.overCapacityDraws = frame.overCapacityDraws;
     published.casterDraws = frame.casterDraws;
+    published.casterDrawsInView = frame.casterDrawsInView;
+    published.casterDrawsInCache = frame.casterDrawsInCache;
     published.cachedDraws = gpu ? static_cast<unsigned>(gpu->cache->size()) : 0;
     published.tracedCachedDraws = gpu ? static_cast<unsigned>(gpu->cache->traced()) : 0;
     published.foliageInstances = gpu ? gpu->foliageInstances : 0;
@@ -3162,14 +3249,15 @@ void publish(const Capture& frame, bool traced)
 void logFrame(const Capture& frame)
 {
     const auto state = status();
-    char text[1024]{};
+    char text[1536]{};
     std::snprintf(text, sizeof(text), "Ray tracing frame %llu: %u G-buffer draws, %u captured (%u alpha-tested, %u without coverage, %u materials), %u decals, sky or screen passes, "
-        "%u unknown shader, %u unsupported, %u over capacity; %u shadow casters (%u repeats skipped), %u cached draws (%u traced, %u standing in for the view; not cached: %u moving, %u anonymous), %u foliage instances from %u meshes (%u placed; %u draws left to them); %llu triangles; CPU %.2f ms capturing, GPU %.2f ms copy, %.2f ms build, "
+        "%u unknown shader, %u unsupported, %u over capacity; %u shadow casters (%u repeats skipped, %u left to the view, %u to the cache), %u cached draws (%u traced, %u standing in for the view; not cached: %u moving, %u anonymous), %u foliage instances from %u meshes (%u placed; %u draws left to them); %llu triangles; CPU %.2f ms capturing, GPU %.2f ms copy, %.2f ms build, "
         "%.2f ms trace; %u shadow resolve draws, sun %s %.3f, %.3f, %.3f; traced shadows %s; traced ambient occlusion %s, GPU %.2f ms; "
         "traced global illumination %s, GPU %.2f ms.",
         static_cast<unsigned long long>(tracedFrames), frame.basePassDraws, frame.capturedDraws, frame.maskedDraws, frame.unbakedDraws,
         state.bakedMaterials, frame.backgroundDraws,
-        frame.unknownShaderDraws, frame.unsupportedDraws, frame.overCapacityDraws, frame.casterDraws, frame.repeatedCasterDraws, state.cachedDraws, state.tracedCachedDraws, frame.standInDraws, frame.movingDraws, frame.anonymousDraws, state.foliageInstances,
+        frame.unknownShaderDraws, frame.unsupportedDraws, frame.overCapacityDraws, frame.casterDraws, frame.repeatedCasterDraws, frame.casterDrawsInView,
+        frame.casterDrawsInCache, state.cachedDraws, state.tracedCachedDraws, frame.standInDraws, frame.movingDraws, frame.anonymousDraws, state.foliageInstances,
         gpu ? static_cast<unsigned>(gpu->foliageTemplates.size()) : 0u,
         gpu ? static_cast<unsigned>(std::count_if(gpu->foliageTemplates.begin(), gpu->foliageTemplates.end(),
             [](const auto& model) { return model.second.reference != NoInstance && gpu->templates->find(model.second.cacheKey); })) : 0u,
@@ -3588,6 +3676,7 @@ Status status()
     result.view = selected;
     result.features.sunShadows = sunShadows;
     result.features.ambientOcclusion = ambientOcclusion;
+    result.features.halfAmbientRays = halfAmbientRays;
     result.features.replaceCanopyShadows = replaceCanopyShadows;
     result.features.offscreenGeometry = offscreenGeometry;
     result.features.globalIllumination = globalIllumination;
@@ -3615,6 +3704,7 @@ void enable(const Features& features)
     failed = false;
     sunShadows = features.sunShadows;
     ambientOcclusion = features.ambientOcclusion;
+    halfAmbientRays = features.halfAmbientRays;
     replaceCanopyShadows = features.replaceCanopyShadows;
     offscreenGeometry = features.offscreenGeometry;
     globalIllumination = features.globalIllumination;

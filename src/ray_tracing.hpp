@@ -10,7 +10,7 @@ struct IUnknown;
 
 // Path-tracing experiment. Each frame the G-buffer and sun shadow map draws are repeated with stream
 // output, a D3D12 device sharing the GPU builds DXR acceleration structures from the captured
-// triangles and traces one ray per pixel plus one toward the sun, four short ones for ambient
+// triangles and traces one ray per pixel plus one toward the sun, four short ones (or two) for ambient
 // occlusion and one bounce of sunlight for global illumination. Features feed the result into the
 // game's lighting; debug views draw it over the frame. docs/DEVELOPMENT.md describes the route.
 namespace days_gone_dlss::ray_tracing
@@ -30,6 +30,9 @@ struct Features
     // Ambient occlusion traced from the same geometry in place of the game's screen-space occlusion,
     // filtered by the game's own blur and temporal accumulation.
     bool ambientOcclusion{};
+    // With ambient occlusion: each pixel traces two of its four directions and takes the other two
+    // from its neighbour, for about half the rays and a little more noise.
+    bool halfAmbientRays{};
     // With sun shadows: leaves out the game's soft tree shadow, which comes from a light-space map of
     // the canopies, so the traced trees shadow alone.
     bool replaceCanopyShadows{};
@@ -55,6 +58,7 @@ struct Status
     unsigned basePassDraws{}, capturedDraws{}, maskedDraws{}, unbakedDraws{}, bakedMaterials{}, backgroundDraws{}, unknownShaderDraws{},
         unsupportedDraws{}, overCapacityDraws{};
     unsigned casterDraws{}; // Captured from the sun shadow maps
+    unsigned casterDrawsInView{}, casterDrawsInCache{}; // Left to the view's capture of their object, and to the geometry cache
     unsigned cachedDraws{}, tracedCachedDraws{}; // Static draws kept from earlier frames, and those traced off view
     unsigned foliageInstances{}; // Tree sections placed from their meshes' templates
     std::uint64_t triangles{}, capacity{};
