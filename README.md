@@ -1,6 +1,6 @@
 # Days Gone DLSS
 
-Adds NVIDIA DLSS Super Resolution and DLAA to Days Gone, with SDR and HDR support.
+Adds NVIDIA DLSS Super Resolution, DLAA, Frame generation and Reflex to Days Gone, with SDR and HDR support.
 
 ## Requirements
 
@@ -26,10 +26,7 @@ Adds NVIDIA DLSS Super Resolution and DLAA to Days Gone, with SDR and HDR suppor
 Choose modes and presets in the overlay. Leave the other settings at their defaults to
 start with.
 
-**Frame generation** adds generated frames between those the game renders: 2x to 6x, or Dynamic,
-which picks the multiplier that reaches your display's refresh rate. It needs DLSS or DLAA on.
-Turning it on takes effect after restarting the game; changing or turning it off works at once.
-It also turns on NVIDIA Reflex, which keeps the added latency low. On 1.07, if foliage shimmers in Performance or lower modes, turn off
+**Frame generation** 2x to 6x, or Dynamic. It needs DLSS or DLAA on. It also turns on NVIDIA Reflex.
 **Screen-space indirect lighting**. DLSS controls the game's Render Scale while enabled; **Off** restores it.
 Settings are saved in `DaysGoneDLSS.ini` beside the add-on.
 
