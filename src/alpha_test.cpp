@@ -4,7 +4,9 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cmath>
 #include <cstring>
+#include <format>
 #include <map>
 #include <span>
 
@@ -13,15 +15,18 @@ namespace days_gone_dlss::ray_tracing
 namespace
 {
 // d3d11tokenizedprogramformat.hpp
-constexpr std::uint32_t Discard = 13, CustomData = 53, ResourceDeclaration = 88;
-constexpr std::uint32_t TempOperand = 0, InputOperand = 1, Immediate32 = 4, Immediate64 = 5;
+constexpr std::uint32_t Discard = 13, CustomData = 53, ResourceDeclaration = 88, Mad = 50, Mul = 56;
+constexpr std::uint32_t TempOperand = 0, InputOperand = 1, Immediate32 = 4, Immediate64 = 5, ConstantBufferOperand = 8;
 constexpr std::uint32_t PositionValue = 1;
 
 struct Operand
 {
     std::uint32_t type{}, index{}, components{};
+    std::uint32_t reg{}; // A constant buffer operand's register; `index` is its buffer
     std::array<std::uint8_t, 4> swizzle{0, 1, 2, 3}; // Source component read for each destination component
     std::uint8_t mask{0xf};                         // Destination components written
+    std::array<std::uint32_t, 4> values{};          // An immediate's
+    bool modified{};                                // Negated, absolute or indexed relatively
 };
 
 struct Instruction
@@ -87,10 +92,15 @@ bool readOperand(std::span<const std::uint32_t> words, std::size_t& i, Operand& 
     {
         if (i >= words.size()) return false;
         extended = words[i++];
+        // An operand modifier: negate, absolute value or both.
+        if ((extended & 0x3f) == 1 && ((extended >> 6) & 0xff)) operand.modified = true;
     }
     if (operand.type == Immediate32 || operand.type == Immediate64)
     {
-        i += (operand.components == 4 ? 4 : 1) * (operand.type == Immediate64 ? 2 : 1);
+        const std::size_t values = operand.components == 4 ? 4 : 1;
+        if (operand.type == Immediate32)
+            for (std::size_t c = 0; c < values && i + c < words.size(); ++c) operand.values[c] = words[i + c];
+        i += values * (operand.type == Immediate64 ? 2 : 1);
         return i <= words.size();
     }
 
@@ -108,7 +118,9 @@ bool readOperand(std::span<const std::uint32_t> words, std::size_t& i, Operand& 
         else if (representation == 1 || representation == 4) i += 2;
         if (representation >= 2 && !readOperand(words, i, relative)) return false;
         if (representation > 4) return false;
+        if (representation >= 2) operand.modified = true;
         if (d == 0) operand.index = value;
+        if (d == 1) operand.reg = value;
     }
     return i <= words.size();
 }
@@ -196,6 +208,82 @@ Components slice(const std::vector<Instruction>& program, std::size_t from, Comp
     return inputs;
 }
 
+// The value an operand gives destination component `component`: a constant or a literal.
+std::optional<TransformValue> transformValue(const Operand& operand, std::uint32_t component)
+{
+    if (operand.modified) return std::nullopt;
+    if (operand.type == ConstantBufferOperand)
+        return TransformValue{true, operand.index, operand.reg, operand.components == 4 ? operand.swizzle[component] : 0u, 0};
+    if (operand.type == Immediate32) return TransformValue{false, 0, 0, 0, std::bit_cast<float>(operand.values[operand.components == 4 ? component : 0])};
+    return std::nullopt;
+}
+
+// How a sample's coordinate operand takes the coordinates input (register `reg`, from component
+// `first`): the input itself (identity), or a temp the input times a scale (plus an offset) wrote.
+// Empty for anything else.
+std::optional<std::optional<CoordinateTransform>> sampledCoordinates(const std::vector<Instruction>& program, std::size_t sample,
+    const Operand& coordinate, std::uint32_t reg, std::uint32_t first)
+{
+    if (coordinate.modified) return std::nullopt;
+    if (coordinate.type == InputOperand)
+    {
+        if (coordinate.index != reg || coordinate.swizzle[0] != first || coordinate.swizzle[1] != first + 1) return std::nullopt;
+        return std::optional<CoordinateTransform>{};
+    }
+    if (coordinate.type != TempOperand) return std::nullopt;
+
+    const auto used = static_cast<std::uint8_t>(1u << coordinate.swizzle[0] | 1u << coordinate.swizzle[1]);
+    for (std::size_t i = sample; i-- > 0;)
+    {
+        const auto& instruction = program[i];
+        if (!destinations(instruction.opcode) || instruction.operands.empty()) continue;
+        const auto& destination = instruction.operands[0];
+        if (destination.type != TempOperand || destination.index != coordinate.index || !(destination.mask & used)) continue;
+        if ((destination.mask & used) != used || (instruction.opcode != Mul && instruction.opcode != Mad)
+            || instruction.operands.size() < (instruction.opcode == Mad ? 4u : 3u))
+            return std::nullopt;
+
+        const auto& a = instruction.operands[1];
+        const auto& b = instruction.operands[2];
+        const bool inputFirst = a.type == InputOperand;
+        const auto& input = inputFirst ? a : b;
+        const auto& scale = inputFirst ? b : a;
+        if (input.type != InputOperand || input.index != reg || input.modified || input.components != 4) return std::nullopt;
+
+        CoordinateTransform transform{};
+        for (std::uint32_t axis = 0; axis < 2; ++axis)
+        {
+            const auto component = coordinate.swizzle[axis];
+            const auto factor = transformValue(scale, component);
+            if (input.swizzle[component] != first + axis || !factor) return std::nullopt;
+
+            transform.scale[axis] = *factor;
+            if (instruction.opcode != Mad) continue;
+
+            const auto offset = transformValue(instruction.operands[3], component);
+            if (!offset) return std::nullopt;
+            transform.offset[axis] = *offset;
+        }
+        return std::optional{transform};
+    }
+    return std::nullopt;
+}
+
+// The transform every sample behind the discard applies to the coordinates. Empty when they take
+// them as they are, or not all the same way.
+std::optional<CoordinateTransform> coordinateTransform(const std::vector<Instruction>& program, const std::vector<std::size_t>& samples,
+    std::uint32_t reg, std::uint32_t first)
+{
+    std::optional<CoordinateTransform> shared;
+    for (std::size_t s = 0; s < samples.size(); ++s)
+    {
+        const auto transform = sampledCoordinates(program, samples[s], program[samples[s]].operands[1], reg, first);
+        if (!transform || (s && *transform != shared)) return std::nullopt;
+        shared = *transform;
+    }
+    return shared;
+}
+
 std::span<const std::uint8_t> chunk(const void* code, std::size_t size, std::initializer_list<const char*> tags)
 {
     const auto* bytes = static_cast<const std::uint8_t*>(code);
@@ -240,6 +328,20 @@ std::string bakeVertexShader(const std::vector<SignatureElement>& inputs, const 
         return a.reg != b.reg ? a.reg < b.reg : std::countr_zero(static_cast<unsigned>(a.mask)) < std::countr_zero(static_cast<unsigned>(b.mask));
     });
     const bool position = std::any_of(elements.begin(), elements.end(), [](const SignatureElement& e) { return e.systemValue == PositionValue; });
+    // With a transform the coordinates run over one tile: the inputs the sampled 0 to 1 come from.
+    std::string tile;
+    if (test.transform)
+    {
+        const auto value = [](const TransformValue& v, std::uint32_t row)
+        {
+            if (v.constant) return std::format("asfloat(Transforms.Load4((Transform * 4 + {}) * 16)).{}", row, "xyzw"[v.component & 3]);
+            return std::format("{:.9g}", std::isfinite(v.literal) ? v.literal : 1.0f);
+        };
+        const auto& t = *test.transform;
+        tile = std::format("    float2 scale = float2({}, {}), offset = float2({}, {});\n"
+            "    float2 tile = (uv - offset) / (abs(scale) > 1e-12 ? scale : 1);\n",
+            value(t.scale[0], 0), value(t.scale[1], 1), value(t.offset[0], 2), value(t.offset[1], 3));
+    }
     std::string declarations, assignments;
     for (std::size_t i = 0; i < elements.size(); ++i)
     {
@@ -255,7 +357,8 @@ std::string bakeVertexShader(const std::vector<SignatureElement>& inputs, const 
         if (sameElement(element, test.coordinates))
         {
             const char* swizzles[]{"xy", "yz", "zw"};
-            assignments += "    output." + name + (width > 2 ? std::string(".") + swizzles[std::min(test.firstComponent + offset, 2u)] : "") + " = uv;\n";
+            assignments += "    output." + name + (width > 2 ? std::string(".") + swizzles[std::min(test.firstComponent + offset, 2u)] : "")
+                + (test.transform ? " = tile;\n" : " = uv;\n");
         }
         if (test.fade && sameElement(element, *test.fade))
             assignments += "    output." + name + (width > 1 ? std::string(".") + "xyzw"[std::min(test.fadeComponent + offset, 3u)] : "") + " = Fade;\n";
@@ -265,10 +368,11 @@ std::string bakeVertexShader(const std::vector<SignatureElement>& inputs, const 
                     + " = Combination >> " + std::to_string(t) + " & 1;\n";
     }
     if (!position) declarations += "    float4 position : SV_Position;\n";
-    return "cbuffer Bake : register(b0)\n{\n    float Fade;\n    float Depth;\n    uint Combination;\n};\n\n"
+    return "cbuffer Bake : register(b0)\n{\n    float Fade;\n    float Depth;\n    uint Combination;\n    uint Transform;\n};\n"
+        "ByteAddressBuffer Transforms : register(t0);\n\n"
         "struct Output\n{\n" + declarations + "};\n\nOutput main(uint vertex : SV_VertexID)\n{\n"
         "    float2 uv = float2(vertex == 1 ? 2 : 0, vertex == 2 ? 2 : 0);\n"
-        "    float4 position = float4(uv * float2(2, -2) + float2(-1, 1), Depth, 1);\n"
+        "    float4 position = float4(uv * float2(2, -2) + float2(-1, 1), Depth, 1);\n" + tile +
         "    Output output;\n" + assignments + (position ? "" : "    output.position = position;\n") + "    return output;\n}\n";
 }
 
@@ -364,6 +468,7 @@ std::optional<AlphaTest> analyseAlphaTest(const void* code, std::size_t size)
     const auto inputs = readSignature(code, size, true);
     std::optional<AlphaTest> best;
     int bestRank = -1;
+    std::uint32_t bestRegister{}, bestFirst{};
     for (const auto& [input, components] : coordinates)
     {
         const auto reg = static_cast<std::uint32_t>(input & 0xffffffff);
@@ -374,9 +479,13 @@ std::optional<AlphaTest> analyseAlphaTest(const void* code, std::size_t size)
         const int rank = (direct.contains(input) ? 2 : 0) + (element->semantic == "TEXCOORD" && element->semanticIndex < 8 ? 1 : 0);
         if (rank <= bestRank) continue;
         bestRank = rank;
-        best = AlphaTest{*element, first - static_cast<std::uint32_t>(std::countr_zero(static_cast<unsigned>(element->mask))), {}};
+        bestRegister = reg;
+        bestFirst = first;
+        best = AlphaTest{*element, first - static_cast<std::uint32_t>(std::countr_zero(static_cast<unsigned>(element->mask))), {}, {}};
     }
     if (!best) return best;
+
+    best->transform = coordinateTransform(*program, samples, bestRegister, bestFirst);
 
     // Bend's prepass tests mostly scale the opacity by one interpolated value besides the texture: a
     // fade or a vertex colour channel. Screen positions (dithering) and the coordinates are not it.

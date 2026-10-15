@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -22,12 +23,36 @@ struct SignatureElement
 
 inline constexpr std::size_t MaxToggles = 4;
 
+// A value the coordinates are scaled or offset by: a component of a constant buffer register, or a
+// literal.
+struct TransformValue
+{
+    bool constant{};
+    std::uint32_t buffer{}, reg{}, component{};
+    float literal{};
+
+    bool operator==(const TransformValue&) const = default;
+};
+
+// Materials tile a texture across a mesh in the pixel shader: the alpha test samples the coordinates
+// times `scale` plus `offset`, per axis.
+struct CoordinateTransform
+{
+    std::array<TransformValue, 2> scale, offset;
+
+    bool operator==(const CoordinateTransform&) const = default;
+};
+
 struct AlphaTest
 {
     // The input the opacity samples take their coordinates from, and its first used component
     // within that element (0 for .xy of a float4, 2 for .zw).
     SignatureElement coordinates;
     std::uint32_t firstComponent{};
+    // How every sample the test reads scales the coordinates, if they do. The bake then covers one
+    // texture tile rather than the mesh's coordinates from 0 to 1, where a finely tiled mask (a
+    // chain-link fence) would fill every texel.
+    std::optional<CoordinateTransform> transform;
     // A per-vertex value the test also reads, such as a fade or a vertex colour channel scaling the
     // opacity, and its component within the element. Only when the test reads exactly one.
     std::optional<SignatureElement> fade;
@@ -38,9 +63,10 @@ struct AlphaTest
     // fully faded in.
     std::vector<std::pair<SignatureElement, std::uint32_t>> toggles;
     // HLSL for a vertex shader whose outputs match the pixel shader's inputs: a triangle covering
-    // the viewport, with `coordinates` running over [0, 1], `fade` from the constant Fade, toggle t
-    // from bit t of the constant Combination and every other input 1. The triangle lies at the
-    // constant Depth (all in b0).
+    // the viewport, with `coordinates` running over [0, 1] (over one tile with a transform), `fade`
+    // from the constant Fade, toggle t from bit t of the constant Combination and every other input 1.
+    // The triangle lies at the constant Depth (all in b0). A transform's constants are the rows
+    // Transform * 4 + k of the buffer in t0: the scale's x and y, then the offset's.
     std::string bakeVertexShader;
     // Texture slots the pixel shader declares (bit n for tn): what identifies its material.
     std::uint32_t textures{};

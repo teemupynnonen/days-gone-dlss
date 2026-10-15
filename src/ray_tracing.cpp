@@ -5,6 +5,7 @@
 #include "ray_tracing_trace.h" // TraceShader: ray_tracing_trace.hlsl compiled by dxc at build time
 #include "ray_tracing_ao.h"    // AmbientTraceShader: ray_tracing_ao.hlsl, likewise
 #include "ray_tracing_bounce.h" // BounceTraceShader: ray_tracing_bounce.hlsl, likewise
+#include "ray_tracing_lights.h" // LightsTraceShader: ray_tracing_lights.hlsl, likewise
 #include "shader_bytecode.hpp"
 #include "upscaler.hpp"
 
@@ -42,9 +43,12 @@ using Microsoft::WRL::ComPtr;
 
 // Captured vertices, three per triangle, travel to D3D12 in a shared texture of 4096 a row. Opaque
 // draws fill it from the start; alpha-tested ones, captured from the depth prepass with their
-// texture coordinates, end at MaskedEnd. Each range starts on a triangle.
-constexpr UINT RowLength = 4096, Rows = 6144, Capacity = RowLength * Rows, MaskedEnd = Capacity / 3 * 3;
-constexpr UINT MaskedCapacity = RowLength * 2048; // Alpha-tested vertices; their coordinates use the same rows
+// texture coordinates, end at MaskedEnd. Each range starts on a triangle. The vertices take the same
+// room again in the stream-output buffer and the D3D12 vertex buffer (Direct3D 11 cannot share a
+// buffer with D3D12, and stream output cannot write a texture), so the room, 4.2 million triangles,
+// just covers the worst view seen: 3.9 million in the Hot Springs forest with the caches off.
+constexpr UINT RowLength = 4096, Rows = 3072, Capacity = RowLength * Rows, MaskedEnd = Capacity / 3 * 3;
+constexpr UINT MaskedCapacity = RowLength * 1536; // Alpha-tested vertices; their coordinates use the same rows
 constexpr UINT VertexBytes = 16;       // float4: clip position when streamed, world position when shared
 constexpr UINT MaskedVertexBytes = 28; // float4 clip position, float2 texture coordinates, float fade
 // Baked coverage of alpha-tested materials: 32 by 32 slots of 256 texels square. A forest view
@@ -77,7 +81,22 @@ constexpr GUID VertexBytecode{0x41f7c2d8, 0x0b6e, 0x4a93, {0x8c, 0x15, 0x7e, 0xd
 constexpr GUID BakeShader{0x6a3e9f04, 0x5d21, 0x4c7b, {0x93, 0x0e, 0xb4, 0x18, 0x6f, 0xc2, 0x7a, 0x55}};
 constexpr GUID BakeShaderSource{0x7e19d4b3, 0x2a6f, 0x4185, {0xbc, 0x47, 0x0d, 0x93, 0x5a, 0x1e, 0xe6, 0x28}};
 constexpr GUID BakeInputData{0x2c8b5e71, 0x9f46, 0x4e0d, {0xa7, 0x3b, 0x61, 0xf0, 0x4c, 0x9e, 0x12, 0xd8}};
-struct BakeInput { char semantic[32]; UINT semanticIndex, component, textures; char fadeSemantic[32]; UINT fadeSemanticIndex, fadeComponent, toggles; };
+struct BakeInput
+{
+    char semantic[32];
+    UINT semanticIndex, component, textures;
+    char fadeSemantic[32];
+    UINT fadeSemanticIndex, fadeComponent, toggles;
+    bool transformed;
+    CoordinateTransform transform;
+};
+// Alpha-tested draws whose material tiles its texture (AlphaTest::transform) in a frame: each has its
+// scale and offset copied from its constants into four rows of a buffer, and Positions takes its
+// coordinates into the baked tile with them.
+constexpr UINT MaxTransformDraws = 2048;
+// A tiled draw's vertices in the alpha-tested range, its rows, and per value (scale x and y, offset
+// x and y) whether it is read from its row (bit k) and which component (bits 8 + 2k), or else the literal.
+struct TransformDraw { std::uint32_t first, end, row, sources; float literals[4]; };
 
 // Bend resolves the sun's shadow into a screen-space target before lighting
 // (FBendSceneDirectionalShadowWithScreenSpaceResolvePS, its fast path and their lighting-model
@@ -111,17 +130,16 @@ constexpr UINT64 TemplateStructureBytes = 256ull << 20;
 constexpr std::uint32_t TemplateCoordinates = 0x80000000;
 constexpr UINT MaxCachedDraws = 8192, MaxNewCachedDraws = 128, MaxFoliageInstances = 65536;
 constexpr UINT MaxInstances = 2 + MaxCachedDraws + MaxFoliageInstances;
-// Foliage: instance transforms of 48 bytes, the visible lists read back over FoliageLatency frames, the
-// trees within FoliageRadius (cm) of the camera traced, and farther ones for FoliageMemory read-backs
-// after they were last seen.
+// Foliage: instance transforms of 48 bytes, the visible lists read back every FoliageLatency-th frame,
+// each with that many frames to land, the trees within FoliageRadius (cm) of the camera traced, and
+// farther ones for FoliageMemory read-backs after they were last seen: about 20 s at 30 fps.
 constexpr UINT FoliageTransformBytes = 48, FoliageLatency = 4, FoliageIndexCapacity = 1 << 18, FoliageReloadFrames = 1800;
-constexpr UINT FoliageMemory = 600;
+constexpr UINT FoliageMemory = 150;
+// A tree is a draw per section: trunk, branches, leaves, and both levels' while its level of detail
+// crossfades. Sections past MaxTreeSections are not traced.
+constexpr UINT MaxTreeSections = 8;
 constexpr UINT NoInstance = 0xffffffff;
 constexpr float FoliageRadius = 8000;
-// Ambient occlusion rays see the view's own foliage within this distance (cm) of the camera, and the
-// trees' copies beyond it. The copies only occlude from 30 cm, so grass beyond it no longer darkens
-// the ground; at 5 m that showed a few metres in front of the player.
-constexpr float AmbientFoliageRadius = 2000;
 
 // Bend's screen-space ambient occlusion (BendScreenSpaceShadowingCS) runs at the end of the G-buffer
 // pass. BuildAmbientMaskCS reads the G-buffer normal (t0) and picks the cube corners on its side,
@@ -138,6 +156,27 @@ constexpr AmbientShaderChecksum AmbientShaders[]{
     {upscaler::dxbcHash("73260a675a394e71f15c5d62bc699101"), AmbientPass::Blur}, // FBlurAmbientCS
 };
 
+// Bend draws each local light (BendDeferredLightShaders) as a full-screen triangle per lighting model,
+// added to the scene colour, scissored to the light and stencil-masked to its volume, which a draw
+// with TDeferredLightVS<true> marks just before. With light shadows, rays take the place of the game's
+// shadow maps for up to MaxLights lights a frame; the rest keep the game's. The light's constants
+// (position and inverse radius, colour, direction, spot angles, source radius and length) are the
+// first rows of constant buffer 4, or 5 for hair, whose cb4 holds its own parameters.
+enum class LightShader : std::uint32_t { Volume, Light };
+constexpr GUID LightShaderTag{0x3d7a91c4, 0x5e28, 0x4b60, {0x8f, 0x13, 0xa6, 0x0c, 0x72, 0xe9, 0x4b, 0xd5}};
+constexpr auto LightVolumeShader = upscaler::dxbcHash("704bf50f025973c175c38a06cb9c43c7");   // TDeferredLightVS<true>
+constexpr auto DeferredLightShader = upscaler::dxbcHash("aefaa9f51b2cdbbef44287091ea4a803"); // BendDeferredLightShaders VertexMain
+constexpr UINT MaxLights = 16, LightConstantRows = 4;
+constexpr int NoLightSlot = -1;
+// The lights' descriptor table (LightsRootSignature): t5 to t29, then u0 to u2.
+namespace LightDescriptor
+{
+constexpr UINT Depth = 0, Coordinates = 1, Coverage = 2, Table = 3, Slots = 4, Normals = Slots + MaxLights, Albedo = Normals + 1,
+    Vertices = Albedo + 1, CacheVertices = Vertices + 1, TemplateVertices = CacheVertices + 1, Visibility = TemplateVertices + 1,
+    Unshadowed = Visibility + 1, Bounced = Unshadowed + 1;
+}
+constexpr UINT LightDescriptors = LightDescriptor::Bounced + 1;
+
 // How shaders::Composite shows the traced images.
 enum class CompositeMode : std::uint32_t
 {
@@ -148,14 +187,15 @@ struct PositionConstants
 {
     float worldFromClip[16], worldFromClipXYW[16];
     std::uint32_t opaqueCount, maskedCount, maskedStart, casterRunCount;
-    float atlasSize[2], padding[2];
+    float atlasSize[2];
+    std::uint32_t transformCount, materialDrawCount;
     std::uint32_t casterRuns[MaxCasterRuns][4]; // First opaque and alpha-tested vertex, shadow map
     float casterDepths[MaxCasterRuns][4];       // The run's viewport depth range
 };
 struct RegionConstants { std::int32_t renderOrigin[2]; std::uint32_t size[2]; };
 struct CompositeConstants { std::int32_t outputOrigin[2], renderOrigin[2]; float renderScale[2]; CompositeMode mode; std::uint32_t padding; };
 struct BakeConstants { std::uint32_t slot[2], padding[2]; };
-struct BakeLevel { float fade, depth; std::uint32_t combination, padding; };
+struct BakeLevel { float fade, depth; std::uint32_t combination, transform; };
 struct TraceConstants
 {
     float worldFromClip[16], clipFromWorld[16];
@@ -163,34 +203,49 @@ struct TraceConstants
     float sun[4];
     // Per instance, the view's geometry then the shadow casters: the first vertex of each geometry, and
     // (maskedBase) the first alpha-tested vertex in the coordinates texture.
-    std::uint32_t geometryBase[2][2], materialDraws, primaryMask, offscreenCheck, padding;
+    std::uint32_t geometryBase[2][2], primaryMask, offscreenCheck, primaryRays, frame, softShadows;
 };
-static_assert(sizeof(TraceConstants) == 48 * 4, "TraceRootSignature takes 48 root constants");
-// Instance masks: primary rays see the view's geometry, sun rays also the shadow casters, the cached
-// geometry and the instanced foliage.
-constexpr UINT ViewMask = 1, CasterMask = 2, FoliageMask = 4;
+static_assert(sizeof(TraceConstants) == 49 * 4, "TraceRootSignature takes 49 root constants");
+// Instance masks: primary rays see the view's geometry, sun rays also the cached geometry, the
+// instanced foliage and the casters of the game's sun shadow map. Light rays leave those casters out:
+// moving objects are among them at the shadow map's level of detail, a coarser copy of the object the
+// view drew, around its surface.
+constexpr UINT ViewMask = 1, CasterMask = 2, FoliageMask = 4, SunCasterMask = 8;
 struct AmbientConstants
 {
     float worldFromClip[16];
-    std::uint32_t size[2], maskedBase[2], materialDraws, frame, halfRays;
+    std::uint32_t size[2], maskedBase[2], frame, halfRays;
 };
-static_assert(sizeof(AmbientConstants) == 23 * 4, "AmbientRootSignature takes 23 root constants");
+static_assert(sizeof(AmbientConstants) == 22 * 4, "AmbientRootSignature takes 22 root constants");
 struct BounceConstants
 {
     float worldFromClip[16], clipFromWorld[16];
     std::uint32_t size[2], maskedBase[2];
     float sun[4];
-    std::uint32_t geometryBase[2][2], materialDraws, frame;
+    std::uint32_t geometryBase[2][2], frame;
 };
-static_assert(sizeof(BounceConstants) == 46 * 4, "BounceRootSignature takes 46 root constants");
+static_assert(sizeof(BounceConstants) == 45 * 4, "BounceRootSignature takes 45 root constants");
 struct BounceFilterConstants
 {
     float worldFromClip[16], previousClipFromWorld[16];
-    std::uint32_t size[2], step, history, final, padding[3];
+    std::uint32_t size[2], step, history, final, maxFrames, clamp, padding;
 };
+enum LightFlags : std::uint32_t { SoftLightShadows = 1, LightBounce = 2 };
+struct LightConstants
+{
+    float worldFromClip[16], clipFromWorld[16];
+    std::uint32_t size[2], maskedBase[2];
+    std::int32_t origin[2];
+    std::uint32_t lightCount, frame;
+    float translation[3];
+    std::uint32_t flags, geometryBase[4];
+};
+static_assert(sizeof(LightConstants) == 48 * 4, "LightsRootSignature takes 48 root constants");
+struct LightTableConstants { std::int32_t rects[MaxLights][4]; };
 // Bend's lighting reads the sun's colour from rows 33 and 140 of its constant buffer in slot 2 and the
 // exposure from row 43, the camera's height from row 53 of slot 1. Copied for the bounced light.
 constexpr std::pair<UINT, UINT> LightingRows[]{{2, 33}, {2, 43}, {2, 140}, {1, 53}};
+constexpr UINT ExposureRow = 43;
 
 // Static geometry the view drew, kept after it leaves the view: Bend draws no trees into its sun
 // shadow maps, so trees behind the camera would stop shadowing what is in front of it. Each cached
@@ -207,7 +262,14 @@ public:
     // A stand-in is a draw the view left to the cache, which holds it.
     struct Draw { std::uint64_t key, object; UINT first, vertices, slot; bool masked, isTemplate{}, standIn{}; };
     // A cached template: its structure, first vertex and coordinate, coverage slot and the frame it came from.
-    struct Template { D3D12_GPU_VIRTUAL_ADDRESS structure; std::uint32_t firstVertex, coordinates, slot; float preViewTranslation[3]; };
+    struct Template
+    {
+        D3D12_GPU_VIRTUAL_ADDRESS structure;
+        std::uint32_t firstVertex, coordinates, slot;
+        float preViewTranslation[3];
+
+        bool operator==(const Template&) const = default;
+    };
 
     GeometryCache(ID3D12Device5* device, UINT vertexCapacity, UINT64 structureBytes);
     // Adds the draws not cached yet, within the frame's budget, and picks the entries to trace: the
@@ -251,10 +313,15 @@ private:
         float preViewTranslation[3]; // Of the frame that drew it
     };
     struct Build { std::list<Entry>::iterator entry; UINT sourceVertex, sourceCoordinate; UINT64 scratchOffset; };
+    // An entry's part of a ring; per ring, a frame's are sorted by offset.
+    struct Room { UINT64 begin, end; };
+    using RingRooms = std::array<std::vector<Room>, 3>;
 
+    static Room roomOf(const Entry& entry, Ring ring);
+    static const Room* firstOverlap(const std::vector<Room>& rooms, Room room);
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS inputs(const Entry& entry, D3D12_RAYTRACING_GEOMETRY_DESC& geometry) const;
-    std::optional<UINT64> allocate(Ring ring, UINT64 size, const std::unordered_set<std::uint64_t>& standIns,
-        const std::unordered_set<std::uint64_t>& casting);
+    RingRooms keptRooms(const std::unordered_set<std::uint64_t>& standIns, const std::unordered_set<std::uint64_t>& casting) const;
+    std::optional<UINT64> allocate(Ring ring, UINT64 size, RingRooms& kept);
     void evict(std::list<Entry>::iterator entry);
 
     ID3D12Device5* device;
@@ -272,8 +339,8 @@ private:
 
 
 std::atomic<View> selected{View::Off};
-std::atomic<bool> sunShadows{}, ambientOcclusion{}, halfAmbientRays{}, replaceCanopyShadows{}, offscreenGeometry{true}, globalIllumination{}, bypassed{},
-    failed{};
+std::atomic<bool> sunShadows{}, ambientOcclusion{}, halfAmbientRays{}, replaceCanopyShadows{}, offscreenGeometry{true}, globalIllumination{},
+    lightShadows{}, softLightShadows{}, lightBounce{}, softSunShadows{}, bypassed{}, failed{};
 std::atomic<std::uint64_t> toggledAt{};
 std::mutex statusMutex;
 Status published;
@@ -305,6 +372,7 @@ struct Capture
     unsigned casterDrawsInView{}, casterDrawsInCache{};
     // Per alpha-tested draw: its first vertex in the alpha-tested range and its coverage slot.
     std::vector<std::array<std::uint32_t, 2>> materialDraws;
+    std::vector<TransformDraw> transformDraws;
     LONGLONG captureTicks{};
     ComPtr<ID3D11Resource> depth;
     unsigned shadowResolveDraws{};
@@ -319,12 +387,25 @@ struct Capture
     struct FoliageDraw { std::uint64_t mesh; ID3D11Buffer* transforms; UINT staged, instances; std::uint64_t templateKey; };
     std::vector<FoliageDraw> foliageDraws;
     UINT foliageIndices{};
+    bool foliagePlaced{}; // The foliage is prepared for this frame's trace, at its first draw
     ComPtr<ID3D11Resource> normals, ambient; // The game's G-buffer normal and ambient occlusion target
     bool ambientRead{}, ambientFiltered{}, ambientInjected{};
-    ComPtr<ID3D11Resource> gbuffer[2]; // Bend's two packed G-buffer targets
+    ComPtr<ID3D11Resource> gbuffer[2]; // Bend's two packed G-buffer targets; the second is the normal
     ComPtr<ID3D11Resource> sceneColor; // The target lighting draws into
     DXGI_FORMAT sceneColorFormat{};
     bool bouncePending{}, bounceAdded{}; // The bounced light waits for lighting to finish, then is added
+    // Local lights: each slot's scissor rectangle, and the target they add to. A light's draws (one per
+    // lighting model) follow its volume's; `lightSlot` is the slot of the light being drawn, NoLightSlot
+    // when the game draws it, and `lightModels` the stencil references it has drawn.
+    std::vector<D3D11_RECT> lightRects;
+    ComPtr<ID3D11Resource> lightTarget;
+    DXGI_FORMAT lightTargetFormat{};
+    bool lightOpen{}, lightVolumeDrawn{};
+    int lightSlot{NoLightSlot};
+    D3D11_RECT lightScissor{};
+    std::uint32_t lightModels{};
+    unsigned tracedLights{}, gameLights{};
+    bool lightsPending{}; // Lights wait in their slots for every light to draw
 } capture;
 
 // Direct3D 12's part of the newest frame it has finished, from its timestamps, in milliseconds.
@@ -345,9 +426,9 @@ struct AmbientGpu
 {
     ComPtr<ID3D11ComputeShader> blur; // The game's BlurAmbientCS
     ComPtr<ID3D11ComputeShader> packShader;
-    // Shared with D3D12 over the view: the game's G-buffer normal, and the traced corners.
-    ComPtr<ID3D11Texture2D> normals, traced;
-    ComPtr<ID3D11ShaderResourceView> normalsView, tracedView;
+    // Shared with D3D12 over the view: the traced corners.
+    ComPtr<ID3D11Texture2D> traced;
+    ComPtr<ID3D11ShaderResourceView> tracedView;
     UINT width{}, height{};
     // The size of the game's target: a copy of it, the traced occlusion packed in its place, and
     // that after the game's blur.
@@ -355,7 +436,7 @@ struct AmbientGpu
     ComPtr<ID3D11ShaderResourceView> gameView, packedView, filteredView;
     ComPtr<ID3D11UnorderedAccessView> packedAccess, filteredAccess;
 
-    ComPtr<ID3D12Resource> normals12, traced12;
+    ComPtr<ID3D12Resource> traced12;
     ID3D12Resource* depth12{}; // The depth copy the descriptors point at
     ComPtr<ID3D12RootSignature> rootSignature;
     ComPtr<ID3D12PipelineState> pipeline;
@@ -367,9 +448,29 @@ struct AmbientGpu
     float milliseconds{};
 };
 
+// A noisy traced signal over the view, accumulated over frames and filtered (shaders::BounceAccumulate,
+// BounceFilter): the sun's bounce, the lights' bounce and the lights' soft shadows each have one.
+struct Denoiser
+{
+    // The accumulation, written to each in turn, with the depth it was last taken at; the filter's
+    // passes take turns too.
+    std::array<ComPtr<ID3D11Texture2D>, 2> history, filtered;
+    std::array<ComPtr<ID3D11ShaderResourceView>, 2> historyViews, filteredViews;
+    std::array<ComPtr<ID3D11UnorderedAccessView>, 2> historyAccess, filteredAccess;
+    ComPtr<ID3D11Texture2D> previousDepth;
+    ComPtr<ID3D11ShaderResourceView> previousDepthView;
+    UINT width{}, height{};
+    UINT current{}; // The history written next
+    UINT64 usedIn{}; // The frame (Gpu::frames) it last took: history carries over only from the frame before
+    bool historyValid{};
+    float previousClipFromWorld[16]{}, previousTranslation[3]{};
+    ID3D11ShaderResourceView* output{}; // The last pass's
+};
+
 // Sunlight bounced once off the captured geometry, created on first use. Direct3D 12 traces a ray
-// per pixel into `traced`; Direct3D 11 accumulates those over frames and filters them into
-// filtered[0], which is added to the scene once lighting has drawn.
+// per pixel into `traced`; Direct3D 11 accumulates and filters those, and the result is added to the
+// scene once lighting has drawn. The game's diffuse colours copied here also serve the local lights'
+// bounce, and the filter their soft shadows too.
 struct BounceGpu
 {
     ComPtr<ID3D11ComputeShader> surfaceShader, accumulateShader, filterShader;
@@ -378,26 +479,18 @@ struct BounceGpu
     ComPtr<ID3D11Buffer> constants;
     ComPtr<ID3D11Buffer> lighting; // LightingRows of this frame's lighting constants
     ComPtr<ID3D11ShaderResourceView> lightingView;
-    ComPtr<ID3D11ShaderResourceView> gbufferViews[2], stencilView; // Of the game's textures
-    // Shared with D3D12 over the view: the game's normals and diffuse colours, and the traced bounce.
-    ComPtr<ID3D11Texture2D> normals, albedo, traced;
-    ComPtr<ID3D11ShaderResourceView> normalsView, albedoView, tracedView;
-    ComPtr<ID3D11UnorderedAccessView> normalsAccess, albedoAccess;
+    ComPtr<ID3D11ShaderResourceView> gbufferView, stencilView; // Of the game's textures
+    // Shared with D3D12 over the view: the game's diffuse colours, and the traced bounce.
+    ComPtr<ID3D11Texture2D> albedo, traced;
+    ComPtr<ID3D11ShaderResourceView> albedoView, tracedView;
+    ComPtr<ID3D11UnorderedAccessView> albedoAccess;
     UINT width{}, height{};
     ID3D11Texture2D* depth{}; // The depth copy depthView and the descriptors point at
     ComPtr<ID3D11ShaderResourceView> depthView;
-    // The accumulation, written to each in turn, with the depth it was last taken at; the filter's
-    // passes take turns too.
-    std::array<ComPtr<ID3D11Texture2D>, 2> history, filtered;
-    std::array<ComPtr<ID3D11ShaderResourceView>, 2> historyViews, filteredViews;
-    std::array<ComPtr<ID3D11UnorderedAccessView>, 2> historyAccess, filteredAccess;
-    ComPtr<ID3D11Texture2D> previousDepth;
-    ComPtr<ID3D11ShaderResourceView> previousDepthView;
-    UINT current{}; // The history written next
-    bool historyValid{};
-    float previousClipFromWorld[16]{}, previousTranslation[3]{};
+    Denoiser denoiser;
+    bool surfaces{}; // This frame's diffuse colours are copied and its normals known
 
-    ComPtr<ID3D12Resource> normals12, albedo12, traced12;
+    ComPtr<ID3D12Resource> albedo12, traced12;
     ComPtr<ID3D12RootSignature> rootSignature;
     ComPtr<ID3D12PipelineState> pipeline;
     ComPtr<ID3D12DescriptorHeap> descriptors;
@@ -406,6 +499,55 @@ struct BounceGpu
     std::array<bool, FramesInFlight> recorded{};
     bool tracing{}; // The frame being traced includes the bounce
     float milliseconds{};
+};
+
+// The game's local lights shadowed by rays, created on first use. Each light the game draws goes,
+// without the game's shadow, into a slot of its own the size of the scene colour, and its constants
+// into `constants`. Once every light has drawn, Direct3D 12 traces toward them: per pixel the lights
+// summed unshadowed, the share of them that reaches it, and with bounce light the light they bounce
+// toward it. Direct3D 11 filters those with soft shadows and bounce light, and adds the result to the
+// scene colour.
+struct LightsGpu
+{
+    ComPtr<ID3D11ComputeShader> tableShader;
+    ComPtr<ID3D11PixelShader> addShader;
+    ComPtr<ID3D11BlendState> additive;
+    ComPtr<ID3D11Buffer> constants, tableConstants;
+    ComPtr<ID3D11ShaderResourceView> constantsView;
+    // Bound in place of the game's shadow maps, lit whichever way they are read: shadow maps far
+    // beyond any depth and baked shadow volumes at 1. Cube maps are compared by a sampler; `near`
+    // passes the comparisons that pass toward greater depths.
+    ComPtr<ID3D11ShaderResourceView> litMap, litCube, litCubeNear, litVolume;
+    // Shared with D3D12: the slots, the light table (LightTable) and the traced images over the view.
+    std::array<ComPtr<ID3D11Texture2D>, MaxLights> slots;
+    std::array<ComPtr<ID3D11RenderTargetView>, MaxLights> slotTargets;
+    std::array<ComPtr<ID3D12Resource>, MaxLights> slots12;
+    ComPtr<ID3D11Texture2D> table, visibility, unshadowed, bounced;
+    ComPtr<ID3D11UnorderedAccessView> tableAccess;
+    ComPtr<ID3D11ShaderResourceView> visibilityView, unshadowedView, bouncedView;
+    UINT width{}, height{};
+    ComPtr<ID3D12Resource> table12, visibility12, unshadowed12, bounced12;
+    ID3D12Resource* depth12{}; // The depth copy the descriptors point at
+    ID3D12Resource* albedo12{}; // The bounce's diffuse colours they point at
+    Denoiser shadows, bounce;
+
+    ComPtr<ID3D12RootSignature> rootSignature;
+    ComPtr<ID3D12PipelineState> pipeline;
+    ComPtr<ID3D12DescriptorHeap> descriptors;
+    ComPtr<ID3D12QueryHeap> timestamps;
+    ComPtr<ID3D12Resource> timestampReadback;
+    std::array<bool, FramesInFlight> recorded{};
+    float milliseconds{};
+};
+
+// A mesh's template with its reference tree inverted: a tree is placed by M_tree inverse(M_reference),
+// and by the camera's movement since the template was cached.
+struct FoliageReference
+{
+    GeometryCache::Template entry;
+    double inverse[3][3], origin[3];
+
+    bool operator==(const FoliageReference&) const = default;
 };
 
 // Everything created while a view or feature is on.
@@ -419,7 +561,18 @@ struct Gpu
     ComPtr<ID3D11ShaderResourceView> streamedView;
     ComPtr<ID3D11Texture2D> positions, traced, sunlit, depthCopy;
     ComPtr<ID3D11UnorderedAccessView> positionsAccess, depthCopyAccess;
-    ComPtr<ID3D11ShaderResourceView> tracedView, sunlitView, depthView, shadowView;
+    ComPtr<ID3D11ShaderResourceView> tracedView, sunlitView, depthView, shadowView, depthCopyView;
+    // Soft sun shadows: each pixel's sun ray across the disc, shared with D3D12, and filtered.
+    ComPtr<ID3D11Texture2D> sunSoft;
+    ComPtr<ID3D11ShaderResourceView> sunSoftView;
+    ID3D11ShaderResourceView* sunFiltered{}; // This frame's, when soft
+    Denoiser sunDenoiser;
+    // The game's G-buffer normal over the view, shared with D3D12 for every feature's rays and filters;
+    // 0, unknown, where the game drew sky or in frames without it.
+    ComPtr<ID3D11Texture2D> normals;
+    ComPtr<ID3D11ShaderResourceView> normalsView;
+    ComPtr<ID3D11UnorderedAccessView> normalsAccess;
+    bool normalsKnown{}; // This frame's are copied
     ID3D11Resource* depthResource{}; // The game's depth texture behind depthView
     ComPtr<ID3D11Texture2D> shadowCopy; // The game's sun shadow as its resolve passes left it
     UINT tracedWidth{}, tracedHeight{};
@@ -429,8 +582,8 @@ struct Gpu
     ComPtr<ID3D11BlendState> redOnly;
     ComPtr<ID3D11Buffer> positionConstants, regionConstants, compositeConstants, bakeConstants, bakeLevel;
     // Alpha-tested geometry: streamed vertices, their coordinates for D3D12, and the coverage atlas.
-    ComPtr<ID3D11Buffer> maskedStreamed;
-    ComPtr<ID3D11ShaderResourceView> maskedStreamedView, bakeView;
+    ComPtr<ID3D11Buffer> maskedStreamed, transformRows, transformDraws, materialDraws;
+    ComPtr<ID3D11ShaderResourceView> maskedStreamedView, bakeView, transformRowsView, transformDrawsView, materialDrawsView;
     ComPtr<ID3D11Texture2D> coordinates, coverage, bakeDepth;
     ComPtr<ID3D11UnorderedAccessView> coordinatesAccess, coverageAccess;
     ComPtr<ID3D11DepthStencilView> bakeTarget;
@@ -467,35 +620,53 @@ struct Gpu
     ComPtr<ID3D12GraphicsCommandList4> list;
     ComPtr<ID3D12Fence> d3d12Fence;
     std::unique_ptr<void, EventCloser> event;
-    ComPtr<ID3D12Resource> positions12, traced12, sunlit12, depthCopy12, coordinates12, coverage12, vertices, bottom, casterBottom, top, scratch,
-        instances;
-    ComPtr<ID3D12Resource> materialTable; // Per frame in flight: the frame's alpha-tested draws
-    ComPtr<ID3D12Resource> cacheTable;    // Per frame in flight: the traced cached draws' coordinates and slots
+    ComPtr<ID3D12Resource> positions12, traced12, sunlit12, sunSoft12, depthCopy12, normals12, coordinates12, coverage12, vertices, bottom,
+        casterBottom, top, scratch, instances;
+    ComPtr<ID3D12Resource> cacheTable; // Per frame in flight: the traced cached draws' coordinates and slots
     std::unique_ptr<GeometryCache> cache, templates;
     bool cacheReset{}; // The coverage atlas started again; cached slots are stale
     std::unordered_map<ID3D11Buffer*, bool> staticBuffers; // Constant buffers by whether they are static
     std::unordered_set<std::uint64_t> movers;              // Objects drawn with velocity: never cached
-    // Foliage: per transform buffer its transforms and the meshes each instance was last drawn with (a
-    // tree is a draw per section: trunk, branches, leaves); per mesh the cached template and the instance
-    // it shows; the visible lists read back over the frames in flight.
+    // Foliage: per transform buffer its transforms, the meshes each instance was last drawn with, and
+    // the trees near the camera or seen lately with their sections placed; per mesh the cached template,
+    // the instance it shows and the reference the trees were last placed by; the visible lists of every
+    // FoliageLatency-th frame, read back one at a time.
+    struct TreeMeshes { std::array<std::uint64_t, MaxTreeSections> keys; std::uint32_t count; };
+    // A tree's sections placed without the camera's position, and what they were placed from.
+    struct LiveTree
+    {
+        std::uint32_t index;
+        TreeMeshes meshes;
+        UINT64 loadedFrame;
+
+        std::array<D3D12_RAYTRACING_INSTANCE_DESC, MaxTreeSections> sections;
+        std::array<std::array<std::uint32_t, 2>, MaxTreeSections> table;
+        std::uint32_t count;
+    };
     struct FoliageTrees
     {
         ComPtr<ID3D11Buffer> source, staging;
         std::vector<std::array<float, 12>> transforms;
-        std::vector<std::vector<std::uint64_t>> meshes;
-        std::vector<UINT64> seenIn; // Per instance: the read-back its meshes come from
-        std::vector<std::uint32_t> seen; // The instances seen at least once, of many more
+        std::vector<TreeMeshes> meshes;
+        std::vector<UINT64> seenIn; // Per instance: the read-back its meshes come from; 0 while not live
+        std::vector<LiveTree> live; // Of many more instances
         bool pending{};
         UINT64 loadedFrame{};
     };
     std::unordered_map<ID3D11Buffer*, FoliageTrees> foliage;
-    struct FoliageTemplate { std::uint64_t cacheKey; ID3D11Buffer* transforms; UINT reference; };
+    struct FoliageTemplate { std::uint64_t cacheKey; ID3D11Buffer* transforms; UINT reference; std::optional<FoliageReference> placedBy; };
     std::unordered_map<std::uint64_t, FoliageTemplate> foliageTemplates;
-    std::unordered_set<std::uint64_t> nearFoliage; // The meshes of the trees within AmbientFoliageRadius
     struct FoliageReadback { ComPtr<ID3D11Buffer> staging; std::vector<Capture::FoliageDraw> draws; bool pending{}; };
-    std::array<FoliageReadback, FoliageLatency> foliageReadbacks;
-    UINT foliageNext{};
+    FoliageReadback foliageReadback;
     UINT64 foliageReads{}; // Read-backs taken in so far
+    UINT64 foliageSectionsIgnored{}; // Past MaxTreeSections, so far
+    // The placed foliage, kept until what it is placed from changes: the instances without the camera's
+    // position, nearest first when they may not all fit, their table entries, and the templates they
+    // were placed from (cache key and structure).
+    bool foliageChanged{}; // What the trees are placed from changed: they are placed again at a frame's first draw
+    std::vector<D3D12_RAYTRACING_INSTANCE_DESC> foliagePlaced;
+    std::vector<std::array<std::uint32_t, 2>> foliageTable;
+    std::vector<std::pair<std::uint64_t, D3D12_GPU_VIRTUAL_ADDRESS>> foliageStructures;
     UINT foliageInstances{}; // Traced last frame
     UINT64 bottomSize{}, casterBottomSize{}, scratchSize{};
     ComPtr<ID3D12RootSignature> rootSignature;
@@ -509,8 +680,10 @@ struct Gpu
     // The add-on's Direct3D 11 passes, and their times in the newest frame the GPU has finished.
     std::unique_ptr<PassTimer> timer;
     PassTimer::Milliseconds passes{};
+    TraceConstants lastTrace; // This frame's, which the lights' rays share
     AmbientGpu ambient;
     BounceGpu bounce;
+    LightsGpu lights;
 };
 std::unique_ptr<Gpu> gpu;
 std::uint64_t tracedFrames{};
@@ -529,9 +702,32 @@ float millisecondsSince(LONGLONG ticks)
     return static_cast<float>(static_cast<double>(ticks) * 1000.0 / static_cast<double>(frequency.QuadPart));
 }
 
-// The render thread's time in trace() this frame, and the part of it spent waiting for the GPU to
-// finish the frame that last used the same slot.
+// The render thread's time in trace(), traceLights() and placing the foliage this frame, and the part
+// of it spent waiting for the GPU to finish the frame that last used the same slot.
 LONGLONG traceTicks{}, gpuWaitTicks{};
+// Parts of traceTicks, as Costs describes them.
+LONGLONG foliageTicks{}, instancesTicks{}, flushTicks{}, submitTicks{}, prepareTicks{};
+// Adds the time until it goes out of scope to traceTicks, however the scope ends.
+struct TraceTime
+{
+    LONGLONG start = ticksNow();
+    ~TraceTime() { traceTicks += ticksNow() - start; }
+};
+// Splits a stretch of code into parts: each lap adds the time since the last one (or since the start)
+// to that part's ticks, and restart() leaves the time since the last lap to no part.
+struct Stopwatch
+{
+    LONGLONG start = ticksNow();
+
+    void lap(LONGLONG& ticks)
+    {
+        const auto now = ticksNow();
+        ticks += now - start;
+        start = now;
+    }
+
+    void restart() { start = ticksNow(); }
+};
 LONGLONG lastPresent{};
 Costs costs; // Averaged; kept while the GPU resources are released, for the frame time
 std::atomic<bool> performanceOverlay{};
@@ -588,6 +784,10 @@ Features activeFeatures()
         result.halfAmbientRays = halfAmbientRays;
         result.replaceCanopyShadows = replaceCanopyShadows;
         result.globalIllumination = globalIllumination;
+        result.lightShadows = lightShadows;
+        result.softLightShadows = softLightShadows;
+        result.lightBounce = lightBounce;
+        result.softSunShadows = softSunShadows;
     }
     return result;
 }
@@ -603,6 +803,14 @@ bool ambientWanted()
 bool bounceWanted()
 {
     return activeFeatures().globalIllumination || selected == View::GlobalIllumination;
+}
+
+// The local lights' soft shadows and bounce are filtered along the game's normals, and the bounce
+// takes the game's diffuse colours.
+bool lightSurfacesWanted()
+{
+    const auto features = activeFeatures();
+    return features.lightShadows && (features.softLightShadows || features.lightBounce);
 }
 
 // Inverts a 4x4 matrix in double precision; false when it is singular.
@@ -678,8 +886,17 @@ ComPtr<ID3D11Buffer> constantBuffer(ID3D11Device* device, UINT size)
     return buffer;
 }
 
+// At 4K the video memory manager demoted the capture memory to system memory for minutes at a time,
+// making the copy and the builds many times slower; this hint asks it to evict other memory first.
+void preferResident(ID3D11Resource* resource)
+{
+    ComPtr<IDXGIResource> dxgi;
+    if (SUCCEEDED(resource->QueryInterface(IID_PPV_ARGS(&dxgi)))) dxgi->SetEvictionPriority(DXGI_RESOURCE_PRIORITY_HIGH);
+}
+
 // Only textures can be shared from Direct3D 11 to 12, and only when Direct3D 11 creates them.
-ComPtr<ID3D11Texture2D> sharedTexture(ID3D11Device* device, UINT width, UINT height, DXGI_FORMAT format, const char* name)
+ComPtr<ID3D11Texture2D> sharedTexture(ID3D11Device* device, UINT width, UINT height, DXGI_FORMAT format, const char* name,
+    UINT bindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS)
 {
     D3D11_TEXTURE2D_DESC description{};
     description.Width = width;
@@ -688,10 +905,11 @@ ComPtr<ID3D11Texture2D> sharedTexture(ID3D11Device* device, UINT width, UINT hei
     description.ArraySize = 1;
     description.Format = format;
     description.SampleDesc.Count = 1;
-    description.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+    description.BindFlags = bindFlags;
     description.MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
     ComPtr<ID3D11Texture2D> texture;
     check(device->CreateTexture2D(&description, nullptr, texture.GetAddressOf()), name);
+    preferResident(texture.Get());
     return texture;
 }
 
@@ -769,7 +987,9 @@ ID3D11ShaderResourceView* gameDepth(Gpu& g, ID3D11Resource* depth)
 
 // ---- Direct3D 12 ----
 
-ComPtr<ID3D12Resource> buffer(ID3D12Device* device, UINT64 size, D3D12_HEAP_TYPE heap, D3D12_RESOURCE_STATES state,
+// Video memory is marked high priority for residency because the video memory manager demoted it to
+// system memory at 4K (see preferResident); upload and readback heaps live there by design.
+ComPtr<ID3D12Resource> buffer(ID3D12Device1* device, UINT64 size, D3D12_HEAP_TYPE heap, D3D12_RESOURCE_STATES state,
     D3D12_RESOURCE_FLAGS flags, const char* name)
 {
     const D3D12_HEAP_PROPERTIES properties{heap};
@@ -784,6 +1004,14 @@ ComPtr<ID3D12Resource> buffer(ID3D12Device* device, UINT64 size, D3D12_HEAP_TYPE
     description.Flags = flags;
     ComPtr<ID3D12Resource> resource;
     check(device->CreateCommittedResource(&properties, D3D12_HEAP_FLAG_NONE, &description, state, nullptr, IID_PPV_ARGS(&resource)), name);
+
+    if (heap == D3D12_HEAP_TYPE_DEFAULT)
+    {
+        ID3D12Pageable* pageable = resource.Get();
+        const auto priority = D3D12_RESIDENCY_PRIORITY_HIGH;
+        device->SetResidencyPriority(1, &pageable, &priority);
+    }
+
     return resource;
 }
 
@@ -829,16 +1057,17 @@ D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS topInputs(D3D12_GPU_VIRTUAL
     return inputs;
 }
 
-// Reads the visible instance lists and transforms the GPU has copied by now.
+// Reads the visible instance lists and transforms the GPU has copied by now; the trees are placed again
+// once either lands. A tree seen while it is not live, for the first time or again after it left,
+// becomes live.
 void readFoliage(Gpu& g)
 {
-    for (auto& readback : g.foliageReadbacks)
+    auto& readback = g.foliageReadback;
+    D3D11_MAPPED_SUBRESOURCE lists{};
+    if (readback.pending && g.context->Map(readback.staging.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &lists) == S_OK)
     {
-        D3D11_MAPPED_SUBRESOURCE mapped{};
-        if (!readback.pending || g.context->Map(readback.staging.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped) != S_OK) continue;
-
         // A tree seen this frame is drawn with this frame's meshes: its level of detail may have changed.
-        const auto* indices = static_cast<const std::uint32_t*>(mapped.pData);
+        const auto* indices = static_cast<const std::uint32_t*>(lists.pData);
         const auto read = ++g.foliageReads;
         for (const auto& draw : readback.draws)
         {
@@ -854,10 +1083,14 @@ void readFoliage(Gpu& g)
                 const auto previous = std::exchange(trees->second.seenIn[index], read);
                 if (previous != read)
                 {
-                    if (!previous) trees->second.seen.push_back(index);
-                    meshes.clear();
+                    if (!previous) trees->second.live.push_back({index});
+                    meshes.count = 0;
                 }
-                if (std::find(meshes.begin(), meshes.end(), draw.mesh) == meshes.end()) meshes.push_back(draw.mesh);
+                const auto end = meshes.keys.begin() + meshes.count;
+                if (std::find(meshes.keys.begin(), end, draw.mesh) != end) continue;
+
+                if (meshes.count == MaxTreeSections) ++g.foliageSectionsIgnored;
+                else meshes.keys[meshes.count++] = draw.mesh;
             }
             const auto found = g.foliageTemplates.find(draw.mesh);
             if (draw.templateKey && found != g.foliageTemplates.end() && found->second.cacheKey == draw.templateKey)
@@ -865,6 +1098,7 @@ void readFoliage(Gpu& g)
         }
         g.context->Unmap(readback.staging.Get(), 0);
         readback.pending = false;
+        g.foliageChanged = true;
     }
     for (auto& [buffer, trees] : g.foliage)
     {
@@ -876,12 +1110,9 @@ void readFoliage(Gpu& g)
         g.context->Unmap(trees.staging.Get(), 0);
         trees.pending = false;
         trees.loadedFrame = g.frames;
+        g.foliageChanged = true;
     }
 }
-
-// A mesh's template with its reference tree inverted: a tree is placed by M_tree inverse(M_reference),
-// and by the camera's movement since the template was cached.
-struct FoliageReference { GeometryCache::Template entry; double inverse[3][3], origin[3]; };
 
 std::optional<FoliageReference> foliageReference(const Gpu& g, const Gpu::FoliageTemplate& model, const GeometryCache::Template& entry)
 {
@@ -904,12 +1135,14 @@ std::optional<FoliageReference> foliageReference(const Gpu& g, const Gpu::Foliag
     return result;
 }
 
-D3D12_RAYTRACING_INSTANCE_DESC placeTree(const std::array<float, 12>& tree, const FoliageReference& reference, const float (&camera)[3])
+// A section of a tree, without the camera's position: the frame's preViewTranslation is added to the
+// translation as the tree is traced.
+D3D12_RAYTRACING_INSTANCE_DESC placeSection(const std::array<float, 12>& tree, const FoliageReference& reference)
 {
     D3D12_RAYTRACING_INSTANCE_DESC instance{};
     for (int r = 0; r < 3; ++r)
     {
-        double moved = tree[r * 4 + 3] + camera[r];
+        double moved = tree[r * 4 + 3];
         for (int c = 0; c < 3; ++c)
         {
             const double a = tree[r * 4] * reference.inverse[0][c] + tree[r * 4 + 1] * reference.inverse[1][c] + tree[r * 4 + 2] * reference.inverse[2][c];
@@ -925,72 +1158,165 @@ D3D12_RAYTRACING_INSTANCE_DESC placeTree(const std::array<float, 12>& tree, cons
     return instance;
 }
 
+// Places a live tree's sections, each by the reference its mesh's template was last resolved to.
+void placeTree(const Gpu& g, const Gpu::FoliageTrees& trees, Gpu::LiveTree& tree)
+{
+    const auto& meshes = trees.meshes[tree.index];
+    tree.meshes = meshes;
+    tree.loadedFrame = trees.loadedFrame;
+    tree.count = 0;
+    for (UINT s = 0; s < meshes.count; ++s)
+    {
+        const auto model = g.foliageTemplates.find(meshes.keys[s]);
+        if (model == g.foliageTemplates.end() || !model->second.placedBy) continue;
+
+        const auto& reference = *model->second.placedBy;
+        tree.sections[tree.count] = placeSection(trees.transforms[tree.index], reference);
+        tree.table[tree.count] = {reference.entry.coordinates, reference.entry.slot | TemplateCoordinates};
+        ++tree.count;
+    }
+}
+
 // The trees near the camera or seen lately, each section of each an instance of its mesh's template.
 // The view leaves the trees it draws to these copies, at any distance. Bend culls far trees by
 // occlusion, so they drop out of its lists now and then: a far tree stays for some seconds after it
-// was last seen, or its shadow would come and go with the read-backs' lag. Past the capacity, the
-// farthest trees go.
-UINT writeFoliage(Gpu& g, D3D12_RAYTRACING_INSTANCE_DESC* instances, std::uint32_t (*table)[2], UINT capacity, const float (&camera)[3])
+// was last seen, or its shadow would come and go with the read-backs' lag. A tree that is neither
+// stops being live until it is seen again. Past the capacity, the farthest trees go.
+// A tree is placed once, without the camera's position, and again only when its meshes, its
+// transforms or one of its meshes' templates change; writeInstances adds the camera's position each
+// frame. This runs only when one of those may have changed, every few frames while trees are drawn:
+// the camera moves little in between, so the trees are kept and ordered by where it was then.
+void placeFoliage(Gpu& g, const Capture& frame)
 {
-    struct NearTree { double distance; const Gpu::FoliageTrees* trees; std::size_t index; };
+    g.foliagePlaced.clear();
+    g.foliageTable.clear();
+    g.foliageStructures.clear();
+
+    // Each mesh's template is resolved afresh, noting the meshes whose trees are placed again.
+    // Templates the cache has dropped or never added are taken again.
+    std::vector<std::uint64_t> changed;
+    for (auto model = g.foliageTemplates.begin(); model != g.foliageTemplates.end();)
+    {
+        auto& [mesh, foliageTemplate] = *model;
+        std::optional<FoliageReference> reference;
+        if (foliageTemplate.reference != NoInstance)
+        {
+            const auto entry = g.templates->find(foliageTemplate.cacheKey);
+            if (!entry)
+            {
+                changed.push_back(mesh);
+                model = g.foliageTemplates.erase(model);
+                continue;
+            }
+            reference = foliageReference(g, foliageTemplate, *entry);
+        }
+        if (reference != foliageTemplate.placedBy) changed.push_back(mesh);
+        if (reference) g.foliageStructures.push_back({foliageTemplate.cacheKey, reference->entry.structure});
+        foliageTemplate.placedBy = reference;
+        ++model;
+    }
+    std::ranges::sort(changed);
+
+    const auto& camera = frame.preViewTranslation;
+    struct NearTree { double distance; const Gpu::LiveTree* tree; };
     std::vector<NearTree> nearby;
     std::size_t sections{};
-    for (const auto& [buffer, trees] : g.foliage)
-        for (const auto i : trees.seen)
+    for (auto& [buffer, trees] : g.foliage)
+    {
+        std::size_t kept{};
+        for (std::size_t t = 0; t < trees.live.size(); ++t)
         {
-            if (i >= trees.transforms.size()) continue;
+            const auto i = trees.live[t].index;
+            const bool loaded = i < trees.transforms.size();
+            double distance{};
+            if (loaded)
+            {
+                const auto& transform = trees.transforms[i];
+                const double position[3]{transform[3] + camera[0], transform[7] + camera[1], transform[11] + camera[2]};
+                distance = position[0] * position[0] + position[1] * position[1] + position[2] * position[2];
+            }
+            const bool withinRadius = loaded && distance <= double{FoliageRadius} * FoliageRadius;
+            if (!withinRadius && trees.seenIn[i] + FoliageMemory < g.foliageReads)
+            {
+                trees.seenIn[i] = 0;
+                continue;
+            }
 
-            const auto& tree = trees.transforms[i];
-            const double position[3]{tree[3] + camera[0], tree[7] + camera[1], tree[11] + camera[2]};
-            const double distance = position[0] * position[0] + position[1] * position[1] + position[2] * position[2];
-            const bool seenLately = trees.seenIn[i] + FoliageMemory >= g.foliageReads;
-            if (!seenLately && distance > double{FoliageRadius} * FoliageRadius) continue;
+            if (kept != t) trees.live[kept] = trees.live[t];
+            auto& tree = trees.live[kept++];
+            if (!loaded) continue;
 
-            nearby.push_back({distance, &trees, i});
-            sections += trees.meshes[i].size();
+            // The meshes are compared as a set: the order of the draws they come from may change.
+            const auto& meshes = trees.meshes[i];
+            const auto end = meshes.keys.begin() + meshes.count;
+            const bool meshesChanged = !std::is_permutation(meshes.keys.begin(), end, tree.meshes.keys.begin(),
+                tree.meshes.keys.begin() + tree.meshes.count);
+            const bool templateChanged = std::any_of(meshes.keys.begin(), end,
+                [&](std::uint64_t mesh) { return std::ranges::binary_search(changed, mesh); });
+            if (meshesChanged || tree.loadedFrame != trees.loadedFrame || templateChanged) placeTree(g, trees, tree);
+            nearby.push_back({distance, &tree});
+            sections += tree.count;
         }
-    if (sections > capacity)
+        trees.live.resize(kept);
+    }
+    // Beyond the room every frame has, whatever the cache traces, the nearest come first.
+    if (sections > MaxFoliageInstances)
         std::sort(nearby.begin(), nearby.end(), [](const NearTree& a, const NearTree& b) { return a.distance < b.distance; });
 
-    std::vector<std::uint64_t> stale;
-    const auto resolve = [&](std::uint64_t mesh) -> std::optional<FoliageReference>
+    for (const auto& [distance, tree] : nearby)
+        for (UINT s = 0; s < tree->count && g.foliagePlaced.size() < MaxInstances - 2; ++s)
+        {
+            g.foliagePlaced.push_back(tree->sections[s]);
+            g.foliageTable.push_back(tree->table[s]);
+        }
+}
+
+// Reads the visible lists that have landed and, when what the trees are placed from has changed,
+// places them, at the frame's first draw: before anything is captured, while the GPU is still busy
+// with the frame before. The trees are placed the frame after a read-back lands, so the two halves of
+// the work fall in different frames. Without the camera's position the trace drops the templates; the
+// trees wait for them.
+void prepareFoliage(Gpu& g, const Capture& frame)
+{
+    const TraceTime time;
+    Stopwatch stopwatch;
+    const bool place = offscreenGeometry && frame.cameraKnown && std::exchange(g.foliageChanged, false);
+    readFoliage(g);
+    if (place) placeFoliage(g, frame);
+    stopwatch.lap(foliageTicks);
+}
+
+// The foliage is placed before the trace adds the frame's templates, which may evict some it was
+// placed from. Their copies are left out from this frame on; the trees are placed again in the next.
+void dropEvictedFoliage(Gpu& g)
+{
+    std::vector<D3D12_GPU_VIRTUAL_ADDRESS> evicted;
+    for (const auto& [key, structure] : g.foliageStructures)
     {
-        const auto model = g.foliageTemplates.find(mesh);
-        if (model == g.foliageTemplates.end() || model->second.reference == NoInstance) return std::nullopt;
+        const auto entry = g.templates->find(key);
+        if (!entry || entry->structure != structure) evicted.push_back(structure);
+    }
+    if (evicted.empty()) return;
 
-        const auto entry = g.templates->find(model->second.cacheKey);
-        if (!entry)
-        {
-            stale.push_back(mesh);
-            return std::nullopt;
-        }
-        return foliageReference(g, model->second, *entry);
-    };
-    std::unordered_map<std::uint64_t, std::optional<FoliageReference>> references;
-    g.nearFoliage.clear();
-    UINT count{};
-    for (const auto& [distance, trees, i] : nearby)
-        for (const auto mesh : trees->meshes[i])
-        {
-            if (distance < double{AmbientFoliageRadius} * AmbientFoliageRadius) g.nearFoliage.insert(mesh);
-            auto reference = references.find(mesh);
-            if (reference == references.end()) reference = references.emplace(mesh, resolve(mesh)).first;
-            if (!reference->second || count == capacity) continue;
+    std::ranges::sort(evicted);
+    std::size_t kept{};
+    for (std::size_t i = 0; i < g.foliagePlaced.size(); ++i)
+    {
+        if (std::ranges::binary_search(evicted, g.foliagePlaced[i].AccelerationStructure)) continue;
 
-            instances[count] = placeTree(trees->transforms[i], *reference->second, camera);
-            table[count][0] = reference->second->entry.coordinates;
-            table[count][1] = reference->second->entry.slot | TemplateCoordinates;
-            ++count;
-        }
-    // Templates the cache has dropped or never added are taken again.
-    for (const auto mesh : stale) g.foliageTemplates.erase(mesh);
-    return count;
+        g.foliagePlaced[kept] = g.foliagePlaced[i];
+        g.foliageTable[kept++] = g.foliageTable[i];
+    }
+    g.foliagePlaced.resize(kept);
+    g.foliageTable.resize(kept);
+    g.foliageChanged = true;
 }
 
 // A frame's instances: the view's geometry and the shadow casters, each in its own bottom-level
 // structure (possibly empty), then, with the off-screen geometry, the cached draws the view did not
-// draw and the foliage. Returns their number.
-UINT writeInstances(Gpu& g, UINT slot, const float (&camera)[3])
+// draw and as much of the placed foliage as there is room for, moved by the frame's camera position.
+// Returns their number.
+UINT writeInstances(Gpu& g, UINT slot, const float (&preViewTranslation)[3])
 {
     D3D12_RAYTRACING_INSTANCE_DESC* instances{};
     std::uint32_t (*table)[2]{};
@@ -998,7 +1324,7 @@ UINT writeInstances(Gpu& g, UINT slot, const float (&camera)[3])
     check(g.cacheTable->Map(0, nullptr, reinterpret_cast<void**>(&table)), "Writing the cached draws");
     instances += UINT64{slot} * MaxInstances;
     table += UINT64{slot} * (MaxInstances - 2);
-    const std::pair<ID3D12Resource*, UINT> structures[]{{g.bottom.Get(), ViewMask}, {g.casterBottom.Get(), CasterMask}};
+    const std::pair<ID3D12Resource*, UINT> structures[]{{g.bottom.Get(), ViewMask}, {g.casterBottom.Get(), SunCasterMask}};
     // The instances' masks and IDs are bit fields: setting one reads the word back, and reading the
     // write-combined upload heap is very slow. Each instance is made aside and copied in whole.
     for (UINT i = 0; i < 2; ++i)
@@ -1011,7 +1337,17 @@ UINT writeInstances(Gpu& g, UINT slot, const float (&camera)[3])
         instances[i] = instance;
     }
     const auto cached = offscreenGeometry ? g.cache->write(instances + 2, table) : 0;
-    g.foliageInstances = offscreenGeometry ? writeFoliage(g, instances + 2 + cached, table + cached, MaxInstances - 2 - cached, camera) : 0;
+    g.foliageInstances = offscreenGeometry ? static_cast<UINT>(std::min<std::size_t>(g.foliagePlaced.size(), MaxInstances - 2 - cached)) : 0;
+    if (g.foliageInstances)
+    {
+        for (UINT i = 0; i < g.foliageInstances; ++i)
+        {
+            auto instance = g.foliagePlaced[i];
+            for (int r = 0; r < 3; ++r) instance.Transform[r][3] += preViewTranslation[r];
+            instances[2 + cached + i] = instance;
+        }
+        std::memcpy(table + cached, g.foliageTable.data(), g.foliageInstances * sizeof(*table));
+    }
     g.cacheTable->Unmap(0, nullptr);
     g.instances->Unmap(0, nullptr);
     return 2 + cached + g.foliageInstances;
@@ -1099,6 +1435,7 @@ std::unique_ptr<Gpu> create(ID3D11DeviceContext* context)
     streamed.BindFlags = D3D11_BIND_STREAM_OUTPUT | D3D11_BIND_SHADER_RESOURCE;
     streamed.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
     check(g.device->CreateBuffer(&streamed, nullptr, g.streamed.GetAddressOf()), "Creating the stream-output buffer");
+    preferResident(g.streamed.Get());
     D3D11_SHADER_RESOURCE_VIEW_DESC raw{};
     raw.Format = DXGI_FORMAT_R32_TYPELESS;
     raw.ViewDimension = D3D11_SRV_DIMENSION_BUFFEREX;
@@ -1109,9 +1446,25 @@ std::unique_ptr<Gpu> create(ID3D11DeviceContext* context)
     check(g.device->CreateUnorderedAccessView(g.positions.Get(), nullptr, g.positionsAccess.GetAddressOf()), "Creating the positions view");
     streamed.ByteWidth = MaskedCapacity * MaskedVertexBytes;
     check(g.device->CreateBuffer(&streamed, nullptr, g.maskedStreamed.GetAddressOf()), "Creating the alpha-tested stream-output buffer");
+    preferResident(g.maskedStreamed.Get());
     raw.BufferEx.NumElements = streamed.ByteWidth / 4;
     check(g.device->CreateShaderResourceView(g.maskedStreamed.Get(), &raw, g.maskedStreamedView.GetAddressOf()),
         "Creating the alpha-tested stream-output view");
+    const D3D11_BUFFER_DESC transformRows{MaxTransformDraws * 4 * 16, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0,
+        D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS};
+    check(g.device->CreateBuffer(&transformRows, nullptr, g.transformRows.GetAddressOf()), "Creating the coordinate transform rows");
+    raw.BufferEx.NumElements = transformRows.ByteWidth / 4;
+    check(g.device->CreateShaderResourceView(g.transformRows.Get(), &raw, g.transformRowsView.GetAddressOf()), "Creating the transform rows view");
+    constexpr UINT transformDrawBytes = sizeof(TransformDraw);
+    const D3D11_BUFFER_DESC transformDraws{MaxTransformDraws * transformDrawBytes, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0,
+        D3D11_RESOURCE_MISC_BUFFER_STRUCTURED, transformDrawBytes};
+    check(g.device->CreateBuffer(&transformDraws, nullptr, g.transformDraws.GetAddressOf()), "Creating the coordinate transform draws");
+    check(g.device->CreateShaderResourceView(g.transformDraws.Get(), nullptr, g.transformDrawsView.GetAddressOf()),
+        "Creating the transform draws view");
+    const D3D11_BUFFER_DESC materialDraws{MaxMaterialDraws * 8, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0,
+        D3D11_RESOURCE_MISC_BUFFER_STRUCTURED, 8};
+    check(g.device->CreateBuffer(&materialDraws, nullptr, g.materialDraws.GetAddressOf()), "Creating the material draws");
+    check(g.device->CreateShaderResourceView(g.materialDraws.Get(), nullptr, g.materialDrawsView.GetAddressOf()), "Creating the material draws view");
     g.coordinates = sharedTexture(g.device.Get(), RowLength, MaskedCapacity / RowLength, DXGI_FORMAT_R32G32B32A32_FLOAT,
         "Creating the shared texture coordinates");
     check(g.device->CreateUnorderedAccessView(g.coordinates.Get(), nullptr, g.coordinatesAccess.GetAddressOf()), "Creating the coordinates view");
@@ -1191,8 +1544,6 @@ std::unique_ptr<Gpu> create(ID3D11DeviceContext* context)
     g.positions12 = openTexture(g.d3d12.Get(), g.positions.Get(), "Opening the shared positions texture");
     g.coordinates12 = openTexture(g.d3d12.Get(), g.coordinates.Get(), "Opening the shared texture coordinates");
     g.coverage12 = openTexture(g.d3d12.Get(), g.coverage.Get(), "Opening the coverage atlas");
-    g.materialTable = buffer(g.d3d12.Get(), FramesInFlight * MaxMaterialDraws * 8, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ,
-        D3D12_RESOURCE_FLAG_NONE, "Creating the material table");
 
     g.vertices = buffer(g.d3d12.Get(), UINT64{Capacity} * VertexBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST,
         D3D12_RESOURCE_FLAG_NONE, "Creating the vertex buffer");
@@ -1201,8 +1552,7 @@ std::unique_ptr<Gpu> create(ID3D11DeviceContext* context)
     g.cacheTable = buffer(g.d3d12.Get(), FramesInFlight * (MaxInstances - 2) * 8, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ,
         D3D12_RESOURCE_FLAG_NONE, "Creating the cached draw table");
     const D3D11_BUFFER_DESC foliageIndices{FoliageIndexCapacity * 4, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ};
-    for (auto& readback : g.foliageReadbacks)
-        check(g.device->CreateBuffer(&foliageIndices, nullptr, readback.staging.GetAddressOf()), "Creating the foliage readback");
+    check(g.device->CreateBuffer(&foliageIndices, nullptr, g.foliageReadback.staging.GetAddressOf()), "Creating the foliage readback");
     g.cache = std::make_unique<GeometryCache>(g.d3d12.Get(), CacheVertexCapacity, CacheStructureBytes);
     g.templates = std::make_unique<GeometryCache>(g.d3d12.Get(), TemplateVertexCapacity, TemplateStructureBytes);
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO bottom{}, top{};
@@ -1229,9 +1579,9 @@ std::unique_ptr<Gpu> create(ID3D11DeviceContext* context)
     pipeline.CS = {TraceShader, sizeof(TraceShader)};
     check(g.d3d12->CreateComputePipelineState(&pipeline, IID_PPV_ARGS(&g.pipeline)), "Creating the trace pipeline");
     // The trace's descriptor table: the game's depth, the texture coordinates, the coverage atlas, the
-    // traced image, the sun visibility and the cached draws' and templates' vertices. Those sized by
-    // the view are written in ensureTraced.
-    D3D12_DESCRIPTOR_HEAP_DESC descriptors{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 7, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
+    // traced image, the sun visibility, the cached draws' and templates' vertices, the game's normals
+    // and the soft sun rays' visibility. Those sized by the view are written in ensureTraced.
+    D3D12_DESCRIPTOR_HEAP_DESC descriptors{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 9, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
     check(g.d3d12->CreateDescriptorHeap(&descriptors, IID_PPV_ARGS(&g.descriptors)), "Creating the descriptor heap");
     g.descriptorSize = g.d3d12->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     auto handle = g.descriptors->GetCPUDescriptorHandleForHeapStart();
@@ -1265,7 +1615,9 @@ std::unique_ptr<Gpu> create(ID3D11DeviceContext* context)
     return result;
 }
 
-// The traced images and the game's depth cover the view at render resolution.
+// The traced images, the game's depth and its normals cover the view at render resolution. The depth
+// copy and the normals are made again together, so the other features' descriptors point at both
+// again when the depth copy changes.
 void ensureTraced(Gpu& g, UINT width, UINT height)
 {
     if (g.traced && g.tracedWidth == width && g.tracedHeight == height) return;
@@ -1274,12 +1626,20 @@ void ensureTraced(Gpu& g, UINT width, UINT height)
     g.traced = sharedTexture(g.device.Get(), width, height, DXGI_FORMAT_R32G32B32A32_FLOAT, "Creating the traced image");
     g.sunlit = sharedTexture(g.device.Get(), width, height, DXGI_FORMAT_R16G16B16A16_FLOAT, "Creating the sun visibility image");
     g.depthCopy = sharedTexture(g.device.Get(), width, height, DXGI_FORMAT_R32_FLOAT, "Creating the shared depth");
+    g.normals = sharedTexture(g.device.Get(), width, height, DXGI_FORMAT_R32_UINT, "Creating the shared normals");
+    g.sunSoft = sharedTexture(g.device.Get(), width, height, DXGI_FORMAT_R16G16B16A16_FLOAT, "Creating the soft sun visibility");
+    check(g.device->CreateShaderResourceView(g.sunSoft.Get(), nullptr, g.sunSoftView.ReleaseAndGetAddressOf()), "Creating the soft sun visibility view");
+    check(g.device->CreateShaderResourceView(g.depthCopy.Get(), nullptr, g.depthCopyView.ReleaseAndGetAddressOf()), "Creating the depth copy view");
     check(g.device->CreateShaderResourceView(g.traced.Get(), nullptr, g.tracedView.ReleaseAndGetAddressOf()), "Creating the traced image view");
     check(g.device->CreateShaderResourceView(g.sunlit.Get(), nullptr, g.sunlitView.ReleaseAndGetAddressOf()), "Creating the sun visibility view");
     check(g.device->CreateUnorderedAccessView(g.depthCopy.Get(), nullptr, g.depthCopyAccess.ReleaseAndGetAddressOf()), "Creating the shared depth view");
+    check(g.device->CreateShaderResourceView(g.normals.Get(), nullptr, g.normalsView.ReleaseAndGetAddressOf()), "Creating the shared normals view");
+    check(g.device->CreateUnorderedAccessView(g.normals.Get(), nullptr, g.normalsAccess.ReleaseAndGetAddressOf()), "Creating the shared normals view");
     g.traced12 = openTexture(g.d3d12.Get(), g.traced.Get(), "Opening the traced image");
     g.sunlit12 = openTexture(g.d3d12.Get(), g.sunlit.Get(), "Opening the sun visibility image");
     g.depthCopy12 = openTexture(g.d3d12.Get(), g.depthCopy.Get(), "Opening the shared depth");
+    g.normals12 = openTexture(g.d3d12.Get(), g.normals.Get(), "Opening the shared normals");
+    g.sunSoft12 = openTexture(g.d3d12.Get(), g.sunSoft.Get(), "Opening the soft sun visibility");
 
     auto handle = g.descriptors->GetCPUDescriptorHandleForHeapStart();
     D3D12_SHADER_RESOURCE_VIEW_DESC depth{};
@@ -1294,8 +1654,39 @@ void ensureTraced(Gpu& g, UINT width, UINT height)
         handle.ptr += g.descriptorSize;
         g.d3d12->CreateUnorderedAccessView(image, nullptr, nullptr, handle);
     }
+    handle.ptr += 3 * g.descriptorSize;
+    g.d3d12->CreateShaderResourceView(g.normals12.Get(), nullptr, handle);
+    handle.ptr += g.descriptorSize;
+    g.d3d12->CreateUnorderedAccessView(g.sunSoft12.Get(), nullptr, nullptr, handle);
     g.tracedWidth = width;
     g.tracedHeight = height;
+}
+
+// Copies the game's G-buffer normal over the view: the G-buffer's second target, so it does not
+// depend on the game's own ambient occlusion, or else the normal that occlusion pass read. Frames
+// without either (menus) clear it to 0, unknown.
+void prepareNormals(Gpu& g, const Capture& frame)
+{
+    const auto& source = frame.gbuffer[1] ? frame.gbuffer[1] : frame.normals;
+    ComPtr<ID3D11Texture2D> normals;
+    D3D11_TEXTURE2D_DESC description{};
+    if (source && SUCCEEDED(source.As(&normals))) normals->GetDesc(&description);
+    g.normalsKnown = (description.Format == DXGI_FORMAT_R32_UINT || description.Format == DXGI_FORMAT_R32_TYPELESS)
+        && description.Width >= static_cast<UINT>(frame.rect[2]) && description.Height >= static_cast<UINT>(frame.rect[3]);
+    if (!g.normalsKnown)
+    {
+        static bool reported{};
+        if (normals && !std::exchange(reported, true))
+            upscaler::log("The game's G-buffer normal is not an R32_UINT texture covering the view; ambient occlusion, bounced light and "
+                "soft light shadows are not traced, and sun rays take the traced normals.");
+        constexpr UINT unknown[4]{};
+        g.context->ClearUnorderedAccessViewUint(g.normalsAccess.Get(), unknown);
+        return;
+    }
+
+    const D3D11_BOX view{static_cast<UINT>(frame.rect[0]), static_cast<UINT>(frame.rect[1]), 0, static_cast<UINT>(frame.rect[2]),
+        static_cast<UINT>(frame.rect[3]), 1};
+    g.context->CopySubresourceRegion(g.normals.Get(), 0, 0, 0, 0, normals.Get(), 0, &view);
 }
 
 void readTimings(Gpu& g, UINT slot)
@@ -1371,52 +1762,66 @@ void GeometryCache::evict(std::list<Entry>::iterator entry)
     entries.erase(entry);
 }
 
-// Takes the next room in a ring, evicting what was there. Entries standing in for the view or for
-// shadow casters this frame are kept: the allocation moves past them. Empty when it cannot.
-std::optional<UINT64> GeometryCache::allocate(Ring ring, UINT64 size, const std::unordered_set<std::uint64_t>& standIns,
-    const std::unordered_set<std::uint64_t>& casting)
+GeometryCache::Room GeometryCache::roomOf(const Entry& entry, Ring ring)
+{
+    return ring == Ring::Vertices ? Room{entry.vertexOffset, entry.vertexOffset + entry.vertices}
+        : ring == Ring::Coordinates ? Room{entry.coordinateOffset, entry.coordinateOffset + (entry.masked ? entry.vertices : 0)}
+        : Room{entry.structureOffset, entry.structureOffset + entry.structureSize};
+}
+
+// The first of `rooms` that overlaps `room`, or null. Rooms apart and sorted by their beginnings are
+// sorted by their ends too.
+const GeometryCache::Room* GeometryCache::firstOverlap(const std::vector<Room>& rooms, Room room)
+{
+    const auto found = std::ranges::partition_point(rooms, [&](const Room& other) { return other.end <= room.begin; });
+    return found != rooms.end() && found->begin < room.end ? &*found : nullptr;
+}
+
+// Per ring, the rooms of the entries standing in for the view or for shadow casters this frame.
+GeometryCache::RingRooms GeometryCache::keptRooms(const std::unordered_set<std::uint64_t>& standIns,
+    const std::unordered_set<std::uint64_t>& casting) const
+{
+    RingRooms kept;
+    for (const auto& entry : entries)
+    {
+        if (!standIns.contains(entry.key) && !casting.contains(entry.object)) continue;
+
+        for (const auto ring : {Ring::Vertices, Ring::Coordinates, Ring::Structures})
+            if (const auto room = roomOf(entry, ring); room.begin < room.end) kept[static_cast<int>(ring)].push_back(room);
+    }
+    for (auto& rooms : kept) std::ranges::sort(rooms, {}, &Room::begin);
+    return kept;
+}
+
+// Takes the next room in a ring. The kept entries' rooms stay: the allocation moves past them. Empty
+// when it cannot. The room taken joins the kept ones, so the frame's later additions move past it
+// too. The entries in the rooms taken are evicted by plan(), once all are taken.
+std::optional<UINT64> GeometryCache::allocate(Ring ring, UINT64 size, RingRooms& kept)
 {
     const UINT64 capacity = ring == Ring::Structures ? structureBytes : vertexCapacity;
     auto& head = heads[static_cast<int>(ring)];
-    const auto extentOf = [&](const Entry& entry)
-    {
-        return ring == Ring::Vertices ? std::pair{entry.vertexOffset, UINT64{entry.vertices}}
-            : ring == Ring::Coordinates ? std::pair{entry.coordinateOffset, entry.masked ? UINT64{entry.vertices} : 0}
-            : std::pair{entry.structureOffset, entry.structureSize};
-    };
+    auto& rooms = kept[static_cast<int>(ring)];
     for (int attempt = 0; attempt < 8; ++attempt)
     {
         if (head + size > capacity) head = 0;
         const auto begin = head;
-        const auto overlaps = [&](const Entry& entry)
+        if (const auto* standing = firstOverlap(rooms, {begin, begin + size}))
         {
-            const auto [offset, extent] = extentOf(entry);
-            return extent && offset < begin + size && begin < offset + extent;
-        };
-        const auto kept = std::find_if(entries.begin(), entries.end(), [&](const Entry& entry)
-        {
-            return (standIns.contains(entry.key) || casting.contains(entry.object)) && overlaps(entry);
-        });
-        if (kept != entries.end())
-        {
-            const auto [offset, extent] = extentOf(*kept);
-            head = offset + extent;
+            head = standing->end;
             continue;
         }
 
-        for (auto entry = entries.begin(); entry != entries.end();)
-        {
-            const auto next = std::next(entry);
-            if (overlaps(*entry)) evict(entry);
-            entry = next;
-        }
         head += size;
+        rooms.insert(std::ranges::lower_bound(rooms, begin, {}, &Room::begin), Room{begin, head});
         return begin;
     }
     return std::nullopt;
 }
 
-// A frame adds at most an eighth of each ring, so its own additions never overwrite each other.
+// The entries kept this frame are found once, at the first addition (most frames add nothing), and the
+// entries in the rooms taken are evicted once all are taken: each a single walk over the entries. The
+// rooms taken join the kept ones as they are taken, so the frame's additions never overwrite each
+// other, even when the kept rooms push them around a whole ring.
 void GeometryCache::plan(const std::vector<Draw>& draws, UINT maskedStart, bool all, const std::unordered_set<std::uint64_t>& casting,
     const float (&preViewTranslation)[3])
 {
@@ -1428,6 +1833,8 @@ void GeometryCache::plan(const std::vector<Draw>& draws, UINT maskedStart, bool 
     std::unordered_set<std::uint64_t> standIns;
     for (const auto& draw : draws)
         if (draw.standIn) standIns.insert(draw.key);
+    std::optional<RingRooms> kept;
+    RingRooms taken;
     for (const auto& draw : draws)
     {
         if (draw.standIn || byKey.contains(draw.key) || builds.size() == MaxNewCachedDraws) continue;
@@ -1448,21 +1855,26 @@ void GeometryCache::plan(const std::vector<Draw>& draws, UINT maskedStart, bool 
         const bool fits = scratchBytes + scratchSize <= CacheScratchBytes && stagedRows + rows <= CacheStagingRows;
         if (!fits || !(withinBudget || alone)) continue;
 
+        // The count still holds the entries the rooms taken so far will evict, so this may evict an
+        // entry, or stop, a little early.
         if (entries.size() == MaxCachedDraws)
         {
             if (standIns.contains(entries.front().key) || casting.contains(entries.front().object)) break;
 
             evict(entries.begin());
         }
-        const auto vertexOffset = allocate(Ring::Vertices, draw.vertices, standIns, casting);
-        const auto coordinateOffset = draw.masked ? allocate(Ring::Coordinates, draw.vertices, standIns, casting) : std::optional<UINT64>{0};
-        const auto structureOffset = allocate(Ring::Structures, structureSize, standIns, casting);
+        if (!kept) kept = keptRooms(standIns, casting);
+        const auto vertexOffset = allocate(Ring::Vertices, draw.vertices, *kept);
+        const auto coordinateOffset = draw.masked ? allocate(Ring::Coordinates, draw.vertices, *kept) : std::optional<UINT64>{0};
+        const auto structureOffset = allocate(Ring::Structures, structureSize, *kept);
         if (!vertexOffset || !coordinateOffset || !structureOffset) break;
 
         entry.vertexOffset = *vertexOffset;
         entry.coordinateOffset = *coordinateOffset;
         entry.structureOffset = *structureOffset;
         entry.structureSize = structureSize;
+        for (const auto ring : {Ring::Vertices, Ring::Coordinates, Ring::Structures})
+            if (const auto room = roomOf(entry, ring); room.begin < room.end) taken[static_cast<int>(ring)].push_back(room);
         entries.push_back(entry);
         byKey[draw.key] = std::prev(entries.end());
         builds.push_back({std::prev(entries.end()), draw.masked ? maskedStart + draw.first : draw.first, draw.first, scratchBytes});
@@ -1470,6 +1882,25 @@ void GeometryCache::plan(const std::vector<Draw>& draws, UINT maskedStart, bool 
         addedBytes += structureSize;
         scratchBytes += scratchSize;
         stagedRows += rows;
+    }
+    // The additions are the last entries.
+    if (!builds.empty())
+    {
+        for (auto& rooms : taken) std::ranges::sort(rooms, {}, &Room::begin);
+        for (auto entry = entries.begin(); entry != builds.front().entry;)
+        {
+            const auto next = std::next(entry);
+            for (const auto ring : {Ring::Vertices, Ring::Coordinates, Ring::Structures})
+            {
+                const auto room = roomOf(*entry, ring);
+                if (room.begin < room.end && firstOverlap(taken[static_cast<int>(ring)], room))
+                {
+                    evict(entry);
+                    break;
+                }
+            }
+            entry = next;
+        }
     }
 
     // An object is whole once every draw the view drew of it this frame is cached.
@@ -1614,22 +2045,20 @@ void createAmbient(Gpu& g)
         D3D12_RESOURCE_FLAG_NONE, "Creating the ambient occlusion timestamp readback");
 }
 
-// The shared textures cover the view, and the descriptors also point at the depth copy ensureTraced makes.
+// The traced corners cover the view, and the descriptors also point at the depth copy and the normals
+// ensureTraced makes; it makes both again together.
 void ensureAmbient(Gpu& g, UINT width, UINT height)
 {
     auto& a = g.ambient;
-    if (a.normals && a.width == width && a.height == height && a.depth12 == g.depthCopy12.Get()) return;
+    if (a.traced && a.width == width && a.height == height && a.depth12 == g.depthCopy12.Get()) return;
 
     waitIdle(g);
-    if (!a.normals || a.width != width || a.height != height)
+    if (!a.traced || a.width != width || a.height != height)
     {
-        a.normals = sharedTexture(g.device.Get(), width, height, DXGI_FORMAT_R32_UINT, "Creating the shared normals");
         // Direct3D 11 does not share R32G32_UINT; the traced corners use x and y.
         a.traced = sharedTexture(g.device.Get(), width, height, DXGI_FORMAT_R32G32B32A32_UINT, "Creating the traced ambient occlusion");
-        check(g.device->CreateShaderResourceView(a.normals.Get(), nullptr, a.normalsView.ReleaseAndGetAddressOf()), "Creating the shared normals view");
         check(g.device->CreateShaderResourceView(a.traced.Get(), nullptr, a.tracedView.ReleaseAndGetAddressOf()),
             "Creating the traced ambient occlusion view");
-        a.normals12 = openTexture(g.d3d12.Get(), a.normals.Get(), "Opening the shared normals");
         a.traced12 = openTexture(g.d3d12.Get(), a.traced.Get(), "Opening the traced ambient occlusion");
         a.width = width;
         a.height = height;
@@ -1642,7 +2071,7 @@ void ensureAmbient(Gpu& g, UINT width, UINT height)
     depth.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     depth.Texture2D.MipLevels = 1;
     g.d3d12->CreateShaderResourceView(g.depthCopy12.Get(), &depth, handle);
-    for (auto* texture : {g.coordinates12.Get(), g.coverage12.Get(), a.normals12.Get()})
+    for (auto* texture : {g.coordinates12.Get(), g.coverage12.Get(), g.normals12.Get()})
     {
         handle.ptr += g.descriptorSize;
         g.d3d12->CreateShaderResourceView(texture, nullptr, handle);
@@ -1652,31 +2081,16 @@ void ensureAmbient(Gpu& g, UINT width, UINT height)
     a.depth12 = g.depthCopy12.Get();
 }
 
-// Copies the game's G-buffer normal over the view for the ambient occlusion rays, when they are
-// wanted and the game's occlusion pass showed where the normal is.
+// The ambient occlusion rays run when they are wanted, the game's normals are known this frame
+// (prepareNormals) and the game ran its own occlusion pass, which filterAmbient needs to use them.
 void prepareAmbient(Gpu& g, const Capture& frame, UINT width, UINT height)
 {
     auto& a = g.ambient;
     a.tracing = false;
-    ComPtr<ID3D11Texture2D> normals;
-    D3D11_TEXTURE2D_DESC description{};
-    if (!ambientWanted() || !frame.normals || FAILED(frame.normals.As(&normals))) return;
-
-    normals->GetDesc(&description);
-    if ((description.Format != DXGI_FORMAT_R32_UINT && description.Format != DXGI_FORMAT_R32_TYPELESS)
-        || description.Width < static_cast<UINT>(frame.rect[2]) || description.Height < static_cast<UINT>(frame.rect[3]))
-    {
-        static bool reported{};
-        if (!std::exchange(reported, true))
-            upscaler::log("The game's G-buffer normal is not an R32_UINT texture covering the view; ambient occlusion is not traced.");
-        return;
-    }
+    if (!ambientWanted() || !g.normalsKnown || !frame.ambient || !frame.normals) return;
 
     if (!a.pipeline) createAmbient(g);
     ensureAmbient(g, width, height);
-    const D3D11_BOX view{static_cast<UINT>(frame.rect[0]), static_cast<UINT>(frame.rect[1]), 0, static_cast<UINT>(frame.rect[2]),
-        static_cast<UINT>(frame.rect[3]), 1};
-    g.context->CopySubresourceRegion(a.normals.Get(), 0, 0, 0, 0, normals.Get(), 0, &view);
     a.tracing = true;
 }
 
@@ -1702,7 +2116,6 @@ void recordAmbient(Gpu& g, UINT slot, const TraceConstants& trace)
     std::memcpy(constants.worldFromClip, trace.worldFromClip, sizeof(constants.worldFromClip));
     std::copy(std::begin(trace.size), std::end(trace.size), constants.size);
     std::copy(std::begin(trace.maskedBase), std::end(trace.maskedBase), constants.maskedBase);
-    constants.materialDraws = trace.materialDraws;
     constants.frame = static_cast<std::uint32_t>(g.frames);
     constants.halfRays = activeFeatures().halfAmbientRays;
     auto* list = g.list.Get();
@@ -1713,11 +2126,10 @@ void recordAmbient(Gpu& g, UINT slot, const TraceConstants& trace)
     list->SetDescriptorHeaps(1, heaps);
     list->SetComputeRoot32BitConstants(0, sizeof(constants) / 4, &constants, 0);
     list->SetComputeRootShaderResourceView(1, g.top->GetGPUVirtualAddress());
-    list->SetComputeRootShaderResourceView(2, g.materialTable->GetGPUVirtualAddress() + UINT64{slot} * MaxMaterialDraws * 8);
-    list->SetComputeRootShaderResourceView(3, g.cacheTable->GetGPUVirtualAddress() + UINT64{slot} * (MaxInstances - 2) * 8);
-    list->SetComputeRootShaderResourceView(4, g.cache->coordinates());
-    list->SetComputeRootShaderResourceView(5, g.templates->coordinates());
-    list->SetComputeRootDescriptorTable(6, a.descriptors->GetGPUDescriptorHandleForHeapStart());
+    list->SetComputeRootShaderResourceView(2, g.cacheTable->GetGPUVirtualAddress() + UINT64{slot} * (MaxInstances - 2) * 8);
+    list->SetComputeRootShaderResourceView(3, g.cache->coordinates());
+    list->SetComputeRootShaderResourceView(4, g.templates->coordinates());
+    list->SetComputeRootDescriptorTable(5, a.descriptors->GetGPUDescriptorHandleForHeapStart());
     list->Dispatch((constants.size[0] + 7) / 8, (constants.size[1] + 7) / 8, 1);
     list->EndQuery(a.timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot * 2 + 1);
     list->ResolveQueryData(a.timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot * 2, 2, a.timestampReadback.Get(), slot * 2 * sizeof(UINT64));
@@ -1779,46 +2191,25 @@ void createBounce(Gpu& g)
         D3D12_RESOURCE_FLAG_NONE, "Creating the bounce timestamp readback");
 }
 
-// The textures cover the view, and the views and descriptors also point at the depth copy
-// ensureTraced makes.
+// The textures cover the view, and the views and descriptors also point at the depth copy and the
+// normals ensureTraced makes; it makes both again together.
 void ensureBounce(Gpu& g, UINT width, UINT height)
 {
     auto& b = g.bounce;
-    if (b.normals && b.width == width && b.height == height && b.depth == g.depthCopy.Get()) return;
+    if (b.albedo && b.width == width && b.height == height && b.depth == g.depthCopy.Get()) return;
 
     waitIdle(g);
-    if (!b.normals || b.width != width || b.height != height)
+    if (!b.albedo || b.width != width || b.height != height)
     {
-        b.normals = sharedTexture(g.device.Get(), width, height, DXGI_FORMAT_R32_UINT, "Creating the shared bounce normals");
         b.albedo = sharedTexture(g.device.Get(), width, height, DXGI_FORMAT_R16G16B16A16_FLOAT, "Creating the shared diffuse colours");
         b.traced = sharedTexture(g.device.Get(), width, height, DXGI_FORMAT_R16G16B16A16_FLOAT, "Creating the traced bounce");
-        check(g.device->CreateShaderResourceView(b.normals.Get(), nullptr, b.normalsView.ReleaseAndGetAddressOf()), "Creating the bounce normals view");
-        check(g.device->CreateUnorderedAccessView(b.normals.Get(), nullptr, b.normalsAccess.ReleaseAndGetAddressOf()), "Creating the bounce normals view");
         check(g.device->CreateShaderResourceView(b.albedo.Get(), nullptr, b.albedoView.ReleaseAndGetAddressOf()), "Creating the diffuse colour view");
         check(g.device->CreateUnorderedAccessView(b.albedo.Get(), nullptr, b.albedoAccess.ReleaseAndGetAddressOf()), "Creating the diffuse colour view");
         check(g.device->CreateShaderResourceView(b.traced.Get(), nullptr, b.tracedView.ReleaseAndGetAddressOf()), "Creating the traced bounce view");
-        b.normals12 = openTexture(g.d3d12.Get(), b.normals.Get(), "Opening the shared bounce normals");
         b.albedo12 = openTexture(g.d3d12.Get(), b.albedo.Get(), "Opening the shared diffuse colours");
         b.traced12 = openTexture(g.d3d12.Get(), b.traced.Get(), "Opening the traced bounce");
-
-        D3D11_TEXTURE2D_DESC description{width, height, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT, {1, 0}, D3D11_USAGE_DEFAULT,
-            D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS};
-        for (UINT i = 0; i < 2; ++i)
-            for (auto [texture, view, access] : {std::tie(b.history[i], b.historyViews[i], b.historyAccess[i]),
-                std::tie(b.filtered[i], b.filteredViews[i], b.filteredAccess[i])})
-            {
-                check(g.device->CreateTexture2D(&description, nullptr, texture.ReleaseAndGetAddressOf()), "Creating a bounce texture");
-                check(g.device->CreateShaderResourceView(texture.Get(), nullptr, view.ReleaseAndGetAddressOf()), "Creating a bounce view");
-                check(g.device->CreateUnorderedAccessView(texture.Get(), nullptr, access.ReleaseAndGetAddressOf()), "Creating a bounce view");
-            }
-        description.Format = DXGI_FORMAT_R32_FLOAT;
-        description.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        check(g.device->CreateTexture2D(&description, nullptr, b.previousDepth.ReleaseAndGetAddressOf()), "Creating the bounce's previous depth");
-        check(g.device->CreateShaderResourceView(b.previousDepth.Get(), nullptr, b.previousDepthView.ReleaseAndGetAddressOf()),
-            "Creating the bounce's previous depth view");
         b.width = width;
         b.height = height;
-        b.historyValid = false;
     }
 
     check(g.device->CreateShaderResourceView(g.depthCopy.Get(), nullptr, b.depthView.ReleaseAndGetAddressOf()), "Creating the bounce depth view");
@@ -1830,7 +2221,7 @@ void ensureBounce(Gpu& g, UINT width, UINT height)
     depth.Texture2D.MipLevels = 1;
     g.d3d12->CreateShaderResourceView(g.depthCopy12.Get(), &depth, handle);
     handle.ptr += 2 * g.descriptorSize;
-    for (auto* texture : {b.normals12.Get(), b.albedo12.Get()})
+    for (auto* texture : {g.normals12.Get(), b.albedo12.Get()})
     {
         handle.ptr += g.descriptorSize;
         g.d3d12->CreateShaderResourceView(texture, nullptr, handle);
@@ -1876,25 +2267,24 @@ ID3D11ShaderResourceView* gameView(Gpu& g, ComPtr<ID3D11ShaderResourceView>& vie
     return view.Get();
 }
 
-// Copies the game's normals and diffuse colours over the view for the bounce rays, when they are
-// wanted and the G-buffer has been seen.
+// Copies the game's diffuse colours over the view for the bounce rays and the lights' bounce, when
+// they are wanted and the G-buffer has been seen. The rays and the filters also need the game's
+// normals (prepareNormals).
 void prepareBounce(Gpu& g, const Capture& frame, UINT width, UINT height)
 {
     auto& b = g.bounce;
-    // The accumulation carries over only from a frame that traced the bounce.
-    b.historyValid = b.historyValid && b.tracing;
-    b.tracing = false;
-    if (!bounceWanted()) return;
+    b.tracing = b.surfaces = false;
+    const bool sunBounce = bounceWanted();
+    if ((!sunBounce && !lightSurfacesWanted()) || !g.normalsKnown) return;
 
     if (!b.pipeline) createBounce(g);
-    ID3D11ShaderResourceView* inputs[]{gameView(g, b.gbufferViews[0], frame.gbuffer[0].Get(), DXGI_FORMAT_R32G32_UINT, frame.rect),
-        gameView(g, b.gbufferViews[1], frame.gbuffer[1].Get(), DXGI_FORMAT_R32_UINT, frame.rect),
+    ID3D11ShaderResourceView* inputs[]{gameView(g, b.gbufferView, frame.gbuffer[0].Get(), DXGI_FORMAT_R32G32_UINT, frame.rect),
         gameView(g, b.stencilView, frame.depth.Get(), DXGI_FORMAT_UNKNOWN, frame.rect)};
     if (std::find(std::begin(inputs), std::end(inputs), nullptr) != std::end(inputs))
     {
         static bool reported{};
         if (!std::exchange(reported, true))
-            upscaler::log("The game's G-buffer or stencil cannot be read over the view; global illumination is not traced.");
+            upscaler::log("The game's G-buffer or stencil cannot be read over the view; bounced light and soft light shadows are not traced.");
         return;
     }
 
@@ -1902,15 +2292,15 @@ void prepareBounce(Gpu& g, const Capture& frame, UINT width, UINT height)
     const RegionConstants region{{frame.rect[0], frame.rect[1]}, {width, height}};
     inOwnState(g, [&]
     {
-        ID3D11UnorderedAccessView* outputs[]{b.normalsAccess.Get(), b.albedoAccess.Get()};
         g.context->UpdateSubresource(g.regionConstants.Get(), 0, nullptr, &region, 0, 0);
         g.context->CSSetShader(b.surfaceShader.Get(), nullptr, 0);
         g.context->CSSetConstantBuffers(0, 1, g.regionConstants.GetAddressOf());
         g.context->CSSetShaderResources(0, static_cast<UINT>(std::size(inputs)), inputs);
-        g.context->CSSetUnorderedAccessViews(0, static_cast<UINT>(std::size(outputs)), outputs, nullptr);
+        g.context->CSSetUnorderedAccessViews(0, 1, b.albedoAccess.GetAddressOf(), nullptr);
         g.context->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
     });
-    b.tracing = true;
+    b.surfaces = true;
+    b.tracing = sunBounce;
 }
 
 // Traces the bounce once the frame's structures are built, timed on its own.
@@ -1938,7 +2328,6 @@ void recordBounce(Gpu& g, UINT slot, const TraceConstants& trace)
     std::copy(std::begin(trace.maskedBase), std::end(trace.maskedBase), constants.maskedBase);
     std::copy(std::begin(trace.sun), std::end(trace.sun), constants.sun);
     std::memcpy(constants.geometryBase, trace.geometryBase, sizeof(constants.geometryBase));
-    constants.materialDraws = trace.materialDraws;
     constants.frame = static_cast<std::uint32_t>(g.frames);
     auto* list = g.list.Get();
     ID3D12DescriptorHeap* heaps[]{b.descriptors.Get()};
@@ -1949,37 +2338,74 @@ void recordBounce(Gpu& g, UINT slot, const TraceConstants& trace)
     list->SetComputeRoot32BitConstants(0, sizeof(constants) / 4, &constants, 0);
     list->SetComputeRootShaderResourceView(1, g.top->GetGPUVirtualAddress());
     list->SetComputeRootShaderResourceView(2, g.vertices->GetGPUVirtualAddress());
-    list->SetComputeRootShaderResourceView(3, g.materialTable->GetGPUVirtualAddress() + UINT64{slot} * MaxMaterialDraws * 8);
-    list->SetComputeRootShaderResourceView(4, g.cacheTable->GetGPUVirtualAddress() + UINT64{slot} * (MaxInstances - 2) * 8);
-    list->SetComputeRootShaderResourceView(5, g.cache->coordinates());
-    list->SetComputeRootShaderResourceView(6, g.templates->coordinates());
-    list->SetComputeRootShaderResourceView(7, g.cache->vertices());
-    list->SetComputeRootShaderResourceView(8, g.templates->vertices());
-    list->SetComputeRootDescriptorTable(9, b.descriptors->GetGPUDescriptorHandleForHeapStart());
+    list->SetComputeRootShaderResourceView(3, g.cacheTable->GetGPUVirtualAddress() + UINT64{slot} * (MaxInstances - 2) * 8);
+    list->SetComputeRootShaderResourceView(4, g.cache->coordinates());
+    list->SetComputeRootShaderResourceView(5, g.templates->coordinates());
+    list->SetComputeRootShaderResourceView(6, g.cache->vertices());
+    list->SetComputeRootShaderResourceView(7, g.templates->vertices());
+    list->SetComputeRootDescriptorTable(8, b.descriptors->GetGPUDescriptorHandleForHeapStart());
     list->Dispatch((constants.size[0] + 7) / 8, (constants.size[1] + 7) / 8, 1);
     list->EndQuery(b.timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot * 2 + 1);
     list->ResolveQueryData(b.timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot * 2, 2, b.timestampReadback.Get(), slot * 2 * sizeof(UINT64));
 }
 
-// Accumulates the traced bounce over frames and filters it, once Direct3D 11 has waited for it.
-void filterBounce(Gpu& g, const Capture& frame, const float (&worldFromClip)[16])
+// The denoiser's textures cover the view.
+void ensureDenoiser(Gpu& g, Denoiser& d, UINT width, UINT height)
+{
+    if (d.previousDepth && d.width == width && d.height == height) return;
+
+    D3D11_TEXTURE2D_DESC description{width, height, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT, {1, 0}, D3D11_USAGE_DEFAULT,
+        D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS};
+    for (UINT i = 0; i < 2; ++i)
+        for (auto [texture, view, access] : {std::tie(d.history[i], d.historyViews[i], d.historyAccess[i]),
+            std::tie(d.filtered[i], d.filteredViews[i], d.filteredAccess[i])})
+        {
+            check(g.device->CreateTexture2D(&description, nullptr, texture.ReleaseAndGetAddressOf()), "Creating a filter texture");
+            check(g.device->CreateShaderResourceView(texture.Get(), nullptr, view.ReleaseAndGetAddressOf()), "Creating a filter view");
+            check(g.device->CreateUnorderedAccessView(texture.Get(), nullptr, access.ReleaseAndGetAddressOf()), "Creating a filter view");
+        }
+    description.Format = DXGI_FORMAT_R32_FLOAT;
+    description.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    check(g.device->CreateTexture2D(&description, nullptr, d.previousDepth.ReleaseAndGetAddressOf()), "Creating a filter's previous depth");
+    check(g.device->CreateShaderResourceView(d.previousDepth.Get(), nullptr, d.previousDepthView.ReleaseAndGetAddressOf()),
+        "Creating a filter's previous depth view");
+    d.width = width;
+    d.height = height;
+    d.historyValid = false;
+}
+
+// Accumulates a traced signal over the view into the denoiser's history, up to `maxFrames`, and
+// filters it in `passes` passes with taps 1, 2, 4... texels apart, once Direct3D 11 has waited for
+// it. A bounce has its lone bright pixels brought down first, and the sun's turns into the scene
+// colour's units in its last pass. Filters along the game's normals (prepareNormals) with the bounce's
+// shaders. Returns the result.
+enum class Signal { SunBounce, LightBounce, Visibility };
+ID3D11ShaderResourceView* denoise(Gpu& g, Denoiser& d, const Capture& frame, const float (&worldFromClip)[16], ID3D11ShaderResourceView* traced,
+    UINT maxFrames, UINT passes, Signal signal)
 {
     auto& b = g.bounce;
+    if (!b.pipeline) createBounce(g);
+    ensureDenoiser(g, d, g.tracedWidth, g.tracedHeight);
+    // History carries over only from the frame before.
+    const bool continued = d.historyValid && d.usedIn + 1 == g.frames;
+    d.usedIn = g.frames;
     BounceFilterConstants constants{};
     std::memcpy(constants.worldFromClip, worldFromClip, sizeof(constants.worldFromClip));
     // Translated world is world plus the negated camera position, so last frame's is this frame's
     // moved by the camera's movement since.
-    std::memcpy(constants.previousClipFromWorld, b.previousClipFromWorld, sizeof(constants.previousClipFromWorld));
+    std::memcpy(constants.previousClipFromWorld, d.previousClipFromWorld, sizeof(constants.previousClipFromWorld));
     for (int column = 0; column < 4; ++column)
         for (int axis = 0; axis < 3; ++axis)
-            constants.previousClipFromWorld[12 + column] += (b.previousTranslation[axis] - frame.preViewTranslation[axis])
-                * b.previousClipFromWorld[axis * 4 + column];
+            constants.previousClipFromWorld[12 + column] += (d.previousTranslation[axis] - frame.preViewTranslation[axis])
+                * d.previousClipFromWorld[axis * 4 + column];
 
-    constants.size[0] = b.width;
-    constants.size[1] = b.height;
-    constants.history = b.historyValid && frame.cameraKnown;
-    const auto previous = b.current ^ 1;
-    const UINT groupsX = (b.width + 7) / 8, groupsY = (b.height + 7) / 8;
+    constants.size[0] = d.width;
+    constants.size[1] = d.height;
+    constants.history = continued && frame.cameraKnown;
+    constants.maxFrames = maxFrames;
+    constants.clamp = signal != Signal::Visibility;
+    const auto previous = d.current ^ 1;
+    const UINT groupsX = (d.width + 7) / 8, groupsY = (d.height + 7) / 8;
     inOwnState(g, [&]
     {
         // The output is bound before the inputs: Direct3D 11 does not read what is still bound for writing.
@@ -1992,25 +2418,29 @@ void filterBounce(Gpu& g, const Capture& frame, const float (&worldFromClip)[16]
             g.context->CSSetShaderResources(0, static_cast<UINT>(inputs.size()), inputs.begin());
             g.context->Dispatch(groupsX, groupsY, 1);
         };
-        pass(b.accumulateShader.Get(), b.historyAccess[b.current].Get(),
-            {b.tracedView.Get(), b.historyViews[previous].Get(), b.depthView.Get(), b.previousDepthView.Get()});
-        // Taps 1, 2 and 4 texels apart, ending in filtered[0].
-        constants.step = 1;
-        pass(b.filterShader.Get(), b.filteredAccess[0].Get(),
-            {b.historyViews[b.current].Get(), b.depthView.Get(), b.normalsView.Get(), b.lightingView.Get()});
-        constants.step = 2;
-        pass(b.filterShader.Get(), b.filteredAccess[1].Get(),
-            {b.filteredViews[0].Get(), b.depthView.Get(), b.normalsView.Get(), b.lightingView.Get()});
-        constants.step = 4;
-        constants.final = 1;
-        pass(b.filterShader.Get(), b.filteredAccess[0].Get(),
-            {b.filteredViews[1].Get(), b.depthView.Get(), b.normalsView.Get(), b.lightingView.Get()});
-        g.context->CopyResource(b.previousDepth.Get(), g.depthCopy.Get());
+        pass(b.accumulateShader.Get(), d.historyAccess[d.current].Get(), {traced, d.historyViews[previous].Get(), g.depthCopyView.Get(),
+            d.previousDepthView.Get()});
+        d.output = d.historyViews[d.current].Get();
+        for (UINT i = 0; i < passes; ++i)
+        {
+            constants.step = 1u << i;
+            constants.final = signal == Signal::SunBounce && i + 1 == passes;
+            pass(b.filterShader.Get(), d.filteredAccess[i % 2].Get(), {d.output, g.depthCopyView.Get(), g.normalsView.Get(), b.lightingView.Get()});
+            d.output = d.filteredViews[i % 2].Get();
+        }
+        g.context->CopyResource(d.previousDepth.Get(), g.depthCopy.Get());
     });
-    b.current = previous;
-    b.historyValid = frame.cameraKnown;
-    std::memcpy(b.previousClipFromWorld, frame.clipFromWorld, sizeof(b.previousClipFromWorld));
-    std::memcpy(b.previousTranslation, frame.preViewTranslation, sizeof(b.previousTranslation));
+    d.current = previous;
+    d.historyValid = frame.cameraKnown;
+    std::memcpy(d.previousClipFromWorld, frame.clipFromWorld, sizeof(d.previousClipFromWorld));
+    std::memcpy(d.previousTranslation, frame.preViewTranslation, sizeof(d.previousTranslation));
+    return d.output;
+}
+
+// Accumulates the traced bounce over frames and filters it, once Direct3D 11 has waited for it.
+void filterBounce(Gpu& g, const Capture& frame, const float (&worldFromClip)[16])
+{
+    denoise(g, g.bounce.denoiser, frame, worldFromClip, g.bounce.tracedView.Get(), 24, 3, Signal::SunBounce);
 }
 
 // Lighting is about to draw: keeps the rows of its constants the bounced light is scaled by and the
@@ -2074,7 +2504,7 @@ void addBounce(Gpu& g, Capture& frame)
     {
         g.context->UpdateSubresource(g.regionConstants.Get(), 0, nullptr, &region, 0, 0);
         const D3D11_VIEWPORT viewport{0, 0, static_cast<float>(description.Width), static_cast<float>(description.Height), 0, 1};
-        ID3D11ShaderResourceView* inputs[]{b.filteredViews[0].Get(), b.albedoView.Get()};
+        ID3D11ShaderResourceView* inputs[]{b.denoiser.output, b.albedoView.Get()};
         g.context->RSSetViewports(1, &viewport);
         g.context->OMSetRenderTargets(1, output.GetAddressOf(), nullptr);
         g.context->OMSetBlendState(b.additive.Get(), nullptr, 0xffffffff);
@@ -2089,10 +2519,472 @@ void addBounce(Gpu& g, Capture& frame)
     frame.bounceAdded = true;
 }
 
-// Only sun shadows and the debug views read the primary and sun rays; without them only the other
-// features' rays run.
+// ---- Local lights ----
+
+D3D12_CPU_DESCRIPTOR_HANDLE lightDescriptor(const Gpu& g, UINT index)
+{
+    auto handle = g.lights.descriptors->GetCPUDescriptorHandleForHeapStart();
+    handle.ptr += index * g.descriptorSize;
+    return handle;
+}
+
+void createLights(Gpu& g)
+{
+    auto& l = g.lights;
+    auto code = compile(shaders::LightTable, "ray-tracing-light-table", "cs_5_0");
+    check(g.device->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, l.tableShader.GetAddressOf()),
+        "Creating the light table shader");
+    code = compile(shaders::LightsAdd, "ray-tracing-lights-add", "ps_5_0");
+    check(g.device->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, l.addShader.GetAddressOf()),
+        "Creating the light adding shader");
+    D3D11_BLEND_DESC additive{};
+    additive.RenderTarget[0] = {TRUE, D3D11_BLEND_ONE, D3D11_BLEND_ONE, D3D11_BLEND_OP_ADD, D3D11_BLEND_ONE, D3D11_BLEND_ONE, D3D11_BLEND_OP_ADD,
+        D3D11_COLOR_WRITE_ENABLE_RED | D3D11_COLOR_WRITE_ENABLE_GREEN | D3D11_COLOR_WRITE_ENABLE_BLUE};
+    check(g.device->CreateBlendState(&additive, l.additive.GetAddressOf()), "Creating the light blend state");
+
+    // A light's rows each, then the lighting constants' row 43 (the exposure).
+    const D3D11_BUFFER_DESC constants{(MaxLights + 1) * LightConstantRows * 16, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0,
+        D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS};
+    check(g.device->CreateBuffer(&constants, nullptr, l.constants.GetAddressOf()), "Creating the light constants");
+    D3D11_SHADER_RESOURCE_VIEW_DESC raw{};
+    raw.Format = DXGI_FORMAT_R32_TYPELESS;
+    raw.ViewDimension = D3D11_SRV_DIMENSION_BUFFEREX;
+    raw.BufferEx.NumElements = constants.ByteWidth / 4;
+    raw.BufferEx.Flags = D3D11_BUFFEREX_SRV_FLAG_RAW;
+    check(g.device->CreateShaderResourceView(l.constants.Get(), &raw, l.constantsView.GetAddressOf()), "Creating the light constants view");
+    l.tableConstants = constantBuffer(g.device.Get(), sizeof(LightTableConstants));
+    l.table = sharedTexture(g.device.Get(), LightConstantRows + 1, MaxLights + 1, DXGI_FORMAT_R32G32B32A32_FLOAT, "Creating the light table");
+    check(g.device->CreateUnorderedAccessView(l.table.Get(), nullptr, l.tableAccess.GetAddressOf()), "Creating the light table view");
+    l.table12 = openTexture(g.d3d12.Get(), l.table.Get(), "Opening the light table");
+
+    // The stand-ins for the game's shadow maps.
+    const float farDepth = 1e30f, nearDepth = -1e30f;
+    const D3D11_SUBRESOURCE_DATA farFaces[6]{{&farDepth, 4}, {&farDepth, 4}, {&farDepth, 4}, {&farDepth, 4}, {&farDepth, 4}, {&farDepth, 4}};
+    const D3D11_SUBRESOURCE_DATA nearFaces[6]{{&nearDepth, 4}, {&nearDepth, 4}, {&nearDepth, 4}, {&nearDepth, 4}, {&nearDepth, 4}, {&nearDepth, 4}};
+    D3D11_TEXTURE2D_DESC map{1, 1, 1, 1, DXGI_FORMAT_R32_FLOAT, {1, 0}, D3D11_USAGE_IMMUTABLE, D3D11_BIND_SHADER_RESOURCE};
+    ComPtr<ID3D11Texture2D> texture;
+    check(g.device->CreateTexture2D(&map, farFaces, texture.GetAddressOf()), "Creating the lit shadow map");
+    check(g.device->CreateShaderResourceView(texture.Get(), nullptr, l.litMap.GetAddressOf()), "Creating the lit shadow map view");
+    map.ArraySize = 6;
+    map.MiscFlags = D3D11_RESOURCE_MISC_TEXTURECUBE;
+    D3D11_SHADER_RESOURCE_VIEW_DESC cube{};
+    cube.Format = DXGI_FORMAT_R32_FLOAT;
+    cube.ViewDimension = D3D11_SRV_DIMENSION_TEXTURECUBE;
+    cube.TextureCube.MipLevels = 1;
+    const auto litCube = [&](const D3D11_SUBRESOURCE_DATA* faces)
+    {
+        ComPtr<ID3D11ShaderResourceView> view;
+        check(g.device->CreateTexture2D(&map, faces, texture.ReleaseAndGetAddressOf()), "Creating a lit shadow cube");
+        check(g.device->CreateShaderResourceView(texture.Get(), &cube, view.GetAddressOf()), "Creating a lit shadow cube view");
+        return view;
+    };
+    l.litCube = litCube(farFaces);
+    l.litCubeNear = litCube(nearFaces);
+    const std::uint8_t lit = 255;
+    const D3D11_SUBRESOURCE_DATA volumeData{&lit, 1, 1};
+    const D3D11_TEXTURE3D_DESC volume{1, 1, 1, 1, DXGI_FORMAT_R8_UNORM, D3D11_USAGE_IMMUTABLE, D3D11_BIND_SHADER_RESOURCE};
+    ComPtr<ID3D11Texture3D> volumeTexture;
+    check(g.device->CreateTexture3D(&volume, &volumeData, volumeTexture.GetAddressOf()), "Creating the lit shadow volume");
+    check(g.device->CreateShaderResourceView(volumeTexture.Get(), nullptr, l.litVolume.GetAddressOf()), "Creating the lit shadow volume view");
+
+    check(g.d3d12->CreateRootSignature(0, LightsTraceShader, sizeof(LightsTraceShader), IID_PPV_ARGS(&l.rootSignature)),
+        "Creating the light root signature");
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline{};
+    pipeline.pRootSignature = l.rootSignature.Get();
+    pipeline.CS = {LightsTraceShader, sizeof(LightsTraceShader)};
+    check(g.d3d12->CreateComputePipelineState(&pipeline, IID_PPV_ARGS(&l.pipeline)), "Creating the light pipeline");
+    // LightDescriptor order. The depth, the outputs and the game's surfaces are written in ensureLights,
+    // each slot as it is made.
+    D3D12_DESCRIPTOR_HEAP_DESC descriptors{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, LightDescriptors, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
+    check(g.d3d12->CreateDescriptorHeap(&descriptors, IID_PPV_ARGS(&l.descriptors)), "Creating the light descriptors");
+    const auto at = [&](UINT index) { return lightDescriptor(g, index); };
+    g.d3d12->CreateShaderResourceView(g.coordinates12.Get(), nullptr, at(LightDescriptor::Coordinates));
+    g.d3d12->CreateShaderResourceView(g.coverage12.Get(), nullptr, at(LightDescriptor::Coverage));
+    g.d3d12->CreateShaderResourceView(l.table12.Get(), nullptr, at(LightDescriptor::Table));
+    D3D12_SHADER_RESOURCE_VIEW_DESC empty{};
+    empty.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    empty.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    empty.Texture2D.MipLevels = 1;
+    empty.Format = DXGI_FORMAT_R11G11B10_FLOAT;
+    for (UINT slot = 0; slot < MaxLights; ++slot) g.d3d12->CreateShaderResourceView(nullptr, &empty, at(LightDescriptor::Slots + slot));
+    empty.Format = DXGI_FORMAT_R32_UINT;
+    g.d3d12->CreateShaderResourceView(nullptr, &empty, at(LightDescriptor::Normals));
+    empty.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    g.d3d12->CreateShaderResourceView(nullptr, &empty, at(LightDescriptor::Albedo));
+    D3D12_SHADER_RESOURCE_VIEW_DESC vertices{};
+    vertices.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    vertices.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    vertices.Buffer.StructureByteStride = VertexBytes;
+    vertices.Buffer.NumElements = Capacity;
+    g.d3d12->CreateShaderResourceView(g.vertices.Get(), &vertices, at(LightDescriptor::Vertices));
+    vertices.Buffer.NumElements = g.cache->capacity();
+    g.d3d12->CreateShaderResourceView(g.cache->vertexResource(), &vertices, at(LightDescriptor::CacheVertices));
+    vertices.Buffer.NumElements = g.templates->capacity();
+    g.d3d12->CreateShaderResourceView(g.templates->vertexResource(), &vertices, at(LightDescriptor::TemplateVertices));
+    D3D12_QUERY_HEAP_DESC timestamps{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, FramesInFlight * 2};
+    check(g.d3d12->CreateQueryHeap(&timestamps, IID_PPV_ARGS(&l.timestamps)), "Creating the light timestamps");
+    l.timestampReadback = buffer(g.d3d12.Get(), FramesInFlight * 2 * sizeof(UINT64), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST,
+        D3D12_RESOURCE_FLAG_NONE, "Creating the light timestamp readback");
+}
+
+// The traced images cover the view, and the descriptors also point at the depth copy and the normals
+// ensureTraced makes (it makes both again together) and at the diffuse colours prepareBounce copies.
+void ensureLights(Gpu& g, UINT width, UINT height)
+{
+    auto& l = g.lights;
+    if (l.visibility && l.width == width && l.height == height && l.depth12 == g.depthCopy12.Get() && l.albedo12 == g.bounce.albedo12.Get())
+        return;
+
+    waitIdle(g);
+    if (!l.visibility || l.width != width || l.height != height)
+    {
+        const auto make = [&](ComPtr<ID3D11Texture2D>& texture, ComPtr<ID3D11ShaderResourceView>& view, ComPtr<ID3D12Resource>& shared)
+        {
+            texture = sharedTexture(g.device.Get(), width, height, DXGI_FORMAT_R16G16B16A16_FLOAT, "Creating a traced light image");
+            check(g.device->CreateShaderResourceView(texture.Get(), nullptr, view.ReleaseAndGetAddressOf()), "Creating a traced light image view");
+            shared = openTexture(g.d3d12.Get(), texture.Get(), "Opening a traced light image");
+        };
+        make(l.visibility, l.visibilityView, l.visibility12);
+        make(l.unshadowed, l.unshadowedView, l.unshadowed12);
+        make(l.bounced, l.bouncedView, l.bounced12);
+        l.width = width;
+        l.height = height;
+    }
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC depth{};
+    depth.Format = DXGI_FORMAT_R32_FLOAT;
+    depth.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    depth.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    depth.Texture2D.MipLevels = 1;
+    g.d3d12->CreateShaderResourceView(g.depthCopy12.Get(), &depth, lightDescriptor(g, LightDescriptor::Depth));
+    g.d3d12->CreateUnorderedAccessView(l.visibility12.Get(), nullptr, nullptr, lightDescriptor(g, LightDescriptor::Visibility));
+    g.d3d12->CreateUnorderedAccessView(l.unshadowed12.Get(), nullptr, nullptr, lightDescriptor(g, LightDescriptor::Unshadowed));
+    g.d3d12->CreateUnorderedAccessView(l.bounced12.Get(), nullptr, nullptr, lightDescriptor(g, LightDescriptor::Bounced));
+    g.d3d12->CreateShaderResourceView(g.normals12.Get(), nullptr, lightDescriptor(g, LightDescriptor::Normals));
+    if (g.bounce.albedo12) g.d3d12->CreateShaderResourceView(g.bounce.albedo12.Get(), nullptr, lightDescriptor(g, LightDescriptor::Albedo));
+    l.depth12 = g.depthCopy12.Get();
+    l.albedo12 = g.bounce.albedo12.Get();
+}
+
+// A slot as large as the game's scene colour, in the format the light draws write it in.
+ID3D11RenderTargetView* lightSlot(Gpu& g, int slot, UINT width, UINT height, DXGI_FORMAT format)
+{
+    auto& l = g.lights;
+    D3D11_TEXTURE2D_DESC current{};
+    if (l.slots[slot]) l.slots[slot]->GetDesc(&current);
+    if (l.slots[slot] && current.Width == width && current.Height == height && current.Format == format) return l.slotTargets[slot].Get();
+
+    waitIdle(g);
+    l.slots[slot] = sharedTexture(g.device.Get(), width, height, format, "Creating a light slot", D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET);
+    check(g.device->CreateRenderTargetView(l.slots[slot].Get(), nullptr, l.slotTargets[slot].ReleaseAndGetAddressOf()), "Creating a light slot view");
+    l.slots12[slot] = openTexture(g.d3d12.Get(), l.slots[slot].Get(), "Opening a light slot");
+    g.d3d12->CreateShaderResourceView(l.slots12[slot].Get(), nullptr, lightDescriptor(g, LightDescriptor::Slots + slot));
+    return l.slotTargets[slot].Get();
+}
+
+// Whether the draw belongs to the game's local lights: a light's volume, or one of its lighting models.
+std::optional<LightShader> lightShader(ID3D11DeviceContext* context)
+{
+    ComPtr<ID3D11VertexShader> shader;
+    LightShader kind{};
+    UINT size = sizeof(kind);
+    context->VSGetShader(shader.GetAddressOf(), nullptr, nullptr);
+    if (!shader || FAILED(shader->GetPrivateData(LightShaderTag, &size, &kind))) return std::nullopt;
+    return kind;
+}
+
+// The stand-in that leaves a texture of the light's draw lit, if it is a shadow map: a depth texture
+// other than the scene's, or a baked shadow volume (the only 3D textures lights read). Cube maps are
+// read through a comparison sampler, which may pass toward greater depths.
+ID3D11ShaderResourceView* litStandIn(const Gpu& g, const Capture& frame, ID3D11ShaderResourceView* view, bool greaterPasses)
+{
+    D3D11_SHADER_RESOURCE_VIEW_DESC description{};
+    view->GetDesc(&description);
+    if (description.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE3D) return g.lights.litVolume.Get();
+    if (description.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D && description.ViewDimension != D3D11_SRV_DIMENSION_TEXTURECUBE) return nullptr;
+
+    ComPtr<ID3D11Resource> resource;
+    ComPtr<ID3D11Texture2D> texture;
+    view->GetResource(resource.GetAddressOf());
+    D3D11_TEXTURE2D_DESC texel{};
+    if (FAILED(resource.As(&texture)) || resource.Get() == frame.depth.Get()) return nullptr;
+
+    texture->GetDesc(&texel);
+    if (!(texel.BindFlags & D3D11_BIND_DEPTH_STENCIL)) return nullptr;
+    if (description.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2D) return g.lights.litMap.Get();
+    return greaterPasses ? g.lights.litCubeNear.Get() : g.lights.litCube.Get();
+}
+
+// Draws one lighting model of a game's light into the light's slot with its shadow maps lit, and keeps
+// the light's constants the first time. Returns false where the game draws it as it is: no slot left,
+// or a target other than the one the lights add to.
+bool drawLight(Gpu& g, Capture& frame, ID3D11DeviceContext* context, std::uint32_t count, std::uint32_t instances, std::uint32_t first,
+    std::int32_t baseVertex, std::uint32_t firstInstance, bool indexed)
+{
+    auto& l = g.lights;
+    std::array<ID3D11RenderTargetView*, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT> targets{};
+    ComPtr<ID3D11DepthStencilView> depth;
+    context->OMGetRenderTargets(static_cast<UINT>(targets.size()), targets.data(), depth.GetAddressOf());
+    std::array<ComPtr<ID3D11RenderTargetView>, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT> held; // Releases them
+    for (std::size_t i = 0; i < targets.size(); ++i) held[i].Attach(targets[i]);
+    ComPtr<ID3D11Resource> target;
+    ComPtr<ID3D11Texture2D> texture;
+    if (targets[0]) targets[0]->GetResource(target.GetAddressOf());
+    D3D11_TEXTURE2D_DESC size{};
+    if (FAILED(target.As(&texture))) return false;
+
+    texture->GetDesc(&size);
+    D3D11_RECT scissor{0, 0, static_cast<LONG>(size.Width), static_cast<LONG>(size.Height)};
+    ComPtr<ID3D11RasterizerState> rasterizer;
+    D3D11_RASTERIZER_DESC raster{};
+    context->RSGetState(rasterizer.GetAddressOf());
+    if (rasterizer) rasterizer->GetDesc(&raster);
+    if (raster.ScissorEnable)
+    {
+        D3D11_RECT rect{};
+        UINT rects = 1;
+        context->RSGetScissorRects(&rects, &rect);
+        scissor = {std::max(rect.left, 0L), std::max(rect.top, 0L), std::min(rect.right, scissor.right), std::min(rect.bottom, scissor.bottom)};
+    }
+    ComPtr<ID3D11DepthStencilState> depthState;
+    UINT reference{};
+    context->OMGetDepthStencilState(depthState.GetAddressOf(), &reference);
+
+    // A light draws each lighting model once, picked by the stencil reference, after its volume.
+    const auto model = 1u << (reference & 31);
+    const bool sameLight = frame.lightOpen && !frame.lightVolumeDrawn && !(frame.lightModels & model) && scissor.left == frame.lightScissor.left
+        && scissor.top == frame.lightScissor.top && scissor.right == frame.lightScissor.right && scissor.bottom == frame.lightScissor.bottom;
+    D3D11_RENDER_TARGET_VIEW_DESC targetView{};
+    targets[0]->GetDesc(&targetView);
+    if (!frame.lightTarget)
+    {
+        frame.lightTarget = target;
+        frame.lightTargetFormat = targetView.Format;
+    }
+    if (!sameLight)
+    {
+        frame.lightOpen = true;
+        frame.lightVolumeDrawn = false;
+        frame.lightScissor = scissor;
+        frame.lightModels = 0;
+        frame.lightSlot = NoLightSlot;
+        ComPtr<ID3D11PixelShader> pixelShader;
+        UINT declared{}, declaredSize = sizeof(declared);
+        context->PSGetShader(pixelShader.GetAddressOf(), nullptr, nullptr);
+        const UINT constantSlot = pixelShader && SUCCEEDED(pixelShader->GetPrivateData(ConstantSlots, &declaredSize, &declared)) && (declared & 1u << 5)
+            ? 5 : 4;
+        ComPtr<ID3D11Buffer> constants;
+        D3D11_BUFFER_DESC description{};
+        context->PSGetConstantBuffers(constantSlot, 1, constants.GetAddressOf());
+        if (constants) constants->GetDesc(&description);
+        if (frame.lightRects.size() < MaxLights && target == frame.lightTarget && targetView.Format == frame.lightTargetFormat
+            && description.ByteWidth >= LightConstantRows * 16)
+        {
+            if (!l.pipeline) createLights(g);
+            frame.lightSlot = static_cast<int>(frame.lightRects.size());
+            frame.lightRects.push_back(scissor);
+            auto* slot = lightSlot(g, frame.lightSlot, size.Width, size.Height, targetView.Format);
+            constexpr float black[4]{};
+            g.context4->ClearView(slot, black, &scissor, 1);
+            const D3D11_BOX rows{0, 0, 0, LightConstantRows * 16, 1, 1};
+            context->CopySubresourceRegion(l.constants.Get(), 0, frame.lightSlot * LightConstantRows * 16, 0, 0, constants.Get(), 0, &rows);
+            // The lights' bounce takes the exposure from the lighting constants all lights share.
+            ComPtr<ID3D11Buffer> lighting;
+            D3D11_BUFFER_DESC lightingDescription{};
+            context->PSGetConstantBuffers(2, 1, lighting.GetAddressOf());
+            if (lighting) lighting->GetDesc(&lightingDescription);
+            if (!frame.lightSlot && lightingDescription.ByteWidth >= (ExposureRow + 1) * 16)
+            {
+                const D3D11_BOX exposure{ExposureRow * 16, 0, 0, (ExposureRow + 1) * 16, 1, 1};
+                context->CopySubresourceRegion(l.constants.Get(), 0, MaxLights * LightConstantRows * 16, 0, 0, lighting.Get(), 0, &exposure);
+            }
+        }
+        else ++frame.gameLights;
+    }
+    frame.lightModels |= model;
+    if (frame.lightSlot == NoLightSlot) return false;
+
+    std::array<ID3D11SamplerState*, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT> samplers{};
+    context->PSGetSamplers(0, static_cast<UINT>(samplers.size()), samplers.data());
+    bool greaterPasses{};
+    for (auto* sampler : samplers)
+    {
+        if (!sampler) continue;
+
+        D3D11_SAMPLER_DESC description{};
+        sampler->GetDesc(&description);
+        greaterPasses = greaterPasses || (D3D11_DECODE_IS_COMPARISON_FILTER(description.Filter)
+            && (description.ComparisonFunc == D3D11_COMPARISON_GREATER || description.ComparisonFunc == D3D11_COMPARISON_GREATER_EQUAL));
+        sampler->Release();
+    }
+    // Lights read their textures from the first few slots.
+    std::array<ID3D11ShaderResourceView*, 16> views{};
+    context->PSGetShaderResources(0, static_cast<UINT>(views.size()), views.data());
+    auto lit = views;
+    bool replaced{};
+    for (auto& view : lit)
+    {
+        auto* standIn = view ? litStandIn(g, frame, view, greaterPasses) : nullptr;
+        if (!standIn) continue;
+
+        view = standIn;
+        replaced = true;
+    }
+
+    auto redirected = targets;
+    redirected[0] = l.slotTargets[frame.lightSlot].Get();
+    context->OMSetRenderTargets(static_cast<UINT>(redirected.size()), redirected.data(), depth.Get());
+    if (replaced) context->PSSetShaderResources(0, static_cast<UINT>(lit.size()), lit.data());
+    if (indexed) context->DrawIndexedInstanced(count, instances, first, baseVertex, firstInstance);
+    else context->DrawInstanced(count, instances, first, firstInstance);
+    // The engine assumes its bindings are still there.
+    context->OMSetRenderTargets(static_cast<UINT>(targets.size()), targets.data(), depth.Get());
+    if (replaced) context->PSSetShaderResources(0, static_cast<UINT>(views.size()), views.data());
+    for (auto* view : views)
+        if (view) view->Release();
+    frame.lightsPending = true;
+    return true;
+}
+
+// Traces toward the lights once they have drawn, timed on its own.
+void recordLights(Gpu& g, UINT slot, const Capture& frame, std::uint32_t flags)
+{
+    auto& l = g.lights;
+    l.milliseconds = 0;
+    if (l.recorded[slot])
+    {
+        const D3D12_RANGE range{slot * 2 * sizeof(UINT64), (slot + 1) * 2 * sizeof(UINT64)};
+        void* ticks{};
+        check(l.timestampReadback->Map(0, &range, &ticks), "Reading the light timestamps");
+        const auto* times = static_cast<const UINT64*>(ticks) + slot * 2;
+        l.milliseconds = static_cast<float>(static_cast<double>(times[1] - times[0]) * g.millisecondsPerTick);
+        const D3D12_RANGE nothing{};
+        l.timestampReadback->Unmap(0, &nothing);
+    }
+    l.recorded[slot] = true;
+
+    const auto& trace = g.lastTrace;
+    LightConstants constants{};
+    std::memcpy(constants.worldFromClip, trace.worldFromClip, sizeof(constants.worldFromClip));
+    std::memcpy(constants.clipFromWorld, trace.clipFromWorld, sizeof(constants.clipFromWorld));
+    std::copy(std::begin(trace.size), std::end(trace.size), constants.size);
+    std::copy(std::begin(trace.maskedBase), std::end(trace.maskedBase), constants.maskedBase);
+    constants.origin[0] = frame.rect[0];
+    constants.origin[1] = frame.rect[1];
+    constants.lightCount = static_cast<std::uint32_t>(frame.lightRects.size());
+    std::copy(std::begin(frame.preViewTranslation), std::end(frame.preViewTranslation), constants.translation);
+    constants.flags = flags;
+    std::memcpy(constants.geometryBase, trace.geometryBase, sizeof(constants.geometryBase));
+    constants.frame = static_cast<std::uint32_t>(g.frames);
+    auto* list = g.list.Get();
+    ID3D12DescriptorHeap* heaps[]{l.descriptors.Get()};
+    list->EndQuery(l.timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot * 2);
+    list->SetComputeRootSignature(l.rootSignature.Get());
+    list->SetPipelineState(l.pipeline.Get());
+    list->SetDescriptorHeaps(1, heaps);
+    list->SetComputeRoot32BitConstants(0, sizeof(constants) / 4, &constants, 0);
+    list->SetComputeRootShaderResourceView(1, g.top->GetGPUVirtualAddress());
+    list->SetComputeRootShaderResourceView(2, g.cacheTable->GetGPUVirtualAddress() + UINT64{slot} * (MaxInstances - 2) * 8);
+    list->SetComputeRootShaderResourceView(3, g.cache->coordinates());
+    list->SetComputeRootShaderResourceView(4, g.templates->coordinates());
+    list->SetComputeRootDescriptorTable(5, l.descriptors->GetGPUDescriptorHandleForHeapStart());
+    list->Dispatch((constants.size[0] + 7) / 8, (constants.size[1] + 7) / 8, 1);
+    list->EndQuery(l.timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot * 2 + 1);
+    list->ResolveQueryData(l.timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot * 2, 2, l.timestampReadback.Get(), slot * 2 * sizeof(UINT64));
+}
+
+// Every light has drawn into its slot: Direct3D 12 traces toward them, Direct3D 11 filters the soft
+// shadows and the bounce, and the lights that reach each pixel are added to the scene colour.
+void traceLights(Gpu& g, Capture& frame)
+{
+    frame.lightsPending = false;
+    frame.lightOpen = false;
+    auto& l = g.lights;
+    ComPtr<ID3D11Texture2D> target;
+    if (frame.lightRects.empty() || FAILED(frame.lightTarget.As(&target))) return;
+
+    const TraceTime time;
+    // Both filter along the game's normals, which prepareNormals copied.
+    const auto features = activeFeatures();
+    const bool surfaces = g.bounce.surfaces && g.bounce.width == g.tracedWidth && g.bounce.height == g.tracedHeight;
+    const bool soft = features.softLightShadows && surfaces, bounce = features.lightBounce && surfaces;
+    ensureLights(g, g.tracedWidth, g.tracedHeight);
+    LightTableConstants table{};
+    for (std::size_t i = 0; i < frame.lightRects.size(); ++i)
+    {
+        const auto& rect = frame.lightRects[i];
+        const std::int32_t corners[]{rect.left, rect.top, rect.right, rect.bottom};
+        std::copy(std::begin(corners), std::end(corners), table.rects[i]);
+    }
+    g.timer->begin(g.context, Pass::LightsAdd);
+    inOwnState(g, [&]
+    {
+        g.context->UpdateSubresource(l.tableConstants.Get(), 0, nullptr, &table, 0, 0);
+        g.context->CSSetShader(l.tableShader.Get(), nullptr, 0);
+        g.context->CSSetConstantBuffers(0, 1, l.tableConstants.GetAddressOf());
+        g.context->CSSetShaderResources(0, 1, l.constantsView.GetAddressOf());
+        g.context->CSSetUnorderedAccessViews(0, 1, l.tableAccess.GetAddressOf(), nullptr);
+        g.context->Dispatch(1, 1, 1);
+    });
+    g.timer->end(g.context, Pass::LightsAdd);
+
+    // The frame's trace went to this slot's allocator; the lights follow it there.
+    g.timer->begin(g.context, Pass::LightsWait);
+    const auto drawn = ++g.fenceValue, traced = ++g.fenceValue;
+    check(g.context4->Signal(g.fence.Get(), drawn), "Signalling the drawn lights");
+    g.context->Flush();
+    const auto slot = static_cast<UINT>((g.frames - 1) % FramesInFlight);
+    check(g.list->Reset(g.allocators[slot].Get(), nullptr), "Resetting the command list");
+    recordLights(g, slot, frame, (soft ? SoftLightShadows : 0) | (bounce ? LightBounce : 0));
+    check(g.list->Close(), "Recording the lights");
+    check(g.queue->Wait(g.d3d12Fence.Get(), drawn), "Waiting for the drawn lights");
+    ID3D12CommandList* lists[]{g.list.Get()};
+    g.queue->ExecuteCommandLists(1, lists);
+    check(g.queue->Signal(g.d3d12Fence.Get(), traced), "Signalling the traced lights");
+    g.submitted[slot] = traced;
+    check(g.context4->Wait(g.fence.Get(), traced), "Waiting for the traced lights");
+    g.timer->end(g.context, Pass::LightsWait);
+
+    // Soft shadows follow moving lights (the flashlight) within a few frames; the bounce changes slowly.
+    auto* visibility = l.visibilityView.Get();
+    ID3D11ShaderResourceView* bounced{};
+    g.timer->begin(g.context, Pass::LightsFilter);
+    if (soft) visibility = denoise(g, l.shadows, frame, g.lastTrace.worldFromClip, visibility, 6, 2, Signal::Visibility);
+    if (bounce) bounced = denoise(g, l.bounce, frame, g.lastTrace.worldFromClip, l.bouncedView.Get(), 16, 3, Signal::LightBounce);
+    g.timer->end(g.context, Pass::LightsFilter);
+
+    D3D11_TEXTURE2D_DESC description{};
+    target->GetDesc(&description);
+    D3D11_RENDER_TARGET_VIEW_DESC view{};
+    view.Format = frame.lightTargetFormat;
+    view.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+    ComPtr<ID3D11RenderTargetView> output;
+    check(g.device->CreateRenderTargetView(target.Get(), &view, output.GetAddressOf()), "Creating the lights' target view");
+    const RegionConstants region{{frame.rect[0], frame.rect[1]}, {l.width, l.height}};
+    g.timer->begin(g.context, Pass::LightsAdd);
+    inOwnState(g, [&]
+    {
+        g.context->UpdateSubresource(g.regionConstants.Get(), 0, nullptr, &region, 0, 0);
+        const D3D11_VIEWPORT viewport{0, 0, static_cast<float>(description.Width), static_cast<float>(description.Height), 0, 1};
+        g.context->RSSetViewports(1, &viewport);
+        g.context->OMSetRenderTargets(1, output.GetAddressOf(), nullptr);
+        g.context->OMSetBlendState(l.additive.Get(), nullptr, 0xffffffff);
+        g.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        g.context->VSSetShader(g.fullScreenShader.Get(), nullptr, 0);
+        g.context->PSSetShader(l.addShader.Get(), nullptr, 0);
+        g.context->PSSetConstantBuffers(0, 1, g.regionConstants.GetAddressOf());
+        ID3D11ShaderResourceView* inputs[]{l.unshadowedView.Get(), visibility, bounced, bounced ? g.bounce.albedoView.Get() : nullptr};
+        g.context->PSSetShaderResources(0, static_cast<UINT>(std::size(inputs)), inputs);
+        g.context->Draw(3, 0);
+    });
+    g.timer->end(g.context, Pass::LightsAdd);
+    frame.tracedLights = static_cast<unsigned>(frame.lightRects.size());
+}
+
+// Only sun shadows and the debug views read the trace shader's sun rays and primary rays; without them
+// only the other features' rays run.
 void recordTrace(Gpu& g, UINT slot, const Capture& frame, const Geometries& view, const Geometries& casters, const TraceConstants& constants,
-    UINT instances, bool primaryRays)
+    UINT instances, bool sunRays)
 {
     auto* list = g.list.Get();
     const auto timestamp = [&](UINT index) { list->EndQuery(g.timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot * TimestampsPerFrame + index); };
@@ -2129,7 +3021,7 @@ void recordTrace(Gpu& g, UINT slot, const Capture& frame, const Geometries& view
     list->ResourceBarrier(1, &unordered);
     timestamp(6);
 
-    if (primaryRays)
+    if (sunRays)
     {
         ID3D12DescriptorHeap* heaps[]{g.descriptors.Get()};
         list->SetComputeRootSignature(g.rootSignature.Get());
@@ -2138,11 +3030,10 @@ void recordTrace(Gpu& g, UINT slot, const Capture& frame, const Geometries& view
         list->SetComputeRoot32BitConstants(0, sizeof(constants) / 4, &constants, 0);
         list->SetComputeRootShaderResourceView(1, g.top->GetGPUVirtualAddress());
         list->SetComputeRootShaderResourceView(2, g.vertices->GetGPUVirtualAddress());
-        list->SetComputeRootShaderResourceView(3, g.materialTable->GetGPUVirtualAddress() + UINT64{slot} * MaxMaterialDraws * 8);
-        list->SetComputeRootShaderResourceView(4, g.cacheTable->GetGPUVirtualAddress() + UINT64{slot} * (MaxInstances - 2) * 8);
-        list->SetComputeRootShaderResourceView(5, g.cache->coordinates());
-        list->SetComputeRootShaderResourceView(6, g.templates->coordinates());
-        list->SetComputeRootDescriptorTable(7, g.descriptors->GetGPUDescriptorHandleForHeapStart());
+        list->SetComputeRootShaderResourceView(3, g.cacheTable->GetGPUVirtualAddress() + UINT64{slot} * (MaxInstances - 2) * 8);
+        list->SetComputeRootShaderResourceView(4, g.cache->coordinates());
+        list->SetComputeRootShaderResourceView(5, g.templates->coordinates());
+        list->SetComputeRootDescriptorTable(6, g.descriptors->GetGPUDescriptorHandleForHeapStart());
         list->Dispatch((constants.size[0] + 7) / 8, (constants.size[1] + 7) / 8, 1);
     }
     timestamp(7);
@@ -2158,12 +3049,7 @@ void recordTrace(Gpu& g, UINT slot, const Capture& frame, const Geometries& view
 // Direct3D 12 builds and traces, and Direct3D 11 waits on the GPU before it reads the results.
 bool trace(Gpu& g, const Capture& frame)
 {
-    // The render thread's time here, however it returns.
-    struct Timed
-    {
-        LONGLONG start = ticksNow();
-        ~Timed() { traceTicks += ticksNow() - start; }
-    } timed;
+    const TraceTime time;
     const auto width = static_cast<UINT>(frame.rect[2] - frame.rect[0]), height = static_cast<UINT>(frame.rect[3] - frame.rect[1]);
     TraceConstants constants{};
     PositionConstants positions{};
@@ -2188,17 +3074,25 @@ bool trace(Gpu& g, const Capture& frame)
     std::copy(std::begin(casters.base), std::end(casters.base), constants.geometryBase[1]);
     std::copy(std::begin(g.sun), std::end(g.sun), constants.sun);
     constants.sun[3] = g.sunFound ? 1.0f : 0.0f;
-    constants.materialDraws = static_cast<std::uint32_t>(std::min<std::size_t>(frame.materialDraws.size(), MaxMaterialDraws));
     // The geometry views show the trees' copies too, which stand in for most of the view's foliage.
-    constants.primaryMask = selected == View::ShadowCasters ? CasterMask | FoliageMask
+    constants.primaryMask = selected == View::ShadowCasters ? SunCasterMask | CasterMask | FoliageMask
         : selected == View::Geometry || selected == View::DepthComparison ? ViewMask | FoliageMask : ViewMask;
     constants.offscreenCheck = selected == View::OffscreenShadows;
+    Stopwatch stopwatch;
     ensureTraced(g, width, height);
     ensureBuildSpace(g, view, casters);
     g.timer->begin(g.context, Pass::Prepare);
+    prepareNormals(g, frame);
     prepareAmbient(g, frame, width, height);
     prepareBounce(g, frame, width, height);
     auto* depth = gameDepth(g, frame.depth.Get());
+    // Sun rays start along the game's normal. Where the game's depth or normal could not be read, they
+    // start from the primary rays' hits and normals, which the debug views show too.
+    constants.primaryRays = selected != View::Off || !depth || !g.normalsKnown;
+    // Soft shadows are filtered along the game's normals.
+    const auto features = activeFeatures();
+    constants.softShadows = features.sunShadows && features.softSunShadows && g.normalsKnown;
+    constants.frame = static_cast<std::uint32_t>(g.frames);
     inOwnState(g, [&]
     {
         std::memcpy(positions.worldFromClip, constants.worldFromClip, sizeof(positions.worldFromClip));
@@ -2216,12 +3110,26 @@ bool trace(Gpu& g, const Capture& frame)
         }
         positions.atlasSize[0] = static_cast<float>(g.atlasWidth);
         positions.atlasSize[1] = static_cast<float>(g.atlasHeight);
+        positions.transformCount = static_cast<std::uint32_t>(frame.transformDraws.size());
+        if (positions.transformCount)
+        {
+            const D3D11_BOX used{0, 0, 0, static_cast<UINT>(frame.transformDraws.size() * sizeof(TransformDraw)), 1, 1};
+            g.context->UpdateSubresource(g.transformDraws.Get(), 0, &used, frame.transformDraws.data(), 0, 0);
+        }
+        // The capture stops at MaxMaterialDraws.
+        positions.materialDrawCount = static_cast<std::uint32_t>(frame.materialDraws.size());
+        if (positions.materialDrawCount)
+        {
+            const D3D11_BOX used{0, 0, 0, positions.materialDrawCount * 8, 1, 1};
+            g.context->UpdateSubresource(g.materialDraws.Get(), 0, &used, frame.materialDraws.data(), 0, 0);
+        }
         g.context->UpdateSubresource(g.positionConstants.Get(), 0, nullptr, &positions, 0, 0);
         g.context->CSSetShader(g.positionShader.Get(), nullptr, 0);
         g.context->CSSetConstantBuffers(0, 1, g.positionConstants.GetAddressOf());
-        ID3D11ShaderResourceView* streams[]{g.streamedView.Get(), g.maskedStreamedView.Get(), g.lightSpaceView.Get()};
+        ID3D11ShaderResourceView* streams[]{g.streamedView.Get(), g.maskedStreamedView.Get(), g.lightSpaceView.Get(), g.transformDrawsView.Get(),
+            g.transformRowsView.Get(), g.materialDrawsView.Get()};
         ID3D11UnorderedAccessView* outputs[]{g.positionsAccess.Get(), g.coordinatesAccess.Get()};
-        g.context->CSSetShaderResources(0, 3, streams);
+        g.context->CSSetShaderResources(0, static_cast<UINT>(std::size(streams)), streams);
         g.context->CSSetUnorderedAccessViews(0, 2, outputs, nullptr);
         g.context->Dispatch((frame.opaqueVertices + frame.maskedVertices + 1023) / 1024, 1, 1);
         g.context->CSSetUnorderedAccessViews(0, 2, std::array<ID3D11UnorderedAccessView*, 2>{}.data(), nullptr);
@@ -2242,54 +3150,62 @@ bool trace(Gpu& g, const Capture& frame)
         g.context->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
     });
     g.timer->end(g.context, Pass::Prepare);
+    stopwatch.lap(prepareTicks);
     // From here Direct3D 11 waits for Direct3D 12.
     g.timer->begin(g.context, Pass::Wait);
     const auto geometryReady = ++g.fenceValue, traced = ++g.fenceValue;
     check(g.context4->Signal(g.fence.Get(), geometryReady), "Signalling the captured geometry");
     g.context->Flush();
+    stopwatch.lap(flushTicks);
 
     const auto slot = static_cast<UINT>(g.frames % FramesInFlight);
     const auto waitStart = ticksNow();
     waitFor(g, g.submitted[slot]);
     gpuWaitTicks += ticksNow() - waitStart;
     if (g.submitted[slot]) readTimings(g, slot);
-    if (constants.materialDraws)
-    {
-        void* table{};
-        const D3D12_RANGE nothing{};
-        check(g.materialTable->Map(0, &nothing, &table), "Writing the material table");
-        std::memcpy(static_cast<std::uint8_t*>(table) + UINT64{slot} * MaxMaterialDraws * 8, frame.materialDraws.data(), constants.materialDraws * 8);
-        g.materialTable->Unmap(0, nullptr);
-    }
     // Without the camera's position cached geometry cannot be placed.
     if (std::exchange(g.cacheReset, false) || !frame.cameraKnown)
     {
         g.cache->clear();
         g.templates->clear();
         g.foliageTemplates.clear();
+        // The live trees' sections point at the dropped templates: placed from nothing, they are placed again.
+        for (auto& [buffer, trees] : g.foliage)
+            for (auto& tree : trees.live) tree = {tree.index};
+        g.foliagePlaced.clear();
+        g.foliageTable.clear();
+        g.foliageStructures.clear();
+        g.foliageChanged = true;
     }
     // The shadow caster and off-screen shadow views show everything sun rays can see beyond the view,
     // on screen too.
     const std::vector<GeometryCache::Draw> none;
     const std::unordered_set<std::uint64_t> noObjects;
     const bool everything = selected == View::ShadowCasters || selected == View::OffscreenShadows;
+    stopwatch.restart();
     g.cache->plan(frame.cameraKnown ? frame.cacheDraws : none, maskedStart, everything, frame.casting, frame.preViewTranslation);
+    const auto templatesHeld = g.templates->size();
     g.templates->plan(frame.cameraKnown ? frame.templateDraws : none, maskedStart, false, noObjects, frame.preViewTranslation);
-    readFoliage(g);
+    // Templates are only evicted to make room for new ones.
+    if (g.templates->size() < templatesHeld + g.templates->building().first) dropEvictedFoliage(g);
     const auto instances = writeInstances(g, slot, frame.preViewTranslation);
-    // The frame's visible foliage lists are read back once the GPU has copied them.
-    auto& readback = g.foliageReadbacks[g.foliageNext];
-    readback.draws = frame.foliageDraws;
-    readback.pending = !readback.draws.empty();
-    g.foliageNext = (g.foliageNext + 1) % FoliageLatency;
+    // The visible foliage lists of every FoliageLatency-th frame are read back once the GPU has copied them.
+    if (!frame.foliageDraws.empty())
+    {
+        g.foliageReadback.draws = frame.foliageDraws;
+        g.foliageReadback.pending = true;
+    }
+    stopwatch.lap(instancesTicks);
     check(g.allocators[slot]->Reset(), "Resetting a command allocator");
     check(g.list->Reset(g.allocators[slot].Get(), nullptr), "Resetting the command list");
+    g.lastTrace = constants;
     recordTrace(g, slot, frame, view, casters, constants, instances, sunShadows || selected != View::Off);
     check(g.list->Close(), "Recording the trace");
     check(g.queue->Wait(g.d3d12Fence.Get(), geometryReady), "Waiting for the captured geometry");
     ID3D12CommandList* lists[]{g.list.Get()};
     g.queue->ExecuteCommandLists(1, lists);
     check(g.queue->Signal(g.d3d12Fence.Get(), traced), "Signalling the traced image");
+    stopwatch.lap(submitTicks);
     g.submitted[slot] = traced;
     ++g.frames;
     check(g.context4->Wait(g.fence.Get(), traced), "Waiting for the traced image");
@@ -2299,6 +3215,14 @@ bool trace(Gpu& g, const Capture& frame)
         g.timer->begin(g.context, Pass::BounceFilter);
         filterBounce(g, frame, constants.worldFromClip);
         g.timer->end(g.context, Pass::BounceFilter);
+    }
+    // The sun moves slowly, so soft shadows keep more frames than the lights'.
+    g.sunFiltered = nullptr;
+    if (constants.softShadows)
+    {
+        g.timer->begin(g.context, Pass::SunFilter);
+        g.sunFiltered = denoise(g, g.sunDenoiser, frame, constants.worldFromClip, g.sunSoftView.Get(), 12, 2, Signal::Visibility);
+        g.timer->end(g.context, Pass::SunFilter);
     }
     return true;
 }
@@ -2319,7 +3243,7 @@ void inject(Gpu& g, Capture& frame)
     {
         g.context->UpdateSubresource(g.regionConstants.Get(), 0, nullptr, &region, 0, 0);
         const D3D11_VIEWPORT viewport{0, 0, static_cast<float>(description.Width), static_cast<float>(description.Height), 0, 1};
-        ID3D11ShaderResourceView* inputs[]{g.sunlitView.Get(), g.shadowView.Get()};
+        ID3D11ShaderResourceView* inputs[]{g.sunlitView.Get(), g.shadowView.Get(), g.sunFiltered ? g.sunFiltered : g.sunlitView.Get()};
         g.context->RSSetViewports(1, &viewport);
         g.context->OMSetRenderTargets(1, target.GetAddressOf(), nullptr);
         g.context->OMSetBlendState(g.redOnly.Get(), nullptr, 0xffffffff);
@@ -2346,7 +3270,7 @@ void composite(Gpu& g, const Capture& frame, ID3D11Texture2D* backBuffer, View v
     const bool showsAmbient = view == View::AmbientOcclusion || view == View::AmbientComparison;
     auto* ambient = showsAmbient && frame.ambientFiltered ? g.ambient.filteredView.Get() : nullptr;
     const bool showsBounce = view == View::GlobalIllumination;
-    auto* bounce = showsBounce && g.bounce.tracing ? g.bounce.filteredViews[0].Get() : nullptr;
+    auto* bounce = showsBounce && g.bounce.tracing ? g.bounce.denoiser.output : nullptr;
     static bool reported{}, ambientReported{}, bounceReported{};
     if (((comparesDepth && !depth) || (view == View::ShadowComparison && !shadow)) && !std::exchange(reported, true))
         upscaler::log("Ray tracing cannot read the game's depth or sun shadow; the comparison shows the traced geometry instead.");
@@ -2370,7 +3294,7 @@ void composite(Gpu& g, const Capture& frame, ID3D11Texture2D* backBuffer, View v
         g.context->UpdateSubresource(g.compositeConstants.Get(), 0, nullptr, &constants, 0, 0);
         const D3D11_VIEWPORT viewport{0, 0, static_cast<float>(description.Width), static_cast<float>(description.Height), 0, 1};
         ID3D11ShaderResourceView* inputs[]{g.tracedView.Get(), depth, shadow, g.sunlitView.Get(), ambient, ambient ? g.ambient.gameView.Get() : nullptr,
-            ambient ? g.ambient.normalsView.Get() : nullptr, bounce, bounce ? g.bounce.albedoView.Get() : nullptr};
+            ambient ? g.normalsView.Get() : nullptr, bounce, bounce ? g.bounce.albedoView.Get() : nullptr};
         g.context->RSSetViewports(1, &viewport);
         g.context->OMSetRenderTargets(1, target.GetAddressOf(), nullptr);
         g.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -2610,29 +3534,24 @@ std::uint64_t foliageMesh(ID3D11DeviceContext* context, std::uint32_t count, std
 }
 
 // Whether the trees' copies can stand in for a foliage draw of this mesh, so the view need not
-// capture it: its template is cached and placed. The copies keep the wind of their template's frame
-// and only occlude ambient light from a distance, so the view keeps the meshes near the camera while
-// the ambient occlusion rays run.
+// capture it: its template resolved to a reference at a frame's first draw (placeFoliage), so its
+// trees are placed. The copies keep the wind of their template's frame.
 bool copiesStandIn(const Gpu& g, std::uint64_t mesh)
 {
-    if (!offscreenGeometry || (ambientWanted() && g.nearFoliage.contains(mesh))) return false;
+    if (!offscreenGeometry || !capture.cameraKnown) return false;
 
     const auto model = g.foliageTemplates.find(mesh);
-    return model != g.foliageTemplates.end() && model->second.reference != NoInstance && g.templates->find(model->second.cacheKey);
+    return model != g.foliageTemplates.end() && model->second.placedBy;
 }
 
-// Records a foliage draw the view captured: its visible instance list, read back a few frames later to
-// learn which trees exist and with which mesh, and once per mesh its first instance as the template the
-// trees are placed from.
+// Records a foliage draw the view captured: its transforms now and then and, every FoliageLatency-th
+// frame, its visible instance list, read back a few frames later to learn which trees exist and with
+// which mesh, and once per mesh its first instance as the template the trees are placed from. Templates
+// are only taken in those frames: the list read back tells which instance the template shows.
 void recordFoliage(ID3D11DeviceContext* context, const FoliageSource& source, std::uint64_t mesh, std::uint32_t instances,
     std::uint32_t firstInstance, UINT firstVertex, UINT vertices, UINT slot, bool masked)
 {
     auto& g = *gpu;
-    auto& readback = g.foliageReadbacks[g.foliageNext];
-    if (readback.pending || capture.foliageIndices + instances > FoliageIndexCapacity) return;
-
-    const D3D11_BOX listed{source.indexOffset + firstInstance * 4, 0, 0, source.indexOffset + (firstInstance + instances) * 4, 1, 1};
-    context->CopySubresourceRegion(readback.staging.Get(), 0, capture.foliageIndices * 4, 0, 0, source.indices.Get(), 0, &listed);
     auto& trees = g.foliage[source.transforms.Get()];
     D3D11_BUFFER_DESC description{};
     source.transforms->GetDesc(&description);
@@ -2657,6 +3576,12 @@ void recordFoliage(ID3D11DeviceContext* context, const FoliageSource& source, st
         trees.pending = true;
     }
 
+    auto& readback = g.foliageReadback;
+    if (g.frames % FoliageLatency || readback.pending || capture.foliageIndices + instances > FoliageIndexCapacity) return;
+
+    const D3D11_BOX listed{source.indexOffset + firstInstance * 4, 0, 0, source.indexOffset + (firstInstance + instances) * 4, 1, 1};
+    context->CopySubresourceRegion(readback.staging.Get(), 0, capture.foliageIndices * 4, 0, 0, source.indices.Get(), 0, &listed);
+
     std::uint64_t templateKey{};
     if (!g.foliageTemplates.contains(mesh))
     {
@@ -2672,7 +3597,7 @@ void recordFoliage(ID3D11DeviceContext* context, const FoliageSource& source, st
 // its texture coordinates into a free coverage slot, once per fade level when it reads a fade.
 // Returns the slot.
 UINT bake(Gpu& g, ID3D11DeviceContext* context, ID3D11PixelShader* pixelShader, ID3D11VertexShader* bakeShader, std::uint32_t textures,
-    bool fades, UINT toggles)
+    bool fades, UINT toggles, UINT transformRow)
 {
     // The material is the shader and the textures it declares; other slots can hold anything. Draws
     // look it up every frame, so the samplers and constants are fetched only to bake it.
@@ -2738,6 +3663,7 @@ UINT bake(Gpu& g, ID3D11DeviceContext* context, ID3D11PixelShader* pixelShader, 
         g.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         g.context->VSSetShader(bakeShader, nullptr, 0);
         g.context->VSSetConstantBuffers(0, 1, g.bakeLevel.GetAddressOf());
+        g.context->VSSetShaderResources(0, 1, g.transformRowsView.GetAddressOf());
         g.context->PSSetShader(pixelShader, nullptr, 0);
         g.context->PSSetShaderResources(0, static_cast<UINT>(views.size()), views.data());
         g.context->PSSetSamplers(0, static_cast<UINT>(finestSamplers.size()), finestSamplers.data());
@@ -2745,7 +3671,8 @@ UINT bake(Gpu& g, ID3D11DeviceContext* context, ID3D11PixelShader* pixelShader, 
         for (UINT level = 0; level < (fades ? FadeLevels : 1); ++level)
             for (UINT combination = 0; combination < 1u << toggles; ++combination)
             {
-                const BakeLevel levelConstants{static_cast<float>(level) / (FadeLevels - 1), static_cast<float>(level * 16) / 255, combination, {}};
+                const BakeLevel levelConstants{static_cast<float>(level) / (FadeLevels - 1), static_cast<float>(level * 16) / 255, combination,
+                    transformRow};
                 g.context->UpdateSubresource(g.bakeLevel.Get(), 0, nullptr, &levelConstants, 0, 0);
                 g.context->Draw(3, 0);
             }
@@ -2847,13 +3774,44 @@ bool captureAlphaTested(ID3D11DeviceContext* context, std::uint32_t count, std::
         return false;
     }
     if (vertices > MaskedCapacity - capture.maskedVertices || vertices > MaskedEnd - capture.opaqueVertices - capture.maskedVertices
-        || capture.materialDraws.size() >= MaxMaterialDraws)
+        || capture.materialDraws.size() >= MaxMaterialDraws || (input.transformed && capture.transformDraws.size() >= MaxTransformDraws))
     {
         ++capture.overCapacityDraws;
         return false;
     }
 
-    const auto slot = bake(g, context, pixelShader.Get(), bakeShader.Get(), input.textures, *input.fadeSemantic, input.toggles);
+    // A material tiling its texture is baked one tile; the draw's own scale and offset take its
+    // coordinates there.
+    TransformDraw transform{capture.maskedVertices, capture.maskedVertices + static_cast<UINT>(vertices),
+        static_cast<std::uint32_t>(capture.transformDraws.size()), 0, {}};
+    if (input.transformed)
+    {
+        const TransformValue values[]{input.transform.scale[0], input.transform.scale[1], input.transform.offset[0], input.transform.offset[1]};
+        for (UINT k = 0; k < 4; ++k)
+        {
+            const auto& value = values[k];
+            if (!value.constant)
+            {
+                transform.literals[k] = value.literal;
+                continue;
+            }
+
+            ComPtr<ID3D11Buffer> constants;
+            D3D11_BUFFER_DESC description{};
+            if (value.buffer < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) context->PSGetConstantBuffers(value.buffer, 1, constants.GetAddressOf());
+            if (constants) constants->GetDesc(&description);
+            if (description.ByteWidth < (value.reg + 1) * 16)
+            {
+                ++capture.unbakedDraws;
+                return false;
+            }
+
+            const D3D11_BOX row{value.reg * 16, 0, 0, (value.reg + 1) * 16, 1, 1};
+            context->CopySubresourceRegion(g.transformRows.Get(), 0, (transform.row * 4 + k) * 16, 0, 0, constants.Get(), 0, &row);
+            transform.sources |= 1u << k | (value.component & 3) << (8 + 2 * k);
+        }
+    }
+    const auto slot = bake(g, context, pixelShader.Get(), bakeShader.Get(), input.textures, *input.fadeSemantic, input.toggles, transform.row);
     UINT offset = capture.maskedVertices * MaskedVertexBytes;
     ID3D11Buffer* target = g.maskedStreamed.Get();
     context->GSSetShader(streamOutput.Get(), nullptr, 0);
@@ -2863,6 +3821,7 @@ bool captureAlphaTested(ID3D11DeviceContext* context, std::uint32_t count, std::
     context->SOSetTargets(0, nullptr, nullptr);
     context->GSSetShader(nullptr, nullptr, 0);
     capture.materialDraws.push_back({capture.maskedVertices, slot});
+    if (input.transformed) capture.transformDraws.push_back(transform);
     capture.maskedVertices += static_cast<UINT>(vertices);
     return true;
 }
@@ -3168,8 +4127,8 @@ bool readsResource(ID3D11DeviceContext* context, ID3D11Resource* resource)
     return reads;
 }
 
-// Packs the traced ambient occlusion as the game packs its own and runs the game's blur over it,
-// keeping a copy of the game's. False where the game's target is not the full-resolution
+// Combines the traced ambient occlusion with the game's own (AmbientPack) and runs the game's blur
+// over it, keeping a copy of the game's. False where the game's target is not the full-resolution
 // R32G32_UINT the trace matches.
 bool filterAmbient(Gpu& g, Capture& frame)
 {
@@ -3230,7 +4189,7 @@ bool filterAmbient(Gpu& g, Capture& frame)
 }
 
 // As lighting first reads the game's ambient occlusion: traces the frame if the sun shadows have not
-// and, with the feature on, puts the traced occlusion in place of the game's.
+// and, with the feature on, puts the traced occlusion combined with the game's in its place.
 void ambientRead(Gpu& g)
 {
     capture.ambientRead = true;
@@ -3279,6 +4238,11 @@ void sampleCosts(const Capture& frame, bool traced, float frameMilliseconds)
     sample.captureCpu = millisecondsSince(frame.captureTicks);
     sample.traceCpu = millisecondsSince(std::exchange(traceTicks, 0));
     sample.gpuWaitCpu = millisecondsSince(std::exchange(gpuWaitTicks, 0));
+    sample.foliageCpu = millisecondsSince(std::exchange(foliageTicks, 0));
+    sample.instancesCpu = millisecondsSince(std::exchange(instancesTicks, 0));
+    sample.flushCpu = millisecondsSince(std::exchange(flushTicks, 0));
+    sample.submitCpu = millisecondsSince(std::exchange(submitTicks, 0));
+    sample.prepareCpu = millisecondsSince(std::exchange(prepareTicks, 0));
     if (gpu)
     {
         if (const auto passes = gpu->timer->endFrame(gpu->context)) gpu->passes = *passes;
@@ -3295,6 +4259,7 @@ void sampleCosts(const Capture& frame, bool traced, float frameMilliseconds)
         sample.casterBuild = t.casters;
         sample.topBuild = t.top;
         sample.sunRays = t.trace;
+        sample.sunFilter = pass(Pass::SunFilter);
         sample.sunInject = pass(Pass::SunInject);
         sample.ambientRays = gpu->ambient.milliseconds;
         sample.ambientFilter = pass(Pass::AmbientFilter);
@@ -3305,12 +4270,21 @@ void sampleCosts(const Capture& frame, bool traced, float frameMilliseconds)
         // Direct3D 11 waits for all of Direct3D 12's work; what is left is the hand-over.
         const auto direct3d12 = t.copy + t.cache + t.templates + t.view + t.casters + t.top + t.trace + sample.ambientRays + sample.bounceRays;
         sample.sync = std::max(0.0f, pass(Pass::Wait) - direct3d12);
+        if (frame.tracedLights)
+        {
+            sample.lightRays = gpu->lights.milliseconds;
+            sample.lightSync = std::max(0.0f, pass(Pass::LightsWait) - sample.lightRays);
+            sample.lightFilter = pass(Pass::LightsFilter);
+            sample.lightAdd = pass(Pass::LightsAdd);
+        }
     }
 
     const auto weight = 1 - std::exp(-frameMilliseconds / 500);
-    for (auto member : {&Costs::frame, &Costs::captureCpu, &Costs::traceCpu, &Costs::gpuWaitCpu, &Costs::prepare, &Costs::copy, &Costs::viewBuild,
-        &Costs::casterBuild, &Costs::cacheBuild, &Costs::templateBuild, &Costs::topBuild, &Costs::sync, &Costs::sunRays, &Costs::sunInject,
-        &Costs::ambientRays, &Costs::ambientFilter, &Costs::bounceRays, &Costs::bounceFilter, &Costs::bounceAdd, &Costs::debugView})
+    for (auto member : {&Costs::frame, &Costs::captureCpu, &Costs::traceCpu, &Costs::gpuWaitCpu, &Costs::foliageCpu, &Costs::instancesCpu,
+        &Costs::flushCpu, &Costs::submitCpu, &Costs::prepareCpu, &Costs::prepare, &Costs::copy, &Costs::viewBuild,
+        &Costs::casterBuild, &Costs::cacheBuild, &Costs::templateBuild, &Costs::topBuild, &Costs::sync, &Costs::sunRays, &Costs::sunFilter, &Costs::sunInject,
+        &Costs::ambientRays, &Costs::ambientFilter, &Costs::bounceRays, &Costs::bounceFilter, &Costs::bounceAdd, &Costs::lightRays, &Costs::lightSync,
+        &Costs::lightFilter, &Costs::lightAdd, &Costs::debugView})
         costs.*member += (sample.*member - costs.*member) * weight;
 }
 
@@ -3319,6 +4293,10 @@ void applySetting(const Measurement::Setting& setting)
     sunShadows = setting.features.sunShadows;
     ambientOcclusion = setting.features.ambientOcclusion;
     globalIllumination = setting.features.globalIllumination;
+    lightShadows = setting.features.lightShadows;
+    softLightShadows = setting.features.softLightShadows;
+    lightBounce = setting.features.lightBounce;
+    softSunShadows = setting.features.softSunShadows;
     selected = setting.view;
     bypassed = setting.paused;
 }
@@ -3329,13 +4307,14 @@ void startMeasurement()
 {
     auto& m = measurement;
     m = {};
-    if (selected == View::Off && !sunShadows && !ambientOcclusion && !globalIllumination)
+    if (selected == View::Off && !sunShadows && !ambientOcclusion && !globalIllumination && !lightShadows)
     {
         upscaler::log("Nothing to measure: no ray-traced feature or view is on.");
         return;
     }
 
-    m.features = {sunShadows, ambientOcclusion, halfAmbientRays, replaceCanopyShadows, offscreenGeometry, globalIllumination};
+    m.features = {sunShadows, ambientOcclusion, halfAmbientRays, replaceCanopyShadows, offscreenGeometry, globalIllumination, lightShadows,
+        softLightShadows, lightBounce, softSunShadows};
     m.view = selected;
     m.bypassed = bypassed;
     Measurement::Setting setting{"", m.features, m.view, false};
@@ -3349,8 +4328,12 @@ void startMeasurement()
         m.settings.push_back(setting);
     };
     leaveOut(m.view != View::Off, "Debug view", [](auto& s) { s.view = View::Off; });
+    leaveOut(m.features.lightShadows && m.features.lightBounce, "Light bounce", [](auto& s) { s.features.lightBounce = false; });
+    leaveOut(m.features.lightShadows && m.features.softLightShadows, "Soft light shadows", [](auto& s) { s.features.softLightShadows = false; });
+    leaveOut(m.features.lightShadows, "Light shadows", [](auto& s) { s.features.lightShadows = false; });
     leaveOut(m.features.globalIllumination, "Global illumination", [](auto& s) { s.features.globalIllumination = false; });
     leaveOut(m.features.ambientOcclusion, "Ambient occlusion", [](auto& s) { s.features.ambientOcclusion = false; });
+    leaveOut(m.features.sunShadows && m.features.softSunShadows, "Soft sun shadows", [](auto& s) { s.features.softSunShadows = false; });
     leaveOut(m.features.sunShadows, "Sun shadows", [](auto& s) { s.features.sunShadows = false; });
     leaveOut(true, "Scene capture and build", [](auto& s) { s.paused = true; });
     m.running = measuring = true;
@@ -3440,6 +4423,8 @@ void publish(const Capture& frame)
     published.shadowsInjected = frame.shadowsInjected;
     published.ambientInjected = frame.ambientInjected;
     published.bounceAdded = frame.bounceAdded;
+    published.tracedLights = frame.tracedLights;
+    published.gameLights = frame.gameLights;
     if (gpu)
     {
         published.sunFound = gpu->sunFound;
@@ -3475,14 +4460,19 @@ std::vector<std::string> costLines(const Status& state)
     lines.push_back(std::format("Scene {:.2f}: placing vertices {:.2f}, copy {:.2f}, view BLAS {:.2f}, casters BLAS {:.2f}, cache builds {:.2f}, "
         "foliage templates {:.2f}, TLAS {:.2f}, Direct3D 12 hand-over {:.2f}", c.scene(), c.prepare, c.copy, c.viewBuild, c.casterBuild,
         c.cacheBuild, c.templateBuild, c.topBuild, c.sync));
-    lines.push_back(std::format("Sun shadows {:.2f}: primary and sun rays {:.2f}, adding {:.2f}", c.sunShadows(), c.sunRays, c.sunInject));
+    lines.push_back(std::format("Sun shadows {:.2f}: sun rays (and debug views' primary rays) {:.2f}, soft shadow filter {:.2f}, adding {:.2f}",
+        c.sunShadows(), c.sunRays, c.sunFilter, c.sunInject));
     lines.push_back(std::format("Ambient occlusion {:.2f}: rays {:.2f}, packing and blur {:.2f}", c.ambientOcclusion(), c.ambientRays,
         c.ambientFilter));
     lines.push_back(std::format("Global illumination {:.2f}: rays {:.2f}, accumulation and filter {:.2f}, adding {:.2f}", c.globalIllumination(),
         c.bounceRays, c.bounceFilter, c.bounceAdd));
+    lines.push_back(std::format("Light shadows {:.2f}: rays {:.2f}, Direct3D 12 hand-over {:.2f}, soft shadow and bounce filters {:.2f}, "
+        "constants and adding {:.2f}; {} lights traced, {} left to the game", c.lightShadows(), c.lightRays, c.lightSync, c.lightFilter, c.lightAdd,
+        state.tracedLights, state.gameLights));
     lines.push_back(std::format("Debug view {:.2f}", c.debugView));
-    lines.push_back(std::format("CPU {:.2f}: repeating draws {:.2f}, preparing and submitting the trace {:.2f} (waiting for the GPU {:.2f})",
-        c.cpu(), c.captureCpu, c.traceCpu, c.gpuWaitCpu));
+    lines.push_back(std::format("CPU {:.2f}: repeating draws {:.2f}, preparing and submitting the trace {:.2f} (foliage {:.2f}, cache plans and "
+        "instances {:.2f}, Direct3D 11 flush {:.2f}, record and submit {:.2f}, preparing {:.2f}, other {:.2f}; waiting for the GPU {:.2f})",
+        c.cpu(), c.captureCpu, c.traceCpu, c.foliageCpu, c.instancesCpu, c.flushCpu, c.submitCpu, c.prepareCpu, c.otherTraceCpu(), c.gpuWaitCpu));
     lines.push_back(std::format("Work: {:.2f} M triangles rebuilt (view {:.2f} M, shadow casters {:.2f} M), {} draws captured, {} cache entries built, "
         "{} cached draws traced, {} foliage instances", static_cast<double>(state.triangles) / 1e6, static_cast<double>(state.viewTriangles) / 1e6,
         static_cast<double>(state.casterTriangles) / 1e6, state.capturedDraws + state.casterDraws, state.newCacheEntries, state.tracedCachedDraws,
@@ -3505,20 +4495,22 @@ void logFrame(const Capture& frame)
 {
     const auto state = status();
     char text[1536]{};
-    std::snprintf(text, sizeof(text), "Ray tracing frame %llu: %u G-buffer draws, %u captured (%u alpha-tested, %u without coverage, %u materials), %u decals, sky or screen passes, "
-        "%u unknown shader, %u unsupported, %u over capacity; %u shadow casters (%u repeats skipped, %u left to the view, %u to the cache), %u cached draws (%u traced, %u standing in for the view; not cached: %u moving, %u anonymous), %u foliage instances from %u meshes (%u placed; %u draws left to them); %llu triangles; "
-        "%u shadow resolve draws, sun %s %.3f, %.3f, %.3f; traced shadows %s; traced ambient occlusion %s; traced global illumination %s.",
-        static_cast<unsigned long long>(tracedFrames), frame.basePassDraws, frame.capturedDraws, frame.maskedDraws, frame.unbakedDraws,
+    std::snprintf(text, sizeof(text), "Ray tracing frame %llu: %u G-buffer draws, %u captured (%u alpha-tested, %u of them tiled, %u without coverage, %u materials), %u decals, sky or screen passes, "
+        "%u unknown shader, %u unsupported, %u over capacity; %u shadow casters (%u repeats skipped, %u left to the view, %u to the cache), %u cached draws (%u traced, %u standing in for the view; not cached: %u moving, %u anonymous), %u foliage instances from %u meshes (%u placed; %u draws left to them; %llu tree sections past %u not traced so far); %llu triangles; "
+        "%u shadow resolve draws, sun %s %.3f, %.3f, %.3f; traced shadows %s; traced ambient occlusion %s; traced global illumination %s; "
+        "local lights %u traced, %u left to the game.",
+        static_cast<unsigned long long>(tracedFrames), frame.basePassDraws, frame.capturedDraws, frame.maskedDraws,
+        static_cast<unsigned>(frame.transformDraws.size()), frame.unbakedDraws,
         state.bakedMaterials, frame.backgroundDraws,
         frame.unknownShaderDraws, frame.unsupportedDraws, frame.overCapacityDraws, frame.casterDraws, frame.repeatedCasterDraws, frame.casterDrawsInView,
         frame.casterDrawsInCache, state.cachedDraws, state.tracedCachedDraws, frame.standInDraws, frame.movingDraws, frame.anonymousDraws, state.foliageInstances,
         gpu ? static_cast<unsigned>(gpu->foliageTemplates.size()) : 0u,
         gpu ? static_cast<unsigned>(std::count_if(gpu->foliageTemplates.begin(), gpu->foliageTemplates.end(),
             [](const auto& model) { return model.second.reference != NoInstance && gpu->templates->find(model.second.cacheKey); })) : 0u,
-        frame.copiedFoliageDraws,
+        frame.copiedFoliageDraws, gpu ? static_cast<unsigned long long>(gpu->foliageSectionsIgnored) : 0ull, MaxTreeSections,
         static_cast<unsigned long long>((frame.opaqueVertices + frame.maskedVertices) / 3), frame.shadowResolveDraws,
         state.sunFound ? "at" : "not found,", state.sun[0], state.sun[1], state.sun[2], frame.shadowsInjected ? "added" : "off",
-        frame.ambientInjected ? "in use" : "off", frame.bounceAdded ? "added" : "off");
+        frame.ambientInjected ? "in use" : "off", frame.bounceAdded ? "added" : "off", frame.tracedLights, frame.gameLights);
     upscaler::log(text);
     const auto lines = costLines(state);
     std::string summary = "Ray tracing costs:";
@@ -3540,8 +4532,8 @@ void releaseGpu()
 bool wanted() noexcept
 {
     const auto features = activeFeatures();
-    return (selected != View::Off || features.sunShadows || features.ambientOcclusion || features.globalIllumination || (measuring && !bypassed))
-        && !failed;
+    return (selected != View::Off || features.sunShadows || features.ambientOcclusion || features.globalIllumination || features.lightShadows
+        || (measuring && !bypassed)) && !failed;
 }
 
 void beginView(const float (&clipFromWorld)[16], const std::int32_t (&rect)[4], const std::int32_t (&unscaled)[4],
@@ -3602,6 +4594,12 @@ void vertexShaderCreated(const void* code, std::size_t size, IUnknown* shader) n
         return;
 
     vertexShader->SetPrivateData(VertexBytecode, static_cast<UINT>(size), code);
+    if (size >= 20)
+    {
+        const auto* checksum = static_cast<const std::uint8_t*>(code) + 4;
+        for (const auto& [hash, kind] : {std::pair{LightVolumeShader, LightShader::Volume}, std::pair{DeferredLightShader, LightShader::Light}})
+            if (std::equal(hash.begin(), hash.end(), checksum)) vertexShader->SetPrivateData(LightShaderTag, sizeof(kind), &kind);
+    }
     const auto slots = declaredConstantBuffers(code, size);
     vertexShader->SetPrivateData(ConstantSlots, sizeof(slots), &slots);
 
@@ -3641,6 +4639,9 @@ void pixelShaderCreated(const void* code, std::size_t size, IUnknown* shader) no
             pixelShader->SetPrivateData(ShadowResolveShader, sizeof(resolve.constantSlot), &resolve.constantSlot);
     try
     {
+        // Light shaders for hair keep the light's constants in another slot.
+        const auto slots = declaredConstantBuffers(code, size);
+        pixelShader->SetPrivateData(ConstantSlots, sizeof(slots), &slots);
         constexpr UINT tested = 1;
         // Alpha-tested materials discard by a texture; their cards are not solid.
         if (!discardsByTexture(code, size)) return;
@@ -3663,6 +4664,8 @@ void pixelShaderCreated(const void* code, std::size_t size, IUnknown* shader) no
             input.fadeComponent = test->fadeComponent;
         }
         input.toggles = static_cast<UINT>(test->toggles.size());
+        input.transformed = test->transform.has_value();
+        if (test->transform) input.transform = *test->transform;
         pixelShader->SetPrivateData(BakeInputData, sizeof(input), &input);
         pixelShader->SetPrivateData(BakeShaderSource, static_cast<UINT>(test->bakeVertexShader.size()), test->bakeVertexShader.data());
     }
@@ -3687,6 +4690,7 @@ void dispatch(ID3D11DeviceContext* context) noexcept
 
     try
     {
+        if (capture.lightsPending) traceLights(*gpu, capture);
         // Compute work after lighting has started means every lighting model has drawn.
         if (capture.bouncePending) addBounce(*gpu, capture);
         if (capture.traced) return;
@@ -3849,13 +4853,21 @@ bool draw(ID3D11DeviceContext* context, std::uint32_t count, std::uint32_t insta
 
     try
     {
+        if (!std::exchange(capture.foliagePlaced, true)) prepareFoliage(*gpu, capture);
         if (shadowResolve(context))
         {
             const auto features = activeFeatures();
             return features.sunShadows && features.replaceCanopyShadows && gpu->sunFound
                 && resolveWithoutCanopy(context, count, instances, first, baseVertex, firstInstance, indexed);
         }
+        // The local lights draw after the trace; any other draw after them means they all have.
+        const auto light = capture.traced ? lightShader(context) : std::nullopt;
+        if (capture.lightsPending && !light) traceLights(*gpu, capture);
         captureDraw(context, count, instances, first, baseVertex, firstInstance, indexed);
+        if (!light) capture.lightOpen = false;
+        else if (*light == LightShader::Volume) capture.lightVolumeDrawn = true;
+        else if (activeFeatures().lightShadows && capture.cameraKnown)
+            return drawLight(*gpu, capture, context, count, instances, first, baseVertex, firstInstance, indexed);
     }
     catch (const std::exception& error) { fail(error.what()); }
     return false;
@@ -3872,13 +4884,20 @@ void present(ID3D11DeviceContext* context, ID3D11Texture2D* backBuffer) noexcept
     try
     {
         // The A/B key only pauses the features, so switching back is instant.
-        if (failed || (view == View::Off && !sunShadows && !ambientOcclusion && !globalIllumination && !measuring)) releaseGpu();
+        if (failed || (view == View::Off && !sunShadows && !ambientOcclusion && !globalIllumination && !lightShadows && !measuring)) releaseGpu();
         else
         {
             if (!gpu) gpu = create(context);
             if (frame.depth) gpu->sceneDepth = frame.depth;
             readSun(*gpu);
             if (frame.shadowPending) copyShadow(*gpu, frame);
+            // Lights still in their slots at the end of the frame are lost: the scene colour has been
+            // used by now. Nothing after the lights drew to it, or ran compute work.
+            if (std::exchange(frame.lightsPending, false))
+            {
+                static bool reported{};
+                if (!std::exchange(reported, true)) upscaler::log("The frame ended before the traced lights could be added to the scene.");
+            }
             // Frames without a sun shadow pass (menus, interiors) are traced here for the debug views.
             traced = frame.traced || (view != View::Off && trace(*gpu, frame));
             if (traced && view != View::Off && backBuffer)
@@ -3917,6 +4936,10 @@ Status status()
     result.features.replaceCanopyShadows = replaceCanopyShadows;
     result.features.offscreenGeometry = offscreenGeometry;
     result.features.globalIllumination = globalIllumination;
+    result.features.lightShadows = lightShadows;
+    result.features.softLightShadows = softLightShadows;
+    result.features.lightBounce = lightBounce;
+    result.features.softSunShadows = softSunShadows;
     result.bypassed = bypassed;
     result.toggledAt = toggledAt;
     result.performanceOverlay = performanceOverlay;
@@ -3946,6 +4969,10 @@ void enable(const Features& features)
     replaceCanopyShadows = features.replaceCanopyShadows;
     offscreenGeometry = features.offscreenGeometry;
     globalIllumination = features.globalIllumination;
+    lightShadows = features.lightShadows;
+    softLightShadows = features.softLightShadows;
+    lightBounce = features.lightBounce;
+    softSunShadows = features.softSunShadows;
 }
 
 void toggleFeatures()

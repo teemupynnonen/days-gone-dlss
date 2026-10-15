@@ -1901,6 +1901,26 @@ static void reloadDiagnostics()
             features.globalIllumination = value != 0;
             featuresRead = true;
         }
+        else if (key == "ray_tracing_light_shadows")
+        {
+            features.lightShadows = value != 0;
+            featuresRead = true;
+        }
+        else if (key == "ray_tracing_soft_light_shadows")
+        {
+            features.softLightShadows = value != 0;
+            featuresRead = true;
+        }
+        else if (key == "ray_tracing_light_bounce")
+        {
+            features.lightBounce = value != 0;
+            featuresRead = true;
+        }
+        else if (key == "ray_tracing_soft_sun_shadows")
+        {
+            features.softSunShadows = value != 0;
+            featuresRead = true;
+        }
         else if (key == "ray_tracing_performance_overlay" && build->rayTracingView) ray_tracing::showPerformance(value != 0);
         // A new number starts a measurement, so rewriting the file with the same one does not.
         else if (key == "ray_tracing_measure_cost" && build->rayTracingView && value && value != std::exchange(measureRequest, value))

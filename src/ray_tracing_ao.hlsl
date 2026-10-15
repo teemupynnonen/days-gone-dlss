@@ -5,7 +5,10 @@
 // on the normal's side, so only those four are traced. Each gets one cosine-weighted ray from the
 // game's surface into the part of the hemisphere nearest its corner, and occluders within a radius
 // count more the nearer they are. The top bytes hold Bend's depth; Direct3D 11 fills them in.
-#define AmbientRootSignature "RootConstants(num32BitConstants=23, b0), SRV(t0), SRV(t2), SRV(t7), SRV(t8), SRV(t9), " \
+// Direct3D 11 also keeps, per corner, the lower of this and the game's own: the game's screen-space
+// occlusion gives the near contact the trees' copies leave out (CopyDistance), such as grass on the
+// ground, and the rays add what the screen does not hold.
+#define AmbientRootSignature "RootConstants(num32BitConstants=22, b0), SRV(t0), SRV(t7), SRV(t8), SRV(t9), " \
     "DescriptorTable(SRV(t3, numDescriptors=4), UAV(u0))"
 
 cbuffer AmbientParameters : register(b0)
@@ -13,14 +16,13 @@ cbuffer AmbientParameters : register(b0)
     row_major float4x4 WorldFromClip;
     uint2 Size;
     uint2 MaskedBase;     // Per instance: its first alpha-tested vertex in Coordinates
-    uint MaterialDraws;   // Entries in Materials
     uint Frame;           // Varies the rays from frame to frame
     uint HalfRays;        // Each pixel traces two corners and takes the other two from its neighbour
 };
 RaytracingAccelerationStructure Scene : register(t0);
-StructuredBuffer<uint2> Materials : register(t2); // Per alpha-tested draw: first vertex, coverage slot
 Texture2D<float> GameDepth : register(t3);        // The game's device depth over the view, 0 for sky
-Texture2D<float4> Coordinates : register(t4);     // Alpha-tested vertices' texture coordinates and fade, 4096 a row
+// Alpha-tested vertices' texture coordinates, fade and their draw's coverage slot (w, -1: none), 4096 a row
+Texture2D<float4> Coordinates : register(t4);
 Texture2D<float> Coverage : register(t5);         // Each material's lowest passing fade level * 16 / 255; 1: never
 Texture2D<uint> Normals : register(t6);           // The game's G-buffer normal over the view, 0 for sky
 RWTexture2D<uint4> Output : register(u0);         // xy: visibility of the four traced corners, 6 bits each
@@ -45,22 +47,6 @@ float3 Unproject(float2 screen, float depth)
     return world.xyz / world.w;
 }
 
-// Bend's octahedral normal, 10 bits a component in bits 0 to 19 (BuildAmbientMaskCS, the lighting).
-float3 DecodeNormal(uint packed)
-{
-    float2 encoded = float2(packed & 1023, packed >> 10 & 1023) * (2.0 / 1023) - 1;
-    float3 normal = float3(encoded, 1 - abs(encoded.x) - abs(encoded.y));
-    if (normal.z < 0) normal.xy = (1 - abs(normal.yx)) * select(normal.xy >= 0, 1.0, -1.0);
-    return normalize(normal);
-}
-
-uint Hash(uint value)
-{
-    uint state = value * 747796405u + 2891336453u;
-    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
-    return (word >> 22u) ^ word;
-}
-
 float2 Random(inout uint seed)
 {
     uint a = Hash(seed), b = Hash(a);
@@ -82,11 +68,13 @@ float3 CosineDirection(float3 normal, float2 random)
 // 1 where nothing lies within the radius, else the squared fraction of it the ray travels: an
 // occluder at half the radius takes away three quarters of the light, and the edge of the radius
 // does not show. The fraction itself would leave the ground under a car most of its light.
-// The view's geometry (instance mask 1, with the cached draws standing in for it) occludes from the
-// start. The trees' copies (mask 4) stand in for most of the view's foliage but keep the wind of the
-// frame their template came from, so they occlude from `copyDistance` on: a leaf is not occluded by
-// its own copy. The shadow casters are the sun shadow map's coarser level of detail, placed from the
-// map, and stand off the surfaces they double by more than these short rays allow.
+// The view's geometry (instance mask 1, with the cached draws standing in for it) and the cached
+// geometry off screen (2) occlude from the start: a wall just outside the view still darkens the
+// corner beside it, which the screen-space occlusion cannot see. The trees' copies (mask 4) stand in
+// for most of the view's foliage but keep the wind of the frame their template came from, so they
+// occlude from `copyDistance` on: a leaf is not occluded by its own copy. The shadow casters are the
+// sun shadow map's coarser level of detail, placed from the map, and stand off the surfaces they
+// double by more than these short rays allow.
 float Visibility(float3 start, float3 direction, float radius, float copyDistance)
 {
     RayDesc ray;
@@ -95,7 +83,7 @@ float Visibility(float3 start, float3 direction, float radius, float copyDistanc
     ray.TMin = 0;
     ray.TMax = radius;
     RayQuery<RAY_FLAG_NONE> view;
-    view.TraceRayInline(Scene, RAY_FLAG_NONE, 1, ray);
+    view.TraceRayInline(Scene, RAY_FLAG_NONE, 3, ray);
     Resolve(view);
     if (view.CommittedStatus() == COMMITTED_TRIANGLE_HIT) ray.TMax = view.CommittedRayT();
     if (copyDistance < ray.TMax)
@@ -200,13 +188,16 @@ void main(uint2 pixel : SV_DispatchThreadID, uint2 local : SV_GroupThreadID)
     }
     if (!inside) return;
 
-    uint2 packed = 0;
+    // The corners not traced, and all of a pixel without a surface, are fully visible: AmbientPack keeps
+    // the lower of each corner's two, so the game's own stays there.
+    uint2 packed = 0x00ffffff;
     if (surface)
         for (uint pair = 0; pair < 4; ++pair)
         {
             uint slot = pair * 2 + (sideBits >> pair & 1 ? 0 : 1);
-            if (slot < 4) packed.x |= corners[pair] << (slot * 6);
-            else packed.y |= corners[pair] << (slot * 6 - 24);
+            uint shift = slot % 4 * 6;
+            if (slot < 4) packed.x = (packed.x & ~(63u << shift)) | corners[pair] << shift;
+            else packed.y = (packed.y & ~(63u << shift)) | corners[pair] << shift;
         }
     Output[pixel] = uint4(packed, 0, 0);
 }

@@ -5,7 +5,7 @@
 // same point on screen, a mid grey otherwise. The output is the light bounced toward the pixel per
 // unit of the sun's colour; Direct3D 11 accumulates it over frames, filters it and lights the scene
 // with it.
-#define BounceRootSignature "RootConstants(num32BitConstants=46, b0), SRV(t0), SRV(t1), SRV(t2), SRV(t6), SRV(t7), SRV(t8), SRV(t9), " \
+#define BounceRootSignature "RootConstants(num32BitConstants=45, b0), SRV(t0), SRV(t1), SRV(t6), SRV(t7), SRV(t8), SRV(t9), " \
     "SRV(t10), DescriptorTable(SRV(t3, numDescriptors=3), SRV(t11, numDescriptors=2), UAV(u0))"
 
 cbuffer BounceParameters : register(b0)
@@ -16,14 +16,13 @@ cbuffer BounceParameters : register(b0)
     uint2 MaskedBase;   // Per instance: its first alpha-tested vertex in Coordinates
     float4 Sun;         // xyz toward the sun; w is 0 until the game's shadow pass has been seen
     uint4 GeometryBase; // Per instance, the view's geometry then the shadow casters: the first vertex of each geometry
-    uint MaterialDraws; // Entries in Materials
     uint Frame;         // Varies the rays from frame to frame
 };
 RaytracingAccelerationStructure Scene : register(t0);
 StructuredBuffer<float4> Vertices : register(t1);
-StructuredBuffer<uint2> Materials : register(t2); // Per alpha-tested draw: first vertex, coverage slot
 Texture2D<float> GameDepth : register(t3);        // The game's device depth over the view, 0 for sky
-Texture2D<float4> Coordinates : register(t4);     // Alpha-tested vertices' texture coordinates and fade, 4096 a row
+// Alpha-tested vertices' texture coordinates, fade and their draw's coverage slot (w, -1: none), 4096 a row
+Texture2D<float4> Coordinates : register(t4);
 Texture2D<float> Coverage : register(t5);         // Each material's lowest passing fade level * 16 / 255; 1: never
 StructuredBuffer<uint2> CachedDraws : register(t6);       // Per cached instance (from 2): first coordinate, coverage slot
 StructuredBuffer<float4> CacheCoordinates : register(t7); // Cached alpha-tested vertices' texture coordinates and fade
@@ -48,22 +47,6 @@ float3 Unproject(float2 screen, float depth)
 {
     float4 world = mul(float4(screen, depth, 1), WorldFromClip);
     return world.xyz / world.w;
-}
-
-// Bend's octahedral normal, 10 bits a component in bits 0 to 19.
-float3 DecodeNormal(uint packed)
-{
-    float2 encoded = float2(packed & 1023, packed >> 10 & 1023) * (2.0 / 1023) - 1;
-    float3 normal = float3(encoded, 1 - abs(encoded.x) - abs(encoded.y));
-    if (normal.z < 0) normal.xy = (1 - abs(normal.yx)) * select(normal.xy >= 0, 1.0, -1.0);
-    return normalize(normal);
-}
-
-uint Hash(uint value)
-{
-    uint state = value * 747796405u + 2891336453u;
-    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
-    return (word >> 22u) ^ word;
 }
 
 float3 CosineDirection(float3 normal, uint seed)
@@ -150,7 +133,7 @@ void main(uint2 pixel : SV_DispatchThreadID)
     RayQuery<RAY_FLAG_NONE> copies;
     if (ray.TMin < ray.TMax)
     {
-        copies.TraceRayInline(Scene, RAY_FLAG_NONE, 6, ray);
+        copies.TraceRayInline(Scene, RAY_FLAG_NONE, 14, ray);
         Resolve(copies);
     }
     bool hitCopy = ray.TMin < ray.TMax && copies.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
@@ -167,6 +150,6 @@ void main(uint2 pixel : SV_DispatchThreadID)
     // Everything captured shadows the point, foliage included: a tree's copy shading its own leaves
     // is canopy shading them all the same.
     float3 start = hit + hitNormal * (0.5 + length(hit - eye) * 1e-3);
-    if (lit > 0 && Occluded(start, Sun.xyz, 7, 0, 1e30)) lit = 0;
+    if (lit > 0 && Occluded(start, Sun.xyz, 15, 0, 1e30)) lit = 0;
     Output[pixel] = float4(AlbedoAt(hit) * lit, 1);
 }

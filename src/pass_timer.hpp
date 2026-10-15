@@ -12,7 +12,10 @@
 namespace days_gone_dlss::ray_tracing
 {
 // The ray tracer's own work in Direct3D 11's command stream.
-enum class Pass : std::size_t { Prepare, Wait, SunInject, AmbientFilter, BounceFilter, BounceAdd, DebugView, Count };
+enum class Pass : std::size_t
+{
+    Prepare, Wait, SunFilter, SunInject, AmbientFilter, BounceFilter, BounceAdd, LightsWait, LightsFilter, LightsAdd, DebugView, Count
+};
 
 // Times passes on the GPU: a timestamp before and after each run, read back a few frames later
 // without waiting. Runs of the same pass in a frame add up.

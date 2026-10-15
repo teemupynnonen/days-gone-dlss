@@ -143,8 +143,15 @@ add_custom_command(OUTPUT "${GENERATED_DIR}/ray_tracing_bounce.h"
     DEPENDS src/ray_tracing_bounce.hlsl src/ray_tracing_scene.hlsli
     VERBATIM
 )
+add_custom_command(OUTPUT "${GENERATED_DIR}/ray_tracing_lights.h"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${GENERATED_DIR}"
+    COMMAND "${DXC_EXECUTABLE}" -nologo -T cs_6_5 -E main -Vn LightsTraceShader -Fh "${GENERATED_DIR}/ray_tracing_lights.h"
+        "${CMAKE_SOURCE_DIR}/src/ray_tracing_lights.hlsl"
+    DEPENDS src/ray_tracing_lights.hlsl src/ray_tracing_scene.hlsli
+    VERBATIM
+)
 add_custom_target(ray_tracing_shaders DEPENDS "${GENERATED_DIR}/ray_tracing_trace.h" "${GENERATED_DIR}/ray_tracing_ao.h"
-    "${GENERATED_DIR}/ray_tracing_bounce.h")
+    "${GENERATED_DIR}/ray_tracing_bounce.h" "${GENERATED_DIR}/ray_tracing_lights.h")
 
 add_library(days_gone_dlss SHARED src/upscaler.cpp src/upscaler_settings.cpp src/upscaler_menu.cpp src/upscaler_addon.cpp
     src/ambient_occlusion.cpp src/indirect_lighting.cpp src/shader_bytecode.cpp src/presenter.cpp src/frame_generation.cpp

@@ -223,7 +223,9 @@ float4 main(uint vertex : SV_VertexID) : SV_Position
     // A quad cut out by a checkerboard in front of an opaque background. As in Bend's renderer, its
     // depth prepass alpha-tests, scaling the opacity by a per-vertex fade, and its G-buffer draw
     // matches that depth without discarding. The first triangle is faded out. Like Bend's foliage,
-    // both draws narrow the viewport's depth range and scale clip z to match.
+    // both draws narrow the viewport's depth range and scale clip z to match. Like a chain-link
+    // fence, the material tiles its texture: the mesh's coordinates span 1/32 and the alpha test
+    // scales them by 32 (and offsets them), which would fill every texel of a bake over 0 to 1.
     const auto backgroundCode = compile(R"(
 float4 main(uint vertex : SV_VertexID) : SV_Position
 {
@@ -234,18 +236,25 @@ cbuffer View : register(b0) { row_major float4x4 ClipFromWorld; };
 void main(uint vertex : SV_VertexID, out float4 position : SV_Position, out float2 uv : TEXCOORD0, out float fade : COLOR0)
 {
     const float2 corners[6] = { float2(0, 0), float2(1, 0), float2(0, 1), float2(0, 1), float2(1, 0), float2(1, 1) };
-    uv = corners[vertex];
+    float2 corner = corners[vertex];
+    uv = corner / 32;
     fade = vertex < 3 ? 0.25 : 0.9;
-    position = mul(float4(lerp(-250, 250, uv.x), lerp(200, -200, uv.y), 450, 1), ClipFromWorld);
+    position = mul(float4(lerp(-250, 250, corner.x), lerp(200, -200, corner.y), 450, 1), ClipFromWorld);
     position.z /= 0.08;
 })");
     const auto alphaCode = compile(R"(
+cbuffer Material : register(b0) { float4 Tiling; };
 Texture2D<float4> Opacity : register(t0);
 SamplerState Point : register(s0);
 void main(float4 position : SV_Position, float2 uv : TEXCOORD0, float fade : COLOR0)
 {
-    clip(Opacity.Sample(Point, uv).a * fade - 0.3333);
+    clip(Opacity.Sample(Point, uv * Tiling.xy + Tiling.zw).a * fade - 0.3333);
 })", "ps_5_0");
+    D3D11_BUFFER_DESC tilingDescription{16, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER};
+    const float tilingValues[4]{32, 32, 0.25f, 0.25f};
+    const D3D11_SUBRESOURCE_DATA tilingData{tilingValues};
+    ComPtr<ID3D11Buffer> tiling;
+    check(device->CreateBuffer(&tilingDescription, &tilingData, &tiling));
     ComPtr<ID3D11VertexShader> backgroundShader, quadShader;
     ComPtr<ID3D11PixelShader> alphaShader;
     check(device->CreateVertexShader(backgroundCode->GetBufferPointer(), backgroundCode->GetBufferSize(), nullptr, &backgroundShader));
@@ -257,7 +266,7 @@ void main(float4 position : SV_Position, float2 uv : TEXCOORD0, float fade : COL
     std::vector<std::uint32_t> checker(64 * 64);
     for (UINT y = 0; y < 64; ++y)
         for (UINT x = 0; x < 64; ++x)
-            checker[y * 64 + x] = (x / 8 + y / 8) % 2 ? 0xffffffff : 0x00ffffff;
+            checker[y * 64 + x] = (x / 4 + y / 4) % 2 ? 0xffffffff : 0x00ffffff;
     D3D11_TEXTURE2D_DESC checkerDescription{64, 64, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE};
     const D3D11_SUBRESOURCE_DATA checkerData{checker.data(), 64 * 4};
     ComPtr<ID3D11Texture2D> checkerTexture;
@@ -280,6 +289,7 @@ void main(float4 position : SV_Position, float2 uv : TEXCOORD0, float fade : COL
         context->PSSetShader(alphaShader.Get(), nullptr, 0);
         context->PSSetShaderResources(0, 1, checkerView.GetAddressOf());
         context->PSSetSamplers(0, 1, pointSampler.GetAddressOf());
+        context->PSSetConstantBuffers(0, 1, tiling.GetAddressOf());
         draw(quadShader.Get(), depthState.Get(), 6);
         context->OMSetRenderTargets(2, targets, depthTarget.Get());
         context->PSSetShader(nullptr, nullptr, 0);

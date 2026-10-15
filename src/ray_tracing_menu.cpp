@@ -16,7 +16,8 @@ namespace
 {
 using namespace menu;
 
-const ImVec4 Blue{0.5f, 0.65f, 0.95f, 1}, Teal{0.4f, 0.8f, 0.75f, 1}, Orange{0.95f, 0.6f, 0.3f, 1}, Purple{0.75f, 0.55f, 0.95f, 1};
+const ImVec4 Blue{0.5f, 0.65f, 0.95f, 1}, Teal{0.4f, 0.8f, 0.75f, 1}, Orange{0.95f, 0.6f, 0.3f, 1}, Purple{0.75f, 0.55f, 0.95f, 1},
+    Pink{0.95f, 0.5f, 0.7f, 1};
 
 struct Part { const char* name; float milliseconds; };
 struct CostRow { const char* name; ImVec4 colour; float milliseconds; std::vector<Part> parts; };
@@ -28,13 +29,19 @@ std::vector<CostRow> costRows(const Costs& c)
         {"Scene", Blue, c.scene(), {{"Placing vertices, copying depth", c.prepare}, {"Copy to Direct3D 12", c.copy}, {"View BLAS", c.viewBuild},
             {"Shadow casters BLAS", c.casterBuild}, {"Geometry cache builds", c.cacheBuild}, {"Foliage templates", c.templateBuild},
             {"TLAS", c.topBuild}, {"Direct3D 12 hand-over", c.sync}}},
-        {"Sun shadows", Yellow, c.sunShadows(), {{"Primary and sun rays", c.sunRays}, {"Adding to the game's shadow", c.sunInject}}},
+        {"Sun shadows", Yellow, c.sunShadows(), {{"Sun rays (and debug views' primary rays)", c.sunRays}, {"Soft shadow filter", c.sunFilter},
+            {"Adding to the game's shadow", c.sunInject}}},
         {"Ambient occlusion", Teal, c.ambientOcclusion(), {{"Rays", c.ambientRays}, {"Packing and the game's blur", c.ambientFilter}}},
         {"Global illumination", Orange, c.globalIllumination(), {{"Rays", c.bounceRays}, {"Accumulation and filter", c.bounceFilter},
             {"Adding to the scene", c.bounceAdd}}},
+        {"Light shadows", Pink, c.lightShadows(), {{"Rays (shadows and bounce)", c.lightRays}, {"Direct3D 12 hand-over", c.lightSync},
+            {"Soft shadow and bounce filters", c.lightFilter}, {"Constants and adding to the scene", c.lightAdd}}},
         {"Debug view", Grey, c.debugView, {}},
         {"CPU (render thread)", Purple, c.cpu(), {{"Repeating the game's draws", c.captureCpu},
-            {"Preparing and submitting the trace", c.traceCpu}, {"  of which waiting for the GPU", c.gpuWaitCpu}}},
+            {"Preparing and submitting the trace", c.traceCpu}, {"  of which foliage", c.foliageCpu},
+            {"  of which cache plans and instances", c.instancesCpu}, {"  of which Direct3D 11 flush", c.flushCpu},
+            {"  of which record and submit", c.submitCpu}, {"  of which preparing", c.prepareCpu}, {"  of which other", c.otherTraceCpu()},
+            {"  of which waiting for the GPU", c.gpuWaitCpu}}},
     };
 }
 
@@ -183,7 +190,7 @@ void drawWork(const Status& state)
 void drawStatus(const Status& state)
 {
     const auto& features = state.features;
-    const bool anyFeature = features.sunShadows || features.ambientOcclusion || features.globalIllumination;
+    const bool anyFeature = features.sunShadows || features.ambientOcclusion || features.globalIllumination || features.lightShadows;
     if (!state.failure.empty()) statusLine(Red, std::format("Ray tracing stopped: {} Change a setting to retry.", state.failure));
     else if (!anyFeature && state.view == View::Off) statusLine(Grey, "Ray tracing is off.");
     else if (state.bypassed) statusLine(Yellow, "Switched off with F9: the game's own image is shown.");
@@ -214,14 +221,20 @@ void drawMenu()
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
         ImGui::SetTooltip("Leaves out the game's soft shadow under tree canopies, so only the traced trees and leaves shadow there.\n"
             "Needs the ray-traced sun shadows.");
+    ImGui::BeginDisabled(!features.sunShadows);
+    if (ImGui::Checkbox("Soft sun shadows", &features.softSunShadows)) enable(features);
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("Traces toward points across the sun's or moon's disc, so shadows soften away from what casts them, as\n"
+            "the light shadows' soft option does. Filtered over frames and neighbouring pixels. Needs the ray-traced sun shadows.");
     if (ImGui::Checkbox("Off-screen objects and trees", &features.offscreenGeometry)) enable(features);
     tooltip("Also traces cached static objects and copies of the trees around the camera, so their shadows stay when they\n"
         "leave the view. Off: only what is on screen and the game's shadow casters cast.");
     ImGui::Unindent();
 
     if (ImGui::Checkbox("Ray-traced ambient occlusion", &features.ambientOcclusion)) enable(features);
-    tooltip("Replaces the game's screen-space ambient occlusion with occlusion traced from the same geometry, filtered by\n"
-        "the game's own blur and accumulation.");
+    tooltip("Traces ambient occlusion from the same geometry and keeps the darker of it and the game's screen-space\n"
+        "occlusion, filtered by the game's own blur and accumulation.");
 
     ImGui::Indent();
     ImGui::BeginDisabled(!features.ambientOcclusion);
@@ -233,6 +246,25 @@ void drawMenu()
     ImGui::Unindent();
     if (ImGui::Checkbox("Ray-traced global illumination", &features.globalIllumination)) enable(features);
     tooltip("Adds sunlight bounced once off the same geometry to the game's lighting, accumulated over frames and filtered.");
+    if (ImGui::Checkbox("Ray-traced light shadows", &features.lightShadows)) enable(features);
+    tooltip("Traces the shadows of the game's lamps, fires and flashlight from the same geometry in place of their shadow\n"
+        "maps. Lights the game draws without shadows get them too. Up to 16 lights a frame; the rest keep the game's.");
+
+    ImGui::Indent();
+    ImGui::BeginDisabled(!features.lightShadows);
+    if (ImGui::Checkbox("Soft shadows", &features.softLightShadows)) enable(features);
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("Traces toward points across each light's size, so shadows soften away from what casts them. Lights the\n"
+            "game gives no size get one: fires and bulbs by their reach, lamps 5 cm. Filtered over a few frames and\n"
+            "neighbouring pixels. Needs the ray-traced light shadows.");
+    ImGui::BeginDisabled(!features.lightShadows);
+    if (ImGui::Checkbox("Bounce light", &features.lightBounce)) enable(features);
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("Adds the lights' light bounced once off the same geometry, accumulated over frames and filtered, so\n"
+            "their shadows fill in as in a real room. Needs the ray-traced light shadows.");
+    ImGui::Unindent();
 }
 
 void drawDiagnostics(float width)
@@ -248,7 +280,8 @@ void drawDiagnostics(float width)
         "nearer, blue where it hits something farther or nothing.\nSun shadow comparison: yellow where the game and the trace are both "
         "lit, red where only the game is, green where only the trace is.\nShadow caster depth comparison: the depth comparison "
         "for the casters taken from the game's sun shadow map alone.\nAmbient occlusion comparison: the game's on the left, the "
-        "traced on the right, both as lighting reads them.\nRay-traced global illumination: the bounced light alone, as it is added.");
+        "traced and the game's combined on the right, both as lighting reads them.\nRay-traced global illumination: the bounced "
+        "light alone, as it is added.");
 
     bool overlay = state.performanceOverlay;
     if (ImGui::Checkbox("Show the costs over the game", &overlay)) showPerformance(overlay);
@@ -287,8 +320,9 @@ void drawDiagnostics(float width)
         state.shadowResolveDraws);
     else ImGui::TextUnformatted("Sun direction: waiting for the game's sun shadow pass.");
     ImGui::Text("Traced sun shadows: %s", state.shadowsInjected ? "added to the game's" : "not in use this frame");
-    ImGui::Text("Traced ambient occlusion: %s", state.ambientInjected ? "in place of the game's" : "not in use this frame");
+    ImGui::Text("Traced ambient occlusion: %s", state.ambientInjected ? "combined with the game's" : "not in use this frame");
     ImGui::Text("Traced global illumination: %s", state.bounceAdded ? "added to the game's lighting" : "not in use this frame");
+    ImGui::Text("Local lights: %u traced, %u left to the game", state.tracedLights, state.gameLights);
     ImGui::TreePop();
 }
 
