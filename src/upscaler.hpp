@@ -1,5 +1,6 @@
 #pragma once
 
+#include "frame_generation.hpp"
 #include "upscaler_settings.hpp"
 
 #include <array>
@@ -51,8 +52,8 @@ const char* selectBuild(std::uintptr_t imageBase) noexcept;
 // The ray-tracing experiment only knows the selected build's view layout on 1.13.
 bool rayTracingSupported() noexcept;
 // Outside the loader lock, after MinHook is initialized and a build is selected: settings, console
-// variables, view hook.
-void initialize(const std::filesystem::path& directory);
+// variables, view hook. With frame generation also the game thread's frame, for Reflex.
+void initialize(const std::filesystem::path& directory, bool withFrameGeneration);
 // Keeps the render scale and jitter in step with DLSS; called at present.
 void tick() noexcept;
 // Restores the engine's render settings and stops replacing the game's TAA.
@@ -69,7 +70,8 @@ void log(std::string_view message);
 // ---- Render side, on the thread executing Direct3D work ----
 // `context` is the native immediate context every call below runs on. `ngxContext` is what NGX
 // receives: ReShade's wrapper where there is one, so other add-ons can follow the evaluation.
-void attach(ID3D11Device* device, ID3D11DeviceContext* context, ID3D11DeviceContext* ngxContext) noexcept;
+// `frameGeneration` shares DLSS's depth and motion with Direct3D 12 and adds the hudless colour.
+void attach(ID3D11Device* device, ID3D11DeviceContext* context, ID3D11DeviceContext* ngxContext, bool frameGeneration) noexcept;
 // Releases DLSS immediately; only when no Direct3D work can run (device teardown).
 void detach() noexcept;
 bool attached() noexcept;
@@ -82,6 +84,8 @@ bool biasSamplers(ID3D11DeviceContext* context, unsigned count, ID3D11SamplerSta
     ID3D11SamplerState** biased) noexcept;
 // Recognises the game's shaders by their DXBC hash when they are created.
 void shaderCreated(const void* code, std::size_t size, IUnknown* shader) noexcept;
+// The presented frame's inputs for frame generation; not valid when DLSS did not run on it. Before endFrame().
+frame_generation::Inputs frameGenerationInputs() noexcept;
 // Once per presented frame, before overlays draw.
 void endFrame() noexcept;
 

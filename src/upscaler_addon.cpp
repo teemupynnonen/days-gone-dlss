@@ -2,6 +2,7 @@
 // game's Direct3D calls, and NGX receives ReShade's wrapped context so other add-ons that
 // follow DLSS evaluations, such as RenoDX, see it like a game's own DLSS.
 #include "upscaler.hpp"
+#include "presenter.hpp"
 #include "ray_tracing.hpp"
 
 #include <Windows.h>
@@ -160,12 +161,10 @@ bool onDrawIndexed(command_list* list, uint32_t indices, uint32_t instances, uin
     return instances == 1 && !firstInstance && upscaler::draw(native(list), indices, first, offset, true);
 }
 
-void onPresent(command_queue*, swapchain* chain, const rect*, const rect*, uint32_t, const rect*)
+// Once per game frame, as the game presents into `backBuffer`. Returns what frame generation needs
+// from the frame.
+frame_generation::Inputs frame(ID3D11Texture2D* backBuffer)
 {
-    // Other add-ons can present their own swap chains; count only the game's frames.
-    if (chain->get_device()->get_api() != device_api::d3d11
-        || (nativeDevice && reinterpret_cast<ID3D11Device*>(chain->get_device()->get_native()) != nativeDevice))
-        return;
     if (!engineReady && !engineFailed)
     {
         // The engine is fully up by the first present; MinHook and the view hook are set up here.
@@ -173,7 +172,7 @@ void onPresent(command_queue*, swapchain* chain, const rect*, const rect*, uint3
         {
             const auto status = MH_Initialize();
             if (status != MH_OK && status != MH_ERROR_ALREADY_INITIALIZED) throw std::runtime_error(MH_StatusToString(status));
-            upscaler::initialize(dataDirectory());
+            upscaler::initialize(dataDirectory(), presenter::active());
             engineReady = true;
         }
         catch (const std::exception& error)
@@ -182,13 +181,29 @@ void onPresent(command_queue*, swapchain* chain, const rect*, const rect*, uint3
             reshade::log::message(reshade::log::level::error, (std::string("Days Gone DLSS: ") + error.what()).c_str());
         }
     }
-    if (!engineReady) return;
+    if (!engineReady) return {};
     upscaler::tick();
     if (!upscaler::attached() && upscaler::wanted() && nativeContext)
-        upscaler::attach(nativeDevice, nativeContext, wrappedContext);
+        upscaler::attach(nativeDevice, nativeContext, wrappedContext, presenter::active());
+    // FrameGeneration's fixed modes run from 2x at X2 = 1.
+    const auto mode = upscaler::currentSettings().frameGeneration;
+    const bool dynamic = mode == upscaler::FrameGeneration::Dynamic;
+    frame_generation::select(mode == upscaler::FrameGeneration::Off || dynamic ? 0 : static_cast<unsigned>(mode) + 1, dynamic);
+    const auto inputs = upscaler::frameGenerationInputs();
     upscaler::endFrame();
-    if (rayTracing && nativeContext)
-        ray_tracing::present(nativeContext, reinterpret_cast<ID3D11Texture2D*>(chain->get_current_back_buffer().handle));
+    if (rayTracing && nativeContext) ray_tracing::present(nativeContext, backBuffer);
+
+    return inputs;
+}
+
+void onPresent(command_queue*, swapchain* chain, const rect*, const rect*, uint32_t, const rect*)
+{
+    // Other add-ons can present their own swap chains; count only the game's frames. Through
+    // Direct3D 12, the presenter reports them instead.
+    if (chain->get_device()->get_api() != device_api::d3d11
+        || (nativeDevice && reinterpret_cast<ID3D11Device*>(chain->get_device()->get_native()) != nativeDevice))
+        return;
+    frame(reinterpret_cast<ID3D11Texture2D*>(chain->get_current_back_buffer().handle));
 }
 
 // F9 switches the ray-traced features off and on, for A/B comparison with the overlay closed.
@@ -207,6 +222,17 @@ void onOverlay(effect_runtime*)
     if (engineFailed) ImGui::TextWrapped("Days Gone DLSS could not start; see ReShade.log.");
     else if (!engineReady) ImGui::TextUnformatted("Days Gone DLSS starts with the first frame.");
     else upscaler::drawMenu(1.0f);
+}
+
+// The game's swap chain is created once, early, so the frame generation setting is read at load.
+bool frameGenerationEnabled()
+{
+    try { return upscaler::loadSettings(dataDirectory() / "DaysGoneDLSS.ini").frameGeneration != upscaler::FrameGeneration::Off; }
+    catch (const std::exception& error)
+    {
+        reshade::log::message(reshade::log::level::warning, (std::string("Days Gone DLSS: ") + error.what()).c_str());
+        return false;
+    }
 }
 }
 
@@ -269,6 +295,7 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon, HMODULE reshadeMo
     HMODULE pinned{};
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
         reinterpret_cast<LPCWSTR>(&AddonInit), &pinned);
+    if (frameGenerationEnabled()) presenter::install(frame, dataDirectory());
     reshade::register_event<reshade::addon_event::init_command_queue>(onInitCommandQueue);
     reshade::register_event<reshade::addon_event::destroy_command_queue>(onDestroyCommandQueue);
     reshade::register_event<reshade::addon_event::init_pipeline>(onInitPipeline);

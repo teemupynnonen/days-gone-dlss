@@ -13,12 +13,15 @@ ctest --test-dir build/release
 
 CMake downloads MinHook, the DLSS SDK v310.9.1 headers, loader and `nvngx_dlss.dll`, the
 ReShade 6.8.0 add-on headers, and Microsoft's DXBC checksum implementation, each pinned
-by commit and checked by SHA-256. The ray-tracing experiment's trace shader is compiled with the
-Windows SDK's `dxc`, which the developer prompt puts on the PATH. The add-on is
-written to `build/release/DaysGoneDLSS.addon64` together with `nvngx_dlss.dll`.
+by commit and checked by SHA-256. Frame generation needs the Streamline SDK 2.14.1, which only
+its release archive carries: the first configure downloads it once (about 280 MB, checked by
+SHA-256) and keeps the headers, license and x64 runtime files. The ray-tracing experiment's trace
+shader is compiled with the Windows SDK's `dxc`, which the developer prompt puts on the PATH. The
+add-on is written to `build/release/DaysGoneDLSS.addon64` together with `nvngx_dlss.dll` and
+Streamline's `sl.*.dll` and `nvngx_dlssg.dll`.
 
-`cmake --install build/release --component addon --prefix <dir>` collects the add-on,
-`nvngx_dlss.dll`, player documentation and licenses for distribution. Runtime files are at
+`cmake --install build/release --component addon --prefix <dir>` collects the add-on, its DLLs,
+player documentation and licenses for distribution. Runtime files are at
 the install root; documentation and licenses are in `DaysGoneDLSS/`.
 
 ## Package a release
@@ -43,6 +46,8 @@ and local settings are excluded. ReShade is installed separately by the player.
 | `src/upscaler_menu.cpp` | Settings window in the ReShade overlay |
 | `src/menu_style.hpp` | Colours, tooltips and status lines the overlay's sections share |
 | `src/upscaler_settings.cpp`, `src/upscaler_settings.hpp` | Modes, render scales and `DaysGoneDLSS.ini` |
+| `src/presenter.cpp`, `src/presenter.hpp` | Frame generation: the game's stand-in swap chain, presented through Direct3D 12 |
+| `src/frame_generation.cpp`, `src/frame_generation.hpp` | Frame generation: Streamline, its inputs and camera, Reflex |
 | `tests/upscaler_tests.cpp` | Settings tests |
 | `src/shader_bytecode.*` | Bounded DXBC parsing and checksum updates |
 | `src/ambient_occlusion.*`, `tests/ambient_occlusion_tests.cpp` | AO reconstruction weight correction and WARP regression tests |
@@ -157,20 +162,68 @@ percent screen percentage. The jitter is added to the projection with +Y up.
 Any frame the replacement cannot handle uses the game's TAA and logs why once. If the upscale
 composite does not follow a replaced TAA, DLSS stops instead of showing a stale history.
 
+## Frame generation
+
+DLSS Frame Generation runs through NVIDIA Streamline, which supports Direct3D 12 and Vulkan only.
+With `frame_generation` set to `2x` to `6x` or `dynamic` in `DaysGoneDLSS.ini`, the game presents
+through Direct3D 12 from its next start; changing the multiplier, or turning generation off, applies
+at once.
+
+- **Swap chain.** When the add-on loads it takes over the `CreateSwapChainForHwnd` slot of DXGI's
+  factory function table, in front of ReShade's hook. The game's swap chain becomes a stand-in
+  (`src/presenter.cpp`) whose back buffer is a texture Direct3D 11 shares with Direct3D 12. A
+  native Direct3D 12 device on the same GPU makes its queue and the real swap chain through
+  Streamline's proxies, so Streamline owns presentation. Each present signals a shared fence after
+  the game's frame; Direct3D 12 copies the back buffer into the swap chain's current one, and
+  Direct3D 11 waits for the copy before the next frame draws into the same texture. Calls that do
+  not concern the back buffer pass on to the real swap chain. When Streamline does not start (an
+  unsupported GPU, missing files), the game keeps its own swap chain.
+- **Present counts.** Frame generation presents several times per game frame, so the real swap
+  chain's counts are not the game's. The stand-in reports its own: `GetLastPresentCount` and
+  `GetFrameStatistics` count the game's presents, with the time of the last one. 1.07 needs this
+  (DIFFERENCES.md, Frame timing).
+- **Overlay.** ReShade wraps only swap chains made on its own proxies, and frame generation presents
+  from a queue of its own, so ReShade's runtime is created on the stand-in instead
+  (`create_effect_runtime`). It draws into the back buffer before the copy and is recreated when
+  the buffers resize or the colour space changes; the stand-in keeps the colour space where ReShade
+  reads it.
+- **Inputs.** The upscaler's depth and render-resolution motion vectors are created shared, and
+  both composites write a second output: the frame before the UI, as the hudless colour. Each
+  present tags the three through Direct3D 12 as `eOnlyValidNow`, so Streamline copies them in the
+  command list that copies the back buffer, before Direct3D 11 reuses them. A frame without DLSS
+  (game TAA, a fallback, no scene) turns generation off until DLSS runs again.
+- **Camera.** The view hook also reads FViewMatrices: ProjMatrix (`+0xB60`), TranslatedViewMatrix
+  (`+0x80` from it), ViewOrigin (`+0x160`) and the jitter PreVisibilityFrameSetup added to the
+  projection (`+0x174`). They are trusted only when they rebuild the translated view-projection
+  (`+0xC0`) the engine computed. Streamline gets the projection without the jitter, the camera's
+  axes and position, and clip-to-previous-clip from the previous frame's camera, centred on the
+  current one for precision.
+- **Reflex.** Frame generation paces its frames with Reflex, whose markers must carry one frame
+  number on every thread. `BeginRenderingViewFamily` increments `GFrameNumber` once per rendered
+  frame on the game thread and stores it in the view family's FrameNumber (`+0x48`; FSceneView
+  starts with its family). A hook on `FEngineLoop::Tick` sleeps and marks the simulation as
+  `GFrameNumber + 1`; the view hook marks the render thread's start with the family's number,
+  which travels with the view capture to the present. Without the Tick hook the present marks the
+  next frame's sleep and simulation, after the game has read its input. The overlay shows Reflex's
+  latency report, from the tick's start to the GPU finishing the frame; it stays empty when the
+  markers' numbers disagree.
+
 1.13's addresses follow; DIFFERENCES.md has 1.07's.
 
 | Address (RVA) | Purpose |
 | --- | --- |
 | `0x20E6920` | `FSceneRenderer::PreVisibilityFrameSetup(RHICmdList)` |
 | `0x19C0EA0` | RHI command memory page allocation |
+| `0x1BF7F0` | `FEngineLoop::Tick`, hooked for Reflex with frame generation |
+| `0x4A60C44` | `GFrameNumber` |
 | `0x4ADCA50`, `0x4CD0620` | `r.ScreenPercentage` and `r.TemporalAASamples` data |
 | `0x4CA41C8`, `0x4CA41E8`, `0x4CA4208` | TAA `_0000`, `_0010` (HDR) and `_0001` shader caches |
 | `0x4CA41A8`, `0x4CA4198` | Composite `_00` and `_01` shader caches |
 | `0x4CA4178`, `0x4CA4168` | HDR composite `_10` and `_11` shader caches |
 | `0x4C46000`, `0x4C46010` | `FDepthResolveCS<false/true>` shader caches |
 
-FViewInfo (0x2D50 bytes): ViewRect `+0xB28`, UnscaledViewRect `+0xB38`, jittered
-`ViewMatrices.TranslatedViewProjectionMatrix` `+0xC20` (`ProjMatrix` is at `+0xB60`), jitter
+FViewInfo (0x2D50 bytes): view family `+0x0`, ViewRect `+0xB28`, UnscaledViewRect `+0xB38`,
+ProjMatrix `+0xB60`, jittered `ViewMatrices.TranslatedViewProjectionMatrix` `+0xC20`, jitter
 `+0x10F0`, screen percentage `+0x1744`, camera cut `+0x1755`, anti-aliasing method `+0x1760` (3 is
 Bend TAA), view state `+0x1CE0`.
 

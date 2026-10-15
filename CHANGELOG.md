@@ -1,5 +1,11 @@
 # Days Gone DLSS changelog
 
+## Unreleased
+
+- Add NVIDIA DLSS Frame Generation: 2x to 6x, or Dynamic to reach the display's refresh rate,
+  with NVIDIA Reflex. The game then presents through Direct3D 12 by way of NVIDIA Streamline;
+  turning it on takes a restart. Needs an RTX 40 (2x) or RTX 50 GPU and DLSS or DLAA on.
+
 ## 1.4.1
 
 - Fix a white flash at every camera cut in cutscenes on Days Gone 1.13. The game's upscaling
