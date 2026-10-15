@@ -127,7 +127,7 @@ add_custom_target(ray_tracing_shaders DEPENDS "${GENERATED_DIR}/ray_tracing_trac
 
 add_library(days_gone_dlss SHARED src/upscaler.cpp src/upscaler_settings.cpp src/upscaler_menu.cpp src/upscaler_addon.cpp
     src/ambient_occlusion.cpp src/indirect_lighting.cpp src/shader_bytecode.cpp src/ray_tracing.cpp
-    src/ray_tracing_menu.cpp src/alpha_test.cpp)
+    src/ray_tracing_menu.cpp src/alpha_test.cpp src/pass_timer.cpp)
 add_dependencies(days_gone_dlss ray_tracing_shaders)
 target_include_directories(days_gone_dlss PRIVATE src "${GENERATED_DIR}")
 target_include_directories(days_gone_dlss SYSTEM PRIVATE "${RESHADE_DIR}/include" "${RESHADE_DIR}/imgui")
@@ -174,7 +174,8 @@ if(BUILD_TESTING)
     target_compile_options(ambient_occlusion_tests PRIVATE /W4 /WX /permissive- /utf-8)
     target_link_libraries(ambient_occlusion_tests PRIVATE dxbc_hash d3d11 d3dcompiler)
     add_test(NAME ambient_occlusion_rendering COMMAND ambient_occlusion_tests)
-    add_executable(ray_tracing_tests tests/ray_tracing_tests.cpp src/ray_tracing.cpp src/alpha_test.cpp src/shader_bytecode.cpp)
+    add_executable(ray_tracing_tests tests/ray_tracing_tests.cpp src/ray_tracing.cpp src/alpha_test.cpp src/shader_bytecode.cpp
+        src/pass_timer.cpp)
     add_dependencies(ray_tracing_tests ray_tracing_shaders)
     target_include_directories(ray_tracing_tests PRIVATE src "${GENERATED_DIR}")
     target_compile_features(ray_tracing_tests PRIVATE cxx_std_20)

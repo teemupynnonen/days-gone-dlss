@@ -48,6 +48,7 @@ and local settings are excluded. ReShade is installed separately by the player.
 | `src/ambient_occlusion.*`, `tests/ambient_occlusion_tests.cpp` | AO reconstruction weight correction and WARP regression tests |
 | `src/indirect_lighting.*` | Identifies 1.07's screen-space indirect lighting passes |
 | `src/ray_tracing*`, `src/alpha_test.*`, `tests/ray_tracing_tests.cpp` | Ray-tracing experiment: geometry capture, alpha-test baking, DXR trace, sun shadows, global illumination and debug views |
+| `src/pass_timer.*` | GPU timing of the ray tracer's Direct3D 11 passes |
 
 The shader rendering test uses authored HLSL on WARP to check the AO near-integer
 rounding regression. The ray-tracing test needs a DXR 1.1 GPU and is skipped without one: it
@@ -192,6 +193,8 @@ the corner for two seconds; the work goes on underneath, so switching back is in
 | `ray_tracing_half_ambient_rays` | 0 | With it, each pixel traces two of its four rays and takes the other two from a neighbour |
 | `ray_tracing_global_illumination` | 0 | One bounce of sunlight added to the game's lighting |
 | `ray_tracing_view` | 0 | A debug view drawn over the image (below) |
+| `ray_tracing_performance_overlay` | 0 | The cost table over the game, also with the overlay closed |
+| `ray_tracing_measure_cost` | 0 | A new non-zero number starts a real-cost measurement (below) |
 
 | View | Shows |
 | --- | --- |
@@ -351,6 +354,19 @@ the corner for two seconds; the work goes on underneath, so switching back is in
   filters with three passes of a 5×5 à-trous kernel weighted by plane distance and normals, and
   scales by the sun's colour, the exposure and 1/π. The first draw or dispatch after lighting that
   does not read the sun shadow adds it, times the pixel's diffuse colour, to the scene colour.
+- **Costs.** Diagnostics shows what each feature costs per frame, averaged over about half a
+  second, and **Show the costs over the game** keeps that table in a corner with the overlay
+  closed. Direct3D 12's work is timed by its own timestamps; the add-on's Direct3D 11 passes
+  (`src/pass_timer.cpp`) by timestamp queries read back a few frames later. The two devices take
+  turns on the GPU, so the times add up. "Direct3D 12 hand-over" is how long Direct3D 11 waits
+  beyond Direct3D 12's work. The primary and sun rays run only for sun shadows and the debug
+  views. The repeated draws run inside the game's passes and are not timed, so **Measure the real
+  cost** times the frame with everything on, then leaves out the debug view, global
+  illumination, ambient occlusion and sun shadows in turn (the scene is still captured and built),
+  then pauses ray tracing as F9 does: 1.5 s to settle and 2.5 s timed per step. The difference
+  between steps is what the left-out part really costs. While ray tracing runs,
+  `DaysGoneDLSS-performance.txt` beside the log holds the same numbers, rewritten every second,
+  and the log has them every 600 traced frames.
 
 Measured on an RTX 5080: the forest at Hot Springs (4K output, DLSS Ultra Performance) captures
 about 3.9 million triangles from 1,600 of 1,900 G-buffer draws, about 730 of them alpha-tested

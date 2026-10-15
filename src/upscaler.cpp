@@ -1665,11 +1665,27 @@ void shaderCreated(const void* code, std::size_t size, IUnknown* shader) noexcep
     }
 }
 
+// While ray tracing runs or its costs are shown, DaysGoneDLSS-performance.txt beside the log holds
+// them, rewritten every second, so they can be read without the overlay.
+static void writePerformanceReport()
+{
+    static std::uint64_t written{};
+    const auto now = GetTickCount64();
+    if (now - written < 1000) return;
+
+    written = now;
+    const auto state = ray_tracing::status();
+    if (!ray_tracing::wanted() && !state.performanceOverlay && !state.measurement.running) return;
+
+    std::ofstream(dataDirectory / "DaysGoneDLSS-performance.txt", std::ios::trunc) << ray_tracing::performanceReport();
+}
+
 // Developer override: DaysGoneDLSS-diagnostics.ini beside the settings is re-read when it changes, so
 // jitter and motion conventions can be compared on a running game without the overlay.
 static void reloadDiagnostics()
 {
     static std::filesystem::file_time_type seen{};
+    static int measureRequest{};
     std::error_code error;
     const auto path = dataDirectory / "DaysGoneDLSS-diagnostics.ini";
     const auto modified = std::filesystem::last_write_time(path, error);
@@ -1729,6 +1745,10 @@ static void reloadDiagnostics()
             features.globalIllumination = value != 0;
             featuresRead = true;
         }
+        else if (key == "ray_tracing_performance_overlay" && build->rayTracingView) ray_tracing::showPerformance(value != 0);
+        // A new number starts a measurement, so rewriting the file with the same one does not.
+        else if (key == "ray_tracing_measure_cost" && build->rayTracingView && value && value != std::exchange(measureRequest, value))
+            ray_tracing::measureCosts();
     }
     if (featuresRead && build->rayTracingView) ray_tracing::enable(features);
     applyDiagnostics(options);
@@ -1749,6 +1769,7 @@ void endFrame() noexcept
         // The ray-tracing switches live in the same file and work without DLSS.
         static std::uint64_t presents{};
         if (active && ++presents % 30 == 0) reloadDiagnostics();
+        if (active && build->rayTracingView) writePerformanceReport();
         if (!active || !hooked) return;
         const auto wanted = currentSettings();
         // Missing slots cost one memory read each until the engine fills its caches.

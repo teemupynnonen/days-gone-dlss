@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 struct ID3D11DeviceContext;
 struct ID3D11Texture2D;
@@ -46,12 +47,53 @@ struct Features
     bool operator==(const Features&) const = default;
 };
 
+// Where the time goes, in milliseconds, averaged over about the last second. GPU times come from
+// timestamps on both devices, which take turns on the GPU, so they add up. Not timed: the repeated
+// draws' GPU work, which runs inside the game's own passes. The cost measurement includes it.
+struct Costs
+{
+    float frame{}; // Between presents: the game's whole frame
+    // On the thread running Direct3D work: repeating the game's draws, and preparing and submitting
+    // the trace, including waiting for the GPU to finish an earlier frame's.
+    float captureCpu{}, traceCpu{}, gpuWaitCpu{};
+    // The scene every feature traces: placing the captured vertices and copying the depth, copying
+    // them to Direct3D 12, building the view's and the shadow casters' structures, the geometry
+    // cache's and the foliage templates' new entries and the top-level structure, and Direct3D 11
+    // waiting on Direct3D 12 beyond its work.
+    float prepare{}, copy{}, viewBuild{}, casterBuild{}, cacheBuild{}, templateBuild{}, topBuild{}, sync{};
+    float sunRays{}, sunInject{}; // The primary and sun rays; adding them to the game's shadow
+    float ambientRays{}, ambientFilter{}; // Packing in the game's format and its blur
+    float bounceRays{}, bounceFilter{}, bounceAdd{}; // Accumulation and filter; adding it to the scene
+    float debugView{};
+
+    float scene() const { return prepare + copy + viewBuild + casterBuild + cacheBuild + templateBuild + topBuild + sync; }
+    float sunShadows() const { return sunRays + sunInject; }
+    float ambientOcclusion() const { return ambientRays + ambientFilter; }
+    float globalIllumination() const { return bounceRays + bounceFilter + bounceAdd; }
+    float gpu() const { return scene() + sunShadows() + ambientOcclusion() + globalIllumination() + debugView; }
+    float cpu() const { return captureCpu + traceCpu; }
+};
+
+// The real cost of each feature: the frame time with everything on, then with the features switched
+// off one by one, the scene alone (captured and built, nothing traced), and ray tracing paused. Each
+// step settles, then is timed. The difference between steps is what the feature left out costs,
+// everything included. Steps whose feature is already off are skipped.
+struct CostMeasurement
+{
+    struct Step { std::string removed; float frame{}; }; // The first step removes nothing
+    std::vector<Step> steps;
+    std::uint64_t finishedAt{}; // GetTickCount64 when `steps` were measured
+    bool running{};
+    unsigned step{}, stepCount{};
+};
+
 struct Status
 {
     View view{};
     Features features;
     bool bypassed{}; // The A/B key has switched the features off
     std::uint64_t toggledAt{}; // GetTickCount64 of the last A/B switch
+    bool performanceOverlay{};
     std::string failure;
     std::uint64_t tracedFrames{};
     // The last traced frame. Base-pass draws are the G-buffer draws; each one is captured or skipped.
@@ -60,17 +102,17 @@ struct Status
     unsigned casterDraws{}; // Captured from the sun shadow maps
     unsigned casterDrawsInView{}, casterDrawsInCache{}; // Left to the view's capture of their object, and to the geometry cache
     unsigned cachedDraws{}, tracedCachedDraws{}; // Static draws kept from earlier frames, and those traced off view
+    unsigned newCacheEntries{}; // Built this frame, in the geometry cache and as foliage templates
     unsigned foliageInstances{}; // Tree sections placed from their meshes' templates
     std::uint64_t triangles{}, capacity{};
+    std::uint64_t viewTriangles{}, casterTriangles{}; // Rebuilt every frame
     unsigned shadowResolveDraws{};
     bool sunFound{}, shadowsInjected{};
     float sun[3]{}; // Toward the sun or moon that casts the game's directional shadows
-    float captureMilliseconds{}; // CPU time spent repeating draws
-    float copyMilliseconds{}, buildMilliseconds{}, traceMilliseconds{}; // D3D12 GPU time
     bool ambientInjected{}; // The traced ambient occlusion replaced the game's this frame
-    float ambientMilliseconds{}; // D3D12 GPU time of its rays
     bool bounceAdded{}; // The traced global illumination lit the scene this frame
-    float bounceMilliseconds{}; // D3D12 GPU time of its rays
+    Costs costs;
+    CostMeasurement measurement;
 };
 
 // ---- Engine side ----
@@ -109,10 +151,17 @@ void select(View view);
 void enable(const Features& features);
 // The A/B key: switches every enabled feature off, or back on.
 void toggleFeatures();
+// Shows the costs over the game, even with the overlay closed.
+void showPerformance(bool show);
+// Starts measuring each feature's real cost, unless a measurement is running.
+void measureCosts();
 // The features, as a section of the DLSS overlay window.
 void drawMenu();
-// The debug view and statistics, inside the window's Diagnostics section.
+// The debug view, costs and statistics, inside the window's Diagnostics section.
 void drawDiagnostics(float width);
-// A short note of the A/B state after the key is pressed, drawn even with the overlay closed.
+// Drawn even with the overlay closed: a short note of the A/B state after the key is pressed, and
+// the costs when shown.
 void drawIndicator();
+// The costs as plain text, for DaysGoneDLSS-performance.txt.
+std::string performanceReport();
 }

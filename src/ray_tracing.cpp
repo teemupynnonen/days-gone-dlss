@@ -1,5 +1,6 @@
 #include "ray_tracing.hpp"
 #include "alpha_test.hpp"
+#include "pass_timer.hpp"
 #include "ray_tracing_shaders.hpp"
 #include "ray_tracing_trace.h" // TraceShader: ray_tracing_trace.hlsl compiled by dxc at build time
 #include "ray_tracing_ao.h"    // AmbientTraceShader: ray_tracing_ao.hlsl, likewise
@@ -20,6 +21,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <format>
 #include <list>
 #include <map>
 #include <memory>
@@ -231,7 +233,7 @@ public:
     void clear();
     std::size_t size() const { return entries.size(); }
     std::size_t traced() const { return tracedEntries.size(); }
-    std::pair<std::size_t, UINT64> building() const // TEMPORARY: builds this frame and their vertices
+    std::pair<std::size_t, UINT64> building() const // Builds this frame and their vertices
     {
         UINT64 vertices{};
         for (const auto& build : builds) vertices += build.entry->vertices;
@@ -325,7 +327,8 @@ struct Capture
     bool bouncePending{}, bounceAdded{}; // The bounced light waits for lighting to finish, then is added
 } capture;
 
-struct Timings { float copy{}, build{}, trace{}, cache{}, templates{}, view{}, casters{}, top{}; }; // TEMPORARY: the last five
+// Direct3D 12's part of the newest frame it has finished, from its timestamps, in milliseconds.
+struct Timings { float copy{}, cache{}, templates{}, view{}, casters{}, top{}, trace{}; };
 
 struct EventCloser { void operator()(HANDLE event) const { CloseHandle(event); } };
 
@@ -503,14 +506,55 @@ struct Gpu
     ComPtr<ID3D12Resource> timestampReadback;
     double millisecondsPerTick{};
     Timings timings;
+    // The add-on's Direct3D 11 passes, and their times in the newest frame the GPU has finished.
+    std::unique_ptr<PassTimer> timer;
+    PassTimer::Milliseconds passes{};
     AmbientGpu ambient;
     BounceGpu bounce;
 };
 std::unique_ptr<Gpu> gpu;
-std::int64_t traceTicks{}; // TEMPORARY: CPU time in trace() since the last log
-std::array<std::int64_t, 6> partTicks{}; // TEMPORARY: D3D11 work and flush, wait, plan, read foliage, write instances, record and submit
-std::int64_t ticksNow() { LARGE_INTEGER now{}; QueryPerformanceCounter(&now); return now.QuadPart; } // TEMPORARY
 std::uint64_t tracedFrames{};
+
+LONGLONG ticksNow()
+{
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+    return now.QuadPart;
+}
+
+float millisecondsSince(LONGLONG ticks)
+{
+    LARGE_INTEGER frequency{};
+    QueryPerformanceFrequency(&frequency);
+    return static_cast<float>(static_cast<double>(ticks) * 1000.0 / static_cast<double>(frequency.QuadPart));
+}
+
+// The render thread's time in trace() this frame, and the part of it spent waiting for the GPU to
+// finish the frame that last used the same slot.
+LONGLONG traceTicks{}, gpuWaitTicks{};
+LONGLONG lastPresent{};
+Costs costs; // Averaged; kept while the GPU resources are released, for the frame time
+std::atomic<bool> performanceOverlay{};
+
+// Measuring each feature's real cost (CostMeasurement). Runs on the thread presenting; the settings
+// the user had come back at the end.
+struct Measurement
+{
+    struct Setting { const char* removed; Features features; View view; bool paused; };
+    std::vector<Setting> settings;
+    Features features; // Restored at the end
+    View view{};
+    bool bypassed{};
+    std::size_t step{};
+    LONGLONG stepStart{}, timingStart{};
+    unsigned timedFrames{};
+    std::vector<CostMeasurement::Step> results;
+    std::uint64_t finishedAt{};
+    bool running{};
+} measurement;
+// While measuring, the scene is captured and built with every feature off, unless paused.
+std::atomic<bool> measurementRequested{}, measuring{};
+constexpr float SettleSeconds = 1.5f, TimedSeconds = 2.5f;
 
 
 void check(HRESULT result, const char* what)
@@ -1207,6 +1251,7 @@ std::unique_ptr<Gpu> create(ID3D11DeviceContext* context)
         g.d3d12->CreateShaderResourceView(cache->vertexResource(), &vertices, handle);
         handle.ptr += g.descriptorSize;
     }
+    g.timer = std::make_unique<PassTimer>(g.device.Get());
     D3D12_QUERY_HEAP_DESC timestamps{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, FramesInFlight * TimestampsPerFrame};
     check(g.d3d12->CreateQueryHeap(&timestamps, IID_PPV_ARGS(&g.timestamps)), "Creating the timestamp queries");
     g.timestampReadback = buffer(g.d3d12.Get(), FramesInFlight * TimestampsPerFrame * sizeof(UINT64), D3D12_HEAP_TYPE_READBACK,
@@ -1260,8 +1305,7 @@ void readTimings(Gpu& g, UINT slot)
     check(g.timestampReadback->Map(0, &range, &ticks), "Reading the timestamps");
     const auto* frame = static_cast<const UINT64*>(ticks) + slot * TimestampsPerFrame;
     const auto milliseconds = [&](int from) { return static_cast<float>(static_cast<double>(frame[from + 1] - frame[from]) * g.millisecondsPerTick); };
-    g.timings = {milliseconds(0), static_cast<float>(static_cast<double>(frame[6] - frame[1]) * g.millisecondsPerTick), milliseconds(6),
-        milliseconds(1), milliseconds(2), milliseconds(3), milliseconds(4), milliseconds(5)};
+    g.timings = {milliseconds(0), milliseconds(1), milliseconds(2), milliseconds(3), milliseconds(4), milliseconds(5), milliseconds(6)};
     const D3D12_RANGE nothing{};
     g.timestampReadback->Unmap(0, &nothing);
 }
@@ -1640,6 +1684,7 @@ void prepareAmbient(Gpu& g, const Capture& frame, UINT width, UINT height)
 void recordAmbient(Gpu& g, UINT slot, const TraceConstants& trace)
 {
     auto& a = g.ambient;
+    a.milliseconds = 0;
     if (a.recorded[slot])
     {
         const D3D12_RANGE range{slot * 2 * sizeof(UINT64), (slot + 1) * 2 * sizeof(UINT64)};
@@ -1872,6 +1917,7 @@ void prepareBounce(Gpu& g, const Capture& frame, UINT width, UINT height)
 void recordBounce(Gpu& g, UINT slot, const TraceConstants& trace)
 {
     auto& b = g.bounce;
+    b.milliseconds = 0;
     if (b.recorded[slot])
     {
         const D3D12_RANGE range{slot * 2 * sizeof(UINT64), (slot + 1) * 2 * sizeof(UINT64)};
@@ -2023,6 +2069,7 @@ void addBounce(Gpu& g, Capture& frame)
     ComPtr<ID3D11RenderTargetView> output;
     check(g.device->CreateRenderTargetView(target.Get(), &view, output.GetAddressOf()), "Creating the scene colour view");
     const RegionConstants region{{frame.rect[0], frame.rect[1]}, {b.width, b.height}};
+    g.timer->begin(g.context, Pass::BounceAdd);
     inOwnState(g, [&]
     {
         g.context->UpdateSubresource(g.regionConstants.Get(), 0, nullptr, &region, 0, 0);
@@ -2038,11 +2085,14 @@ void addBounce(Gpu& g, Capture& frame)
         g.context->PSSetShaderResources(0, static_cast<UINT>(std::size(inputs)), inputs);
         g.context->Draw(3, 0);
     });
+    g.timer->end(g.context, Pass::BounceAdd);
     frame.bounceAdded = true;
 }
 
+// Only sun shadows and the debug views read the primary and sun rays; without them only the other
+// features' rays run.
 void recordTrace(Gpu& g, UINT slot, const Capture& frame, const Geometries& view, const Geometries& casters, const TraceConstants& constants,
-    UINT instances)
+    UINT instances, bool primaryRays)
 {
     auto* list = g.list.Get();
     const auto timestamp = [&](UINT index) { list->EndQuery(g.timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot * TimestampsPerFrame + index); };
@@ -2079,19 +2129,22 @@ void recordTrace(Gpu& g, UINT slot, const Capture& frame, const Geometries& view
     list->ResourceBarrier(1, &unordered);
     timestamp(6);
 
-    ID3D12DescriptorHeap* heaps[]{g.descriptors.Get()};
-    list->SetComputeRootSignature(g.rootSignature.Get());
-    list->SetPipelineState(g.pipeline.Get());
-    list->SetDescriptorHeaps(1, heaps);
-    list->SetComputeRoot32BitConstants(0, sizeof(constants) / 4, &constants, 0);
-    list->SetComputeRootShaderResourceView(1, g.top->GetGPUVirtualAddress());
-    list->SetComputeRootShaderResourceView(2, g.vertices->GetGPUVirtualAddress());
-    list->SetComputeRootShaderResourceView(3, g.materialTable->GetGPUVirtualAddress() + UINT64{slot} * MaxMaterialDraws * 8);
-    list->SetComputeRootShaderResourceView(4, g.cacheTable->GetGPUVirtualAddress() + UINT64{slot} * (MaxInstances - 2) * 8);
-    list->SetComputeRootShaderResourceView(5, g.cache->coordinates());
-    list->SetComputeRootShaderResourceView(6, g.templates->coordinates());
-    list->SetComputeRootDescriptorTable(7, g.descriptors->GetGPUDescriptorHandleForHeapStart());
-    list->Dispatch((constants.size[0] + 7) / 8, (constants.size[1] + 7) / 8, 1);
+    if (primaryRays)
+    {
+        ID3D12DescriptorHeap* heaps[]{g.descriptors.Get()};
+        list->SetComputeRootSignature(g.rootSignature.Get());
+        list->SetPipelineState(g.pipeline.Get());
+        list->SetDescriptorHeaps(1, heaps);
+        list->SetComputeRoot32BitConstants(0, sizeof(constants) / 4, &constants, 0);
+        list->SetComputeRootShaderResourceView(1, g.top->GetGPUVirtualAddress());
+        list->SetComputeRootShaderResourceView(2, g.vertices->GetGPUVirtualAddress());
+        list->SetComputeRootShaderResourceView(3, g.materialTable->GetGPUVirtualAddress() + UINT64{slot} * MaxMaterialDraws * 8);
+        list->SetComputeRootShaderResourceView(4, g.cacheTable->GetGPUVirtualAddress() + UINT64{slot} * (MaxInstances - 2) * 8);
+        list->SetComputeRootShaderResourceView(5, g.cache->coordinates());
+        list->SetComputeRootShaderResourceView(6, g.templates->coordinates());
+        list->SetComputeRootDescriptorTable(7, g.descriptors->GetGPUDescriptorHandleForHeapStart());
+        list->Dispatch((constants.size[0] + 7) / 8, (constants.size[1] + 7) / 8, 1);
+    }
     timestamp(7);
     recordAmbient(g, slot, constants);
     recordBounce(g, slot, constants);
@@ -2105,6 +2158,12 @@ void recordTrace(Gpu& g, UINT slot, const Capture& frame, const Geometries& view
 // Direct3D 12 builds and traces, and Direct3D 11 waits on the GPU before it reads the results.
 bool trace(Gpu& g, const Capture& frame)
 {
+    // The render thread's time here, however it returns.
+    struct Timed
+    {
+        LONGLONG start = ticksNow();
+        ~Timed() { traceTicks += ticksNow() - start; }
+    } timed;
     const auto width = static_cast<UINT>(frame.rect[2] - frame.rect[0]), height = static_cast<UINT>(frame.rect[3] - frame.rect[1]);
     TraceConstants constants{};
     PositionConstants positions{};
@@ -2136,8 +2195,7 @@ bool trace(Gpu& g, const Capture& frame)
     constants.offscreenCheck = selected == View::OffscreenShadows;
     ensureTraced(g, width, height);
     ensureBuildSpace(g, view, casters);
-    auto part = ticksNow(); // TEMPORARY
-    const auto lap = [&](std::size_t index) { const auto now = ticksNow(); partTicks[index] += now - part; part = now; };
+    g.timer->begin(g.context, Pass::Prepare);
     prepareAmbient(g, frame, width, height);
     prepareBounce(g, frame, width, height);
     auto* depth = gameDepth(g, frame.depth.Get());
@@ -2183,14 +2241,17 @@ bool trace(Gpu& g, const Capture& frame)
         g.context->CSSetUnorderedAccessViews(0, 1, g.depthCopyAccess.GetAddressOf(), nullptr);
         g.context->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
     });
+    g.timer->end(g.context, Pass::Prepare);
+    // From here Direct3D 11 waits for Direct3D 12.
+    g.timer->begin(g.context, Pass::Wait);
     const auto geometryReady = ++g.fenceValue, traced = ++g.fenceValue;
     check(g.context4->Signal(g.fence.Get(), geometryReady), "Signalling the captured geometry");
     g.context->Flush();
-    lap(0);
 
     const auto slot = static_cast<UINT>(g.frames % FramesInFlight);
+    const auto waitStart = ticksNow();
     waitFor(g, g.submitted[slot]);
-    lap(1);
+    gpuWaitTicks += ticksNow() - waitStart;
     if (g.submitted[slot]) readTimings(g, slot);
     if (constants.materialDraws)
     {
@@ -2214,11 +2275,8 @@ bool trace(Gpu& g, const Capture& frame)
     const bool everything = selected == View::ShadowCasters || selected == View::OffscreenShadows;
     g.cache->plan(frame.cameraKnown ? frame.cacheDraws : none, maskedStart, everything, frame.casting, frame.preViewTranslation);
     g.templates->plan(frame.cameraKnown ? frame.templateDraws : none, maskedStart, false, noObjects, frame.preViewTranslation);
-    lap(2);
     readFoliage(g);
-    lap(3);
     const auto instances = writeInstances(g, slot, frame.preViewTranslation);
-    lap(4);
     // The frame's visible foliage lists are read back once the GPU has copied them.
     auto& readback = g.foliageReadbacks[g.foliageNext];
     readback.draws = frame.foliageDraws;
@@ -2226,7 +2284,7 @@ bool trace(Gpu& g, const Capture& frame)
     g.foliageNext = (g.foliageNext + 1) % FoliageLatency;
     check(g.allocators[slot]->Reset(), "Resetting a command allocator");
     check(g.list->Reset(g.allocators[slot].Get(), nullptr), "Resetting the command list");
-    recordTrace(g, slot, frame, view, casters, constants, instances);
+    recordTrace(g, slot, frame, view, casters, constants, instances, sunShadows || selected != View::Off);
     check(g.list->Close(), "Recording the trace");
     check(g.queue->Wait(g.d3d12Fence.Get(), geometryReady), "Waiting for the captured geometry");
     ID3D12CommandList* lists[]{g.list.Get()};
@@ -2235,8 +2293,13 @@ bool trace(Gpu& g, const Capture& frame)
     g.submitted[slot] = traced;
     ++g.frames;
     check(g.context4->Wait(g.fence.Get(), traced), "Waiting for the traced image");
-    if (g.bounce.tracing) filterBounce(g, frame, constants.worldFromClip);
-    lap(5);
+    g.timer->end(g.context, Pass::Wait);
+    if (g.bounce.tracing)
+    {
+        g.timer->begin(g.context, Pass::BounceFilter);
+        filterBounce(g, frame, constants.worldFromClip);
+        g.timer->end(g.context, Pass::BounceFilter);
+    }
     return true;
 }
 
@@ -2251,6 +2314,7 @@ void inject(Gpu& g, Capture& frame)
     ComPtr<ID3D11RenderTargetView> target;
     check(g.device->CreateRenderTargetView(frame.shadow.Get(), &view, target.GetAddressOf()), "Creating the sun shadow target view");
     const RegionConstants region{{frame.rect[0], frame.rect[1]}, {g.tracedWidth, g.tracedHeight}};
+    g.timer->begin(g.context, Pass::SunInject);
     inOwnState(g, [&]
     {
         g.context->UpdateSubresource(g.regionConstants.Get(), 0, nullptr, &region, 0, 0);
@@ -2266,6 +2330,7 @@ void inject(Gpu& g, Capture& frame)
         g.context->PSSetShaderResources(0, static_cast<UINT>(std::size(inputs)), inputs);
         g.context->Draw(3, 0);
     });
+    g.timer->end(g.context, Pass::SunInject);
     frame.shadowsInjected = true;
 }
 
@@ -3082,11 +3147,7 @@ void shadowsResolved(Gpu& g)
 {
     copyShadow(g, capture);
     readLighting(g, capture);
-    LARGE_INTEGER traceStart{}, traceEnd{}; // TEMPORARY
-    QueryPerformanceCounter(&traceStart);
     if (!capture.traced) capture.traced = trace(g, capture);
-    QueryPerformanceCounter(&traceEnd);
-    traceTicks += traceEnd.QuadPart - traceStart.QuadPart;
     if (capture.traced && capture.shadowCopied && g.sunFound && activeFeatures().sunShadows) inject(g, capture);
 }
 
@@ -3174,10 +3235,15 @@ void ambientRead(Gpu& g)
 {
     capture.ambientRead = true;
     if (!capture.traced) capture.traced = trace(g, capture);
-    if (!capture.traced || !g.ambient.tracing || !filterAmbient(g, capture) || !activeFeatures().ambientOcclusion) return;
+    if (!capture.traced || !g.ambient.tracing) return;
 
-    inOwnState(g, [&] { g.context->CopyResource(capture.ambient.Get(), g.ambient.filtered.Get()); });
-    capture.ambientInjected = true;
+    g.timer->begin(g.context, Pass::AmbientFilter);
+    if (filterAmbient(g, capture) && activeFeatures().ambientOcclusion)
+    {
+        inOwnState(g, [&] { g.context->CopyResource(capture.ambient.Get(), g.ambient.filtered.Get()); });
+        capture.ambientInjected = true;
+    }
+    g.timer->end(g.context, Pass::AmbientFilter);
 }
 
 // Takes the newest sun direction the GPU has finished copying, oldest copy first.
@@ -3204,10 +3270,147 @@ void readSun(Gpu& g)
     }
 }
 
-void publish(const Capture& frame, bool traced)
+// Adds this frame's costs to the averages, which follow about the last half second. GPU times are of
+// the newest frames each device has finished; frames that traced nothing count as costing nothing.
+void sampleCosts(const Capture& frame, bool traced, float frameMilliseconds)
 {
-    LARGE_INTEGER frequency{};
-    QueryPerformanceFrequency(&frequency);
+    Costs sample{};
+    sample.frame = frameMilliseconds;
+    sample.captureCpu = millisecondsSince(frame.captureTicks);
+    sample.traceCpu = millisecondsSince(std::exchange(traceTicks, 0));
+    sample.gpuWaitCpu = millisecondsSince(std::exchange(gpuWaitTicks, 0));
+    if (gpu)
+    {
+        if (const auto passes = gpu->timer->endFrame(gpu->context)) gpu->passes = *passes;
+    }
+    if (gpu && traced)
+    {
+        const auto& t = gpu->timings;
+        const auto pass = [&](Pass pass) { return gpu->passes[static_cast<std::size_t>(pass)]; };
+        sample.prepare = pass(Pass::Prepare);
+        sample.copy = t.copy;
+        sample.cacheBuild = t.cache;
+        sample.templateBuild = t.templates;
+        sample.viewBuild = t.view;
+        sample.casterBuild = t.casters;
+        sample.topBuild = t.top;
+        sample.sunRays = t.trace;
+        sample.sunInject = pass(Pass::SunInject);
+        sample.ambientRays = gpu->ambient.milliseconds;
+        sample.ambientFilter = pass(Pass::AmbientFilter);
+        sample.bounceRays = gpu->bounce.milliseconds;
+        sample.bounceFilter = pass(Pass::BounceFilter);
+        sample.bounceAdd = pass(Pass::BounceAdd);
+        sample.debugView = pass(Pass::DebugView);
+        // Direct3D 11 waits for all of Direct3D 12's work; what is left is the hand-over.
+        const auto direct3d12 = t.copy + t.cache + t.templates + t.view + t.casters + t.top + t.trace + sample.ambientRays + sample.bounceRays;
+        sample.sync = std::max(0.0f, pass(Pass::Wait) - direct3d12);
+    }
+
+    const auto weight = 1 - std::exp(-frameMilliseconds / 500);
+    for (auto member : {&Costs::frame, &Costs::captureCpu, &Costs::traceCpu, &Costs::gpuWaitCpu, &Costs::prepare, &Costs::copy, &Costs::viewBuild,
+        &Costs::casterBuild, &Costs::cacheBuild, &Costs::templateBuild, &Costs::topBuild, &Costs::sync, &Costs::sunRays, &Costs::sunInject,
+        &Costs::ambientRays, &Costs::ambientFilter, &Costs::bounceRays, &Costs::bounceFilter, &Costs::bounceAdd, &Costs::debugView})
+        costs.*member += (sample.*member - costs.*member) * weight;
+}
+
+void applySetting(const Measurement::Setting& setting)
+{
+    sunShadows = setting.features.sunShadows;
+    ambientOcclusion = setting.features.ambientOcclusion;
+    globalIllumination = setting.features.globalIllumination;
+    selected = setting.view;
+    bypassed = setting.paused;
+}
+
+// The steps from what is on now: each leaves out one more feature, which leaves the scene built with
+// nothing traced, then the scene too: the A/B key's pause stops all of the work.
+void startMeasurement()
+{
+    auto& m = measurement;
+    m = {};
+    if (selected == View::Off && !sunShadows && !ambientOcclusion && !globalIllumination)
+    {
+        upscaler::log("Nothing to measure: no ray-traced feature or view is on.");
+        return;
+    }
+
+    m.features = {sunShadows, ambientOcclusion, halfAmbientRays, replaceCanopyShadows, offscreenGeometry, globalIllumination};
+    m.view = selected;
+    m.bypassed = bypassed;
+    Measurement::Setting setting{"", m.features, m.view, false};
+    m.settings.push_back(setting);
+    const auto leaveOut = [&](bool on, const char* removed, auto change)
+    {
+        if (!on) return;
+
+        change(setting);
+        setting.removed = removed;
+        m.settings.push_back(setting);
+    };
+    leaveOut(m.view != View::Off, "Debug view", [](auto& s) { s.view = View::Off; });
+    leaveOut(m.features.globalIllumination, "Global illumination", [](auto& s) { s.features.globalIllumination = false; });
+    leaveOut(m.features.ambientOcclusion, "Ambient occlusion", [](auto& s) { s.features.ambientOcclusion = false; });
+    leaveOut(m.features.sunShadows, "Sun shadows", [](auto& s) { s.features.sunShadows = false; });
+    leaveOut(true, "Scene capture and build", [](auto& s) { s.paused = true; });
+    m.running = measuring = true;
+    m.stepStart = ticksNow();
+    applySetting(m.settings.front());
+    upscaler::log("Measuring the ray tracer's real cost: " + std::to_string(m.settings.size()) + " steps.");
+}
+
+void finishMeasurement()
+{
+    auto& m = measurement;
+    m.running = measuring = false;
+    m.finishedAt = GetTickCount64();
+    applySetting({"", m.features, m.view, m.bypassed});
+    std::string line = "Ray tracing real cost (frame time without each, ms):";
+    for (std::size_t i = 0; i < m.results.size(); ++i)
+    {
+        char text[160]{};
+        const auto& step = m.results[i];
+        if (i == 0) std::snprintf(text, sizeof(text), " everything on %.2f;", step.frame);
+        else std::snprintf(text, sizeof(text), " %s %.2f (%+.2f);", step.removed.c_str(), step.frame, m.results[i - 1].frame - step.frame);
+        line += text;
+    }
+    if (m.results.size() > 1)
+    {
+        char total[64]{};
+        std::snprintf(total, sizeof(total), " total %.2f ms.", m.results.front().frame - m.results.back().frame);
+        line += total;
+    }
+    upscaler::log(line);
+}
+
+// One present into the measurement: each step settles, then its frames are timed.
+void measure(LONGLONG now)
+{
+    auto& m = measurement;
+    if (measurementRequested.exchange(false) && !m.running) startMeasurement();
+    if (!m.running) return;
+
+    if (millisecondsSince(now - m.stepStart) < SettleSeconds * 1000) return;
+    if (!m.timingStart)
+    {
+        m.timingStart = now;
+        m.timedFrames = 0;
+        return;
+    }
+    ++m.timedFrames;
+    const auto timed = millisecondsSince(now - m.timingStart);
+    if (timed < TimedSeconds * 1000) return;
+
+    m.results.push_back({m.settings[m.step].removed, timed / static_cast<float>(m.timedFrames)});
+    m.timingStart = 0;
+    m.stepStart = now;
+    if (++m.step == m.settings.size()) return finishMeasurement();
+
+    applySetting(m.settings[m.step]);
+}
+
+void publish(const Capture& frame)
+{
     std::lock_guard lock(statusMutex);
     published.tracedFrames = tracedFrames;
     published.basePassDraws = frame.basePassDraws;
@@ -3227,6 +3430,12 @@ void publish(const Capture& frame, bool traced)
     published.foliageInstances = gpu ? gpu->foliageInstances : 0;
     published.triangles = (frame.opaqueVertices + frame.maskedVertices) / 3;
     published.capacity = Capacity / 3;
+    // Shadow casters follow the view's geometry in both ranges.
+    const auto casterOpaqueStart = frame.casterRuns.empty() ? frame.opaqueVertices : frame.casterRuns.front().opaqueStart;
+    const auto casterMaskedStart = frame.casterRuns.empty() ? frame.maskedVertices : frame.casterRuns.front().maskedStart;
+    published.viewTriangles = (casterOpaqueStart + casterMaskedStart) / 3;
+    published.casterTriangles = published.triangles - published.viewTriangles;
+    published.newCacheEntries = gpu ? static_cast<unsigned>(gpu->cache->building().first + gpu->templates->building().first) : 0;
     published.shadowResolveDraws = frame.shadowResolveDraws;
     published.shadowsInjected = frame.shadowsInjected;
     published.ambientInjected = frame.ambientInjected;
@@ -3236,14 +3445,60 @@ void publish(const Capture& frame, bool traced)
         published.sunFound = gpu->sunFound;
         std::copy(std::begin(gpu->sun), std::end(gpu->sun), published.sun);
     }
-    published.captureMilliseconds = static_cast<float>(static_cast<double>(frame.captureTicks) * 1000.0 / static_cast<double>(frequency.QuadPart));
-    if (!traced || !gpu) return;
+}
 
-    published.copyMilliseconds = gpu->timings.copy;
-    published.buildMilliseconds = gpu->timings.build;
-    published.traceMilliseconds = gpu->timings.trace;
-    published.ambientMilliseconds = gpu->ambient.milliseconds;
-    published.bounceMilliseconds = gpu->bounce.milliseconds;
+// Publishes what any frame has: the costs and the measurement, traced or not.
+void publishCosts()
+{
+    std::lock_guard lock(statusMutex);
+    published.costs = costs;
+    auto& m = published.measurement;
+    m.running = measurement.running;
+    m.step = static_cast<unsigned>(measurement.step);
+    m.stepCount = static_cast<unsigned>(measurement.settings.size());
+    if (!measurement.running && m.finishedAt != measurement.finishedAt)
+    {
+        m.steps = measurement.results;
+        m.finishedAt = measurement.finishedAt;
+    }
+}
+
+// The costs as lines of text: a heading, then one line each for the frame, every feature, the CPU, the
+// work behind the costs and the real cost.
+std::vector<std::string> costLines(const Status& state)
+{
+    const auto& c = state.costs;
+    std::vector<std::string> lines{"Days Gone DLSS ray tracing costs in milliseconds, averaged over about half a second. GPU times are timed "
+        "passes; the real cost also includes the repeated draws inside the game's passes."};
+    lines.push_back(std::format("Frame {:.2f} ms ({:.1f} fps); ray tracing timed GPU {:.2f} ms, CPU {:.2f} ms", c.frame,
+        c.frame > 0 ? 1000 / c.frame : 0, c.gpu(), c.cpu()));
+    lines.push_back(std::format("Scene {:.2f}: placing vertices {:.2f}, copy {:.2f}, view BLAS {:.2f}, casters BLAS {:.2f}, cache builds {:.2f}, "
+        "foliage templates {:.2f}, TLAS {:.2f}, Direct3D 12 hand-over {:.2f}", c.scene(), c.prepare, c.copy, c.viewBuild, c.casterBuild,
+        c.cacheBuild, c.templateBuild, c.topBuild, c.sync));
+    lines.push_back(std::format("Sun shadows {:.2f}: primary and sun rays {:.2f}, adding {:.2f}", c.sunShadows(), c.sunRays, c.sunInject));
+    lines.push_back(std::format("Ambient occlusion {:.2f}: rays {:.2f}, packing and blur {:.2f}", c.ambientOcclusion(), c.ambientRays,
+        c.ambientFilter));
+    lines.push_back(std::format("Global illumination {:.2f}: rays {:.2f}, accumulation and filter {:.2f}, adding {:.2f}", c.globalIllumination(),
+        c.bounceRays, c.bounceFilter, c.bounceAdd));
+    lines.push_back(std::format("Debug view {:.2f}", c.debugView));
+    lines.push_back(std::format("CPU {:.2f}: repeating draws {:.2f}, preparing and submitting the trace {:.2f} (waiting for the GPU {:.2f})",
+        c.cpu(), c.captureCpu, c.traceCpu, c.gpuWaitCpu));
+    lines.push_back(std::format("Work: {:.2f} M triangles rebuilt (view {:.2f} M, shadow casters {:.2f} M), {} draws captured, {} cache entries built, "
+        "{} cached draws traced, {} foliage instances", static_cast<double>(state.triangles) / 1e6, static_cast<double>(state.viewTriangles) / 1e6,
+        static_cast<double>(state.casterTriangles) / 1e6, state.capturedDraws + state.casterDraws, state.newCacheEntries, state.tracedCachedDraws,
+        state.foliageInstances));
+
+    const auto& m = state.measurement;
+    if (m.running) lines.push_back(std::format("Real cost: measuring, step {} of {}", m.step + 1, m.stepCount));
+    else if (m.steps.size() < 2) lines.emplace_back("Real cost: not measured");
+    else
+    {
+        auto line = std::format("Real cost: everything on {:.2f}; leaving out", m.steps.front().frame);
+        for (std::size_t i = 1; i < m.steps.size(); ++i)
+            line += std::format("{} {} saves {:.2f}", i > 1 ? "," : "", m.steps[i].removed, m.steps[i - 1].frame - m.steps[i].frame);
+        lines.push_back(line + std::format("; total {:.2f}", m.steps.front().frame - m.steps.back().frame));
+    }
+    return lines;
 }
 
 void logFrame(const Capture& frame)
@@ -3251,9 +3506,8 @@ void logFrame(const Capture& frame)
     const auto state = status();
     char text[1536]{};
     std::snprintf(text, sizeof(text), "Ray tracing frame %llu: %u G-buffer draws, %u captured (%u alpha-tested, %u without coverage, %u materials), %u decals, sky or screen passes, "
-        "%u unknown shader, %u unsupported, %u over capacity; %u shadow casters (%u repeats skipped, %u left to the view, %u to the cache), %u cached draws (%u traced, %u standing in for the view; not cached: %u moving, %u anonymous), %u foliage instances from %u meshes (%u placed; %u draws left to them); %llu triangles; CPU %.2f ms capturing, GPU %.2f ms copy, %.2f ms build, "
-        "%.2f ms trace; %u shadow resolve draws, sun %s %.3f, %.3f, %.3f; traced shadows %s; traced ambient occlusion %s, GPU %.2f ms; "
-        "traced global illumination %s, GPU %.2f ms.",
+        "%u unknown shader, %u unsupported, %u over capacity; %u shadow casters (%u repeats skipped, %u left to the view, %u to the cache), %u cached draws (%u traced, %u standing in for the view; not cached: %u moving, %u anonymous), %u foliage instances from %u meshes (%u placed; %u draws left to them); %llu triangles; "
+        "%u shadow resolve draws, sun %s %.3f, %.3f, %.3f; traced shadows %s; traced ambient occlusion %s; traced global illumination %s.",
         static_cast<unsigned long long>(tracedFrames), frame.basePassDraws, frame.capturedDraws, frame.maskedDraws, frame.unbakedDraws,
         state.bakedMaterials, frame.backgroundDraws,
         frame.unknownShaderDraws, frame.unsupportedDraws, frame.overCapacityDraws, frame.casterDraws, frame.repeatedCasterDraws, frame.casterDrawsInView,
@@ -3262,42 +3516,14 @@ void logFrame(const Capture& frame)
         gpu ? static_cast<unsigned>(std::count_if(gpu->foliageTemplates.begin(), gpu->foliageTemplates.end(),
             [](const auto& model) { return model.second.reference != NoInstance && gpu->templates->find(model.second.cacheKey); })) : 0u,
         frame.copiedFoliageDraws,
-        static_cast<unsigned long long>((frame.opaqueVertices + frame.maskedVertices) / 3), state.captureMilliseconds, state.copyMilliseconds,
-        state.buildMilliseconds, state.traceMilliseconds, frame.shadowResolveDraws, state.sunFound ? "at" : "not found,", state.sun[0],
-        state.sun[1], state.sun[2], frame.shadowsInjected ? "added" : "off", frame.ambientInjected ? "in use" : "off", state.ambientMilliseconds,
-        frame.bounceAdded ? "added" : "off", state.bounceMilliseconds);
+        static_cast<unsigned long long>((frame.opaqueVertices + frame.maskedVertices) / 3), frame.shadowResolveDraws,
+        state.sunFound ? "at" : "not found,", state.sun[0], state.sun[1], state.sun[2], frame.shadowsInjected ? "added" : "off",
+        frame.ambientInjected ? "in use" : "off", frame.bounceAdded ? "added" : "off");
     upscaler::log(text);
-    if (gpu) // TEMPORARY
-    {
-        static LARGE_INTEGER last{};
-        static std::uint64_t lastFrames{};
-        LARGE_INTEGER now{}, frequency{};
-        QueryPerformanceCounter(&now);
-        QueryPerformanceFrequency(&frequency);
-        const auto frames = tracedFrames - lastFrames;
-        const double frameMilliseconds = last.QuadPart && frames
-            ? static_cast<double>(now.QuadPart - last.QuadPart) * 1000.0 / static_cast<double>(frequency.QuadPart) / static_cast<double>(frames) : 0;
-        const double traceMilliseconds = frames ? static_cast<double>(traceTicks) * 1000.0 / static_cast<double>(frequency.QuadPart) / static_cast<double>(frames) : 0;
-        last = now;
-        lastFrames = tracedFrames;
-        traceTicks = 0;
-        char parts[256]{};
-        const auto ms = [&](std::size_t index) { return frames ? static_cast<double>(partTicks[index]) * 1000.0 / static_cast<double>(frequency.QuadPart) / static_cast<double>(frames) : 0; };
-        std::snprintf(parts, sizeof(parts), "DEBUG trace CPU: D3D11 and flush %.2f, wait %.2f, plan %.2f, read foliage %.2f, write instances %.2f, record and submit %.2f ms",
-            ms(0), ms(1), ms(2), ms(3), ms(4), ms(5));
-        upscaler::log(parts);
-        partTicks = {};
-        const auto [cacheBuilds, cacheVertices] = gpu->cache->building();
-        const auto [templateBuilds, templateVertices] = gpu->templates->building();
-        const auto& t = gpu->timings;
-        char detail[512]{};
-        std::snprintf(detail, sizeof(detail), "DEBUG profile: frame %.2f ms, trace CPU %.2f ms; GPU copy %.2f, cache %.2f (%zu builds, %llu vertices), templates %.2f "
-            "(%zu builds, %llu vertices), view BLAS %.2f (%u opaque + %u masked vertices), casters BLAS %.2f, TLAS %.2f (%u instances), trace %.2f ms",
-            frameMilliseconds, traceMilliseconds, t.copy, t.cache, cacheBuilds, static_cast<unsigned long long>(cacheVertices), t.templates, templateBuilds,
-            static_cast<unsigned long long>(templateVertices), t.view, frame.opaqueVertices, frame.maskedVertices, t.casters, t.top,
-            2 + static_cast<unsigned>(gpu->cache->traced()) + gpu->foliageInstances, t.trace);
-        upscaler::log(detail);
-    }
+    const auto lines = costLines(state);
+    std::string summary = "Ray tracing costs:";
+    for (std::size_t i = 1; i < lines.size(); ++i) summary += (i > 1 ? " | " : " ") + lines[i];
+    upscaler::log(summary);
 }
 
 void releaseGpu()
@@ -3314,7 +3540,8 @@ void releaseGpu()
 bool wanted() noexcept
 {
     const auto features = activeFeatures();
-    return (selected != View::Off || features.sunShadows || features.ambientOcclusion || features.globalIllumination) && !failed;
+    return (selected != View::Off || features.sunShadows || features.ambientOcclusion || features.globalIllumination || (measuring && !bypassed))
+        && !failed;
 }
 
 void beginView(const float (&clipFromWorld)[16], const std::int32_t (&rect)[4], const std::int32_t (&unscaled)[4],
@@ -3638,25 +3865,35 @@ void present(ID3D11DeviceContext* context, ID3D11Texture2D* backBuffer) noexcept
 {
     const auto view = selected.load();
     auto frame = std::exchange(capture, {});
+    const auto now = ticksNow();
+    const auto frameMilliseconds = lastPresent ? millisecondsSince(now - lastPresent) : 0.0f;
+    lastPresent = now;
+    bool traced{};
     try
     {
         // The A/B key only pauses the features, so switching back is instant.
-        if (failed || (view == View::Off && !sunShadows && !ambientOcclusion && !globalIllumination))
+        if (failed || (view == View::Off && !sunShadows && !ambientOcclusion && !globalIllumination && !measuring)) releaseGpu();
+        else
         {
-            releaseGpu();
-            return;
+            if (!gpu) gpu = create(context);
+            if (frame.depth) gpu->sceneDepth = frame.depth;
+            readSun(*gpu);
+            if (frame.shadowPending) copyShadow(*gpu, frame);
+            // Frames without a sun shadow pass (menus, interiors) are traced here for the debug views.
+            traced = frame.traced || (view != View::Off && trace(*gpu, frame));
+            if (traced && view != View::Off && backBuffer)
+            {
+                gpu->timer->begin(gpu->context, Pass::DebugView);
+                composite(*gpu, frame, backBuffer, view);
+                gpu->timer->end(gpu->context, Pass::DebugView);
+            }
+            if (traced) ++tracedFrames;
+            publish(frame);
+            if (traced && (tracedFrames == 1 || tracedFrames % 600 == 0)) logFrame(frame);
         }
-
-        if (!gpu) gpu = create(context);
-        if (frame.depth) gpu->sceneDepth = frame.depth;
-        readSun(*gpu);
-        if (frame.shadowPending) copyShadow(*gpu, frame);
-        // Frames without a sun shadow pass (menus, interiors) are traced here for the debug views.
-        const bool traced = frame.traced || (view != View::Off && trace(*gpu, frame));
-        if (traced && view != View::Off && backBuffer) composite(*gpu, frame, backBuffer, view);
-        if (traced) ++tracedFrames;
-        publish(frame, traced);
-        if (traced && (tracedFrames == 1 || tracedFrames % 600 == 0)) logFrame(frame);
+        sampleCosts(frame, traced, frameMilliseconds);
+        measure(now);
+        publishCosts();
     }
     catch (const std::exception& error) { fail(error.what()); }
 }
@@ -3682,6 +3919,7 @@ Status status()
     result.features.globalIllumination = globalIllumination;
     result.bypassed = bypassed;
     result.toggledAt = toggledAt;
+    result.performanceOverlay = performanceOverlay;
     return result;
 }
 
@@ -3715,5 +3953,22 @@ void toggleFeatures()
     bypassed = !bypassed;
     toggledAt = GetTickCount64();
     upscaler::log(std::string("A/B: ray-traced features ") + (bypassed ? "off." : "on."));
+}
+
+void showPerformance(bool show)
+{
+    performanceOverlay = show;
+}
+
+void measureCosts()
+{
+    measurementRequested = true;
+}
+
+std::string performanceReport()
+{
+    std::string report;
+    for (const auto& line : costLines(status())) report += line + '\n';
+    return report;
 }
 }

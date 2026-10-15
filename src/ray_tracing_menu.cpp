@@ -5,14 +5,179 @@
 #include <Windows.h>
 #include <imgui.h>
 #include <reshade.hpp> // Routes ImGui calls through ReShade's overlay.
+#include <algorithm>
 #include <format>
 #include <iterator>
+#include <vector>
 
 namespace days_gone_dlss::ray_tracing
 {
 namespace
 {
 using namespace menu;
+
+const ImVec4 Blue{0.5f, 0.65f, 0.95f, 1}, Teal{0.4f, 0.8f, 0.75f, 1}, Orange{0.95f, 0.6f, 0.3f, 1}, Purple{0.75f, 0.55f, 0.95f, 1};
+
+struct Part { const char* name; float milliseconds; };
+struct CostRow { const char* name; ImVec4 colour; float milliseconds; std::vector<Part> parts; };
+
+// What each feature costs per frame, and the render thread's share.
+std::vector<CostRow> costRows(const Costs& c)
+{
+    return {
+        {"Scene", Blue, c.scene(), {{"Placing vertices, copying depth", c.prepare}, {"Copy to Direct3D 12", c.copy}, {"View BLAS", c.viewBuild},
+            {"Shadow casters BLAS", c.casterBuild}, {"Geometry cache builds", c.cacheBuild}, {"Foliage templates", c.templateBuild},
+            {"TLAS", c.topBuild}, {"Direct3D 12 hand-over", c.sync}}},
+        {"Sun shadows", Yellow, c.sunShadows(), {{"Primary and sun rays", c.sunRays}, {"Adding to the game's shadow", c.sunInject}}},
+        {"Ambient occlusion", Teal, c.ambientOcclusion(), {{"Rays", c.ambientRays}, {"Packing and the game's blur", c.ambientFilter}}},
+        {"Global illumination", Orange, c.globalIllumination(), {{"Rays", c.bounceRays}, {"Accumulation and filter", c.bounceFilter},
+            {"Adding to the scene", c.bounceAdd}}},
+        {"Debug view", Grey, c.debugView, {}},
+        {"CPU (render thread)", Purple, c.cpu(), {{"Repeating the game's draws", c.captureCpu},
+            {"Preparing and submitting the trace", c.traceCpu}, {"  of which waiting for the GPU", c.gpuWaitCpu}}},
+    };
+}
+
+// A horizontal bar filled to `fraction` of `width`.
+void bar(float fraction, const ImVec4& colour, float width)
+{
+    const auto start = ImGui::GetCursorScreenPos();
+    const float height = ImGui::GetTextLineHeight();
+    const ImVec2 top{start.x, start.y + height * 0.25f}, bottom{start.x + width, start.y + height * 0.8f};
+    auto* draw = ImGui::GetWindowDrawList();
+    draw->AddRectFilled(top, bottom, IM_COL32(255, 255, 255, 24), 2);
+    const float filled = width * std::clamp(fraction, 0.0f, 1.0f);
+    if (filled >= 1) draw->AddRectFilled(top, ImVec2(start.x + filled, bottom.y), ImGui::ColorConvertFloat4ToU32(colour), 2);
+    ImGui::Dummy(ImVec2(width, height));
+}
+
+void rightAligned(const std::string& text, bool dim = false)
+{
+    const float offset = ImGui::GetContentRegionAvail().x - ImGui::CalcTextSize(text.c_str()).x;
+    if (offset > 0) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + offset);
+    if (dim) ImGui::TextDisabled("%s", text.c_str());
+    else ImGui::TextUnformatted(text.c_str());
+}
+
+// One row per feature: its bar against the costliest, its milliseconds and its share of the frame.
+// With details, each opens to its parts.
+void drawCostTable(const Costs& costs, bool details)
+{
+    const auto rows = costRows(costs);
+    float largest = 0.01f;
+    for (const auto& row : rows) largest = std::max(largest, row.milliseconds);
+    const auto share = [&](float milliseconds) { return costs.frame > 0 ? std::format("{:.0f}%", milliseconds / costs.frame * 100) : std::string(); };
+    if (!ImGui::BeginTable("costs", 4, ImGuiTableFlags_SizingFixedFit)) return;
+
+    ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed);
+    ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 7);
+    ImGui::TableSetupColumn("ms", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 3);
+    ImGui::TableSetupColumn("frame", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 2.5f);
+    for (const auto& row : rows)
+    {
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn();
+        ImGui::PushStyleColor(ImGuiCol_Text, row.colour);
+        bool open{};
+        if (details)
+        {
+            const auto flags = ImGuiTreeNodeFlags_SpanAllColumns | (row.parts.empty() ? ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen : 0);
+            open = ImGui::TreeNodeEx(row.name, flags) && !row.parts.empty();
+        }
+        else ImGui::TextUnformatted(row.name);
+        ImGui::PopStyleColor();
+        ImGui::TableNextColumn();
+        bar(row.milliseconds / largest, row.colour, ImGui::GetFontSize() * 7);
+        ImGui::TableNextColumn();
+        rightAligned(std::format("{:.2f}", row.milliseconds));
+        ImGui::TableNextColumn();
+        rightAligned(share(row.milliseconds), true);
+        if (!open) continue;
+
+        for (const auto& part : row.parts)
+        {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::TextDisabled("%s", part.name);
+            ImGui::TableNextColumn();
+            ImGui::TableNextColumn();
+            rightAligned(std::format("{:.2f}", part.milliseconds), true);
+        }
+        ImGui::TreePop();
+    }
+    ImGui::TableNextRow();
+    ImGui::TableNextColumn();
+    ImGui::TextUnformatted("GPU total");
+    ImGui::TableNextColumn();
+    ImGui::TableNextColumn();
+    rightAligned(std::format("{:.2f}", costs.gpu()));
+    ImGui::TableNextColumn();
+    rightAligned(share(costs.gpu()), true);
+    ImGui::EndTable();
+}
+
+// The frame above the table, and what the ray tracing is doing if not the usual.
+void drawHeadline(const Status& state)
+{
+    const auto& c = state.costs;
+    ImGui::Text("Frame %.2f ms  (%.0f fps)", c.frame, c.frame > 0 ? 1000 / c.frame : 0.0f);
+    if (state.measurement.running)
+        statusLine(Yellow, std::format("Measuring the real cost: step {} of {}. Hold still.", state.measurement.step + 1, state.measurement.stepCount));
+    else if (state.bypassed) statusLine(Yellow, "Paused with F9: nothing is traced.");
+}
+
+// What the last measurement found each feature really costs, everything included.
+void drawRealCost(const CostMeasurement& m)
+{
+    if (m.steps.size() < 2)
+    {
+        if (!m.running) ImGui::TextDisabled("Real cost: not measured yet.");
+        return;
+    }
+
+    float largest = 0.01f;
+    for (std::size_t i = 1; i < m.steps.size(); ++i) largest = std::max(largest, m.steps[i - 1].frame - m.steps[i].frame);
+    const auto minutes = (GetTickCount64() - m.finishedAt) / 60000;
+    const auto age = minutes ? std::format("{} min ago", minutes) : std::string("just now");
+    ImGui::Text("Real cost");
+    ImGui::SameLine();
+    ImGui::TextDisabled("(ms saved by leaving out, %s)", age.c_str());
+    if (!ImGui::BeginTable("realCost", 3, ImGuiTableFlags_SizingFixedFit)) return;
+
+    ImGui::TableNextRow();
+    ImGui::TableNextColumn();
+    ImGui::TextDisabled("Frame with everything on");
+    ImGui::TableNextColumn();
+    ImGui::TableNextColumn();
+    rightAligned(std::format("{:.2f}", m.steps.front().frame), true);
+
+    for (std::size_t i = 1; i < m.steps.size(); ++i)
+    {
+        const auto saved = m.steps[i - 1].frame - m.steps[i].frame;
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted(m.steps[i].removed.c_str());
+        ImGui::TableNextColumn();
+        bar(saved / largest, Red, ImGui::GetFontSize() * 7);
+        ImGui::TableNextColumn();
+        rightAligned(std::format("{:.2f}", saved));
+    }
+    ImGui::TableNextRow();
+    ImGui::TableNextColumn();
+    ImGui::TextUnformatted("All of ray tracing");
+    ImGui::TableNextColumn();
+    ImGui::TableNextColumn();
+    rightAligned(std::format("{:.2f}", m.steps.front().frame - m.steps.back().frame));
+    ImGui::EndTable();
+}
+
+// The work behind the scene's cost, in two short lines.
+void drawWork(const Status& state)
+{
+    ImGui::TextDisabled("Rebuilt %.2f M triangles from %u draws", static_cast<double>(state.triangles) / 1e6,
+        state.capturedDraws + state.casterDraws);
+    ImGui::TextDisabled("Tree copies %u, new cache entries %u", state.foliageInstances, state.newCacheEntries);
+}
 
 // One coloured line on what the ray tracing is doing right now.
 void drawStatus(const Status& state)
@@ -85,7 +250,26 @@ void drawDiagnostics(float width)
         "for the casters taken from the game's sun shadow map alone.\nAmbient occlusion comparison: the game's on the left, the "
         "traced on the right, both as lighting reads them.\nRay-traced global illumination: the bounced light alone, as it is added.");
 
-    const auto summary = std::format("Ray tracing: {} frames traced###rayTracing", state.tracedFrames);
+    bool overlay = state.performanceOverlay;
+    if (ImGui::Checkbox("Show the costs over the game", &overlay)) showPerformance(overlay);
+    tooltip("Keeps the cost table in the top right corner, also with this window closed.");
+    ImGui::SameLine();
+    ImGui::BeginDisabled(state.measurement.running);
+    if (ImGui::Button("Measure the real cost")) measureCosts();
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("Times the frame with everything on, then leaves out one feature at a time, then the scene, then pauses ray\n"
+            "tracing: about 4 seconds a step. The differences include what the timed passes miss, such as the repeated draws\n"
+            "inside the game's passes. Hold still (Photo Mode) for steady numbers; your settings come back at the end.");
+
+    ImGui::Spacing();
+    drawHeadline(state);
+    drawCostTable(state.costs, true);
+    drawWork(state);
+    ImGui::Spacing();
+    drawRealCost(state.measurement);
+
+    const auto summary = std::format("Capture statistics: {} frames traced###rayTracing", state.tracedFrames);
     if (!ImGui::TreeNode(summary.c_str())) return;
 
     ImGui::Text("G-buffer draws: %u, captured %u (%u alpha-tested)", state.basePassDraws, state.capturedDraws, state.maskedDraws);
@@ -96,23 +280,37 @@ void drawDiagnostics(float width)
     ImGui::Text("Alpha-tested materials baked: %u; draws without coverage: %u", state.bakedMaterials, state.unbakedDraws);
     ImGui::Text("Skipped: %u decals, sky or screen passes, %u unknown shader, %u unsupported, %u over capacity", state.backgroundDraws,
         state.unknownShaderDraws, state.unsupportedDraws, state.overCapacityDraws);
-    ImGui::Text("Triangles: %llu of %llu", static_cast<unsigned long long>(state.triangles), static_cast<unsigned long long>(state.capacity));
+    ImGui::Text("Triangles: %llu of %llu (view %llu, shadow casters %llu)", static_cast<unsigned long long>(state.triangles),
+        static_cast<unsigned long long>(state.capacity), static_cast<unsigned long long>(state.viewTriangles),
+        static_cast<unsigned long long>(state.casterTriangles));
     if (state.sunFound) ImGui::Text("Sun direction: %.3f, %.3f, %.3f (%u shadow resolve draws)", state.sun[0], state.sun[1], state.sun[2],
         state.shadowResolveDraws);
     else ImGui::TextUnformatted("Sun direction: waiting for the game's sun shadow pass.");
     ImGui::Text("Traced sun shadows: %s", state.shadowsInjected ? "added to the game's" : "not in use this frame");
-    ImGui::Text("Traced ambient occlusion: %s, GPU %.2f ms", state.ambientInjected ? "in place of the game's" : "not in use this frame",
-        state.ambientMilliseconds);
-    ImGui::Text("Traced global illumination: %s, GPU %.2f ms", state.bounceAdded ? "added to the game's lighting" : "not in use this frame",
-        state.bounceMilliseconds);
-    ImGui::Text("CPU: %.2f ms repeating draws", state.captureMilliseconds);
-    ImGui::Text("GPU: %.2f ms copy, %.2f ms build, %.2f ms trace", state.copyMilliseconds, state.buildMilliseconds, state.traceMilliseconds);
+    ImGui::Text("Traced ambient occlusion: %s", state.ambientInjected ? "in place of the game's" : "not in use this frame");
+    ImGui::Text("Traced global illumination: %s", state.bounceAdded ? "added to the game's lighting" : "not in use this frame");
     ImGui::TreePop();
 }
 
 void drawIndicator()
 {
     const auto state = status();
+    if (state.performanceOverlay)
+    {
+        const auto& display = ImGui::GetIO().DisplaySize;
+        ImGui::SetNextWindowPos(ImVec2(display.x - 24, 24), ImGuiCond_Always, ImVec2(1, 0));
+        ImGui::SetNextWindowBgAlpha(0.75f);
+        constexpr auto flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings
+            | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoMove;
+        if (ImGui::Begin("Ray tracing costs###rayTracingCosts", nullptr, flags))
+        {
+            drawHeadline(state);
+            drawCostTable(state.costs, false);
+            drawWork(state);
+            drawRealCost(state.measurement);
+        }
+        ImGui::End();
+    }
     if (!state.toggledAt || GetTickCount64() - state.toggledAt > 2000) return;
 
     const char* text = state.bypassed ? "Ray tracing: OFF (game)" : "Ray tracing: ON";
