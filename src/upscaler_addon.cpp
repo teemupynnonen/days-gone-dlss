@@ -2,6 +2,7 @@
 // game's Direct3D calls, and NGX receives ReShade's wrapped context so other add-ons that
 // follow DLSS evaluations, such as RenoDX, see it like a game's own DLSS.
 #include "upscaler.hpp"
+#include "fsr_frame_generation.hpp"
 #include "presenter.hpp"
 #include "ray_tracing.hpp"
 
@@ -18,7 +19,7 @@
 
 extern "C" __declspec(dllexport) const char* NAME = "Days Gone DLSS";
 extern "C" __declspec(dllexport) const char* DESCRIPTION =
-    "NVIDIA DLSS Super Resolution and DLAA in place of Days Gone's temporal anti-aliasing (game versions 1.13 and 1.07).";
+    "NVIDIA DLSS or AMD FSR upscaling and frame generation in place of Days Gone's temporal anti-aliasing (game versions 1.13 and 1.07).";
 
 namespace
 {
@@ -172,7 +173,7 @@ frame_generation::Inputs frame(ID3D11Texture2D* backBuffer)
         {
             const auto status = MH_Initialize();
             if (status != MH_OK && status != MH_ERROR_ALREADY_INITIALIZED) throw std::runtime_error(MH_StatusToString(status));
-            upscaler::initialize(dataDirectory(), presenter::active());
+            upscaler::initialize(dataDirectory(), presenter::active() && presenter::route() == presenter::Route::Streamline);
             engineReady = true;
         }
         catch (const std::exception& error)
@@ -185,10 +186,12 @@ frame_generation::Inputs frame(ID3D11Texture2D* backBuffer)
     upscaler::tick();
     if (!upscaler::attached() && upscaler::wanted() && nativeContext)
         upscaler::attach(nativeDevice, nativeContext, wrappedContext, presenter::active());
-    // FrameGeneration's fixed modes run from 2x at X2 = 1.
+    // FrameGeneration's fixed DLSS modes run from 2x at X2 = 1.
     const auto mode = upscaler::currentSettings().frameGeneration;
     const bool dynamic = mode == upscaler::FrameGeneration::Dynamic;
-    frame_generation::select(mode == upscaler::FrameGeneration::Off || dynamic ? 0 : static_cast<unsigned>(mode) + 1, dynamic);
+    const bool dlss = mode != upscaler::FrameGeneration::Off && mode != upscaler::FrameGeneration::Fsr;
+    frame_generation::select(!dlss || dynamic ? 0 : static_cast<unsigned>(mode) + 1, dynamic);
+    fsr_frame_generation::select(mode == upscaler::FrameGeneration::Fsr);
     const auto inputs = upscaler::frameGenerationInputs();
     upscaler::endFrame();
     if (rayTracing && nativeContext) ray_tracing::present(nativeContext, backBuffer);
@@ -225,13 +228,13 @@ void onOverlay(effect_runtime*)
 }
 
 // The game's swap chain is created once, early, so the frame generation setting is read at load.
-bool frameGenerationEnabled()
+upscaler::FrameGeneration frameGenerationSetting()
 {
-    try { return upscaler::loadSettings(dataDirectory() / "DaysGoneDLSS.ini").frameGeneration != upscaler::FrameGeneration::Off; }
+    try { return upscaler::loadSettings(dataDirectory() / "DaysGoneDLSS.ini").frameGeneration; }
     catch (const std::exception& error)
     {
         reshade::log::message(reshade::log::level::warning, (std::string("Days Gone DLSS: ") + error.what()).c_str());
-        return false;
+        return upscaler::FrameGeneration::Off;
     }
 }
 }
@@ -295,7 +298,8 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon, HMODULE reshadeMo
     HMODULE pinned{};
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
         reinterpret_cast<LPCWSTR>(&AddonInit), &pinned);
-    if (frameGenerationEnabled()) presenter::install(frame, dataDirectory());
+    if (const auto mode = frameGenerationSetting(); mode != upscaler::FrameGeneration::Off)
+        presenter::install(frame, dataDirectory(), mode == upscaler::FrameGeneration::Fsr ? presenter::Route::Fsr : presenter::Route::Streamline);
     reshade::register_event<reshade::addon_event::init_command_queue>(onInitCommandQueue);
     reshade::register_event<reshade::addon_event::destroy_command_queue>(onDestroyCommandQueue);
     reshade::register_event<reshade::addon_event::init_pipeline>(onInitPipeline);

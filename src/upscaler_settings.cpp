@@ -17,9 +17,11 @@ namespace days_gone_dlss::upscaler
 {
 namespace
 {
+constexpr std::string_view UpscalerKeys[]{"dlss", "fsr"};
+static_assert(std::size(UpscalerKeys) == static_cast<std::size_t>(Upscaler::Count));
 constexpr std::string_view QualityKeys[]{"off", "dlaa", "quality", "balanced", "performance", "ultra_performance", "custom"};
 static_assert(std::size(QualityKeys) == static_cast<std::size_t>(Quality::Count));
-constexpr std::string_view FrameGenerationKeys[]{"off", "2x", "3x", "4x", "5x", "6x", "dynamic"};
+constexpr std::string_view FrameGenerationKeys[]{"off", "2x", "3x", "4x", "5x", "6x", "dynamic", "fsr"};
 static_assert(std::size(FrameGenerationKeys) == static_cast<std::size_t>(FrameGeneration::Count));
 // The same keys DaysGoneDLSS-diagnostics.ini takes.
 constexpr std::pair<std::string_view, bool ray_tracing::Features::*> RayTracingKeys[]{
@@ -51,12 +53,22 @@ template<class T> bool number(std::string_view text, T& result)
 }
 }
 
-std::string_view label(Quality quality)
+std::string_view label(Upscaler upscaler)
+{
+    switch (upscaler)
+    {
+    case Upscaler::Dlss: return "DLSS";
+    case Upscaler::Fsr: return "FSR";
+    default: return "Unknown";
+    }
+}
+
+std::string_view label(Quality quality, Upscaler upscaler)
 {
     switch (quality)
     {
     case Quality::Off: return "Off (game TAA)";
-    case Quality::Dlaa: return "DLAA";
+    case Quality::Dlaa: return upscaler == Upscaler::Fsr ? "Native AA" : "DLAA";
     case Quality::Quality: return "Quality";
     case Quality::Balanced: return "Balanced";
     case Quality::Performance: return "Performance";
@@ -84,12 +96,13 @@ std::string_view label(FrameGeneration mode)
     switch (mode)
     {
     case FrameGeneration::Off: return "Off";
-    case FrameGeneration::X2: return "2x";
-    case FrameGeneration::X3: return "3x";
-    case FrameGeneration::X4: return "4x";
-    case FrameGeneration::X5: return "5x";
-    case FrameGeneration::X6: return "6x";
-    case FrameGeneration::Dynamic: return "Dynamic (display refresh rate)";
+    case FrameGeneration::X2: return "DLSS 2x";
+    case FrameGeneration::X3: return "DLSS 3x";
+    case FrameGeneration::X4: return "DLSS 4x";
+    case FrameGeneration::X5: return "DLSS 5x";
+    case FrameGeneration::X6: return "DLSS 6x";
+    case FrameGeneration::Dynamic: return "DLSS Dynamic (display refresh rate)";
+    case FrameGeneration::Fsr: return "FSR 2x";
     default: return "Unknown";
     }
 }
@@ -99,13 +112,14 @@ bool validPreset(int value)
     return value == 0 || (value >= static_cast<int>(Preset::J) && value <= static_cast<int>(Preset::M));
 }
 
-float nominalScale(Quality quality, float customScale)
+float nominalScale(Upscaler upscaler, Quality quality, float customScale)
 {
     switch (quality)
     {
     case Quality::Dlaa: return 1.0f;
     case Quality::Quality: return 2.0f / 3.0f;
-    case Quality::Balanced: return 0.58f;
+    // AMD's Balanced divides by 1.7.
+    case Quality::Balanced: return upscaler == Upscaler::Fsr ? 1.0f / 1.7f : 0.58f;
     case Quality::Performance: return 0.5f;
     case Quality::UltraPerformance: return 1.0f / 3.0f;
     case Quality::Custom:
@@ -145,7 +159,12 @@ Settings loadSettings(const std::filesystem::path& path)
         const auto key = trim(std::string_view(line).substr(0, separator));
         const auto value = trim(std::string_view(line).substr(separator + 1));
         if (value.empty()) continue;
-        if (key == "quality")
+        if (key == "upscaler")
+        {
+            const auto found = std::find(std::begin(UpscalerKeys), std::end(UpscalerKeys), value);
+            if (found != std::end(UpscalerKeys)) settings.upscaler = static_cast<Upscaler>(found - std::begin(UpscalerKeys));
+        }
+        else if (key == "quality")
         {
             const auto found = std::find(std::begin(QualityKeys), std::end(QualityKeys), value);
             if (found != std::end(QualityKeys)) settings.quality = static_cast<Quality>(found - std::begin(QualityKeys));
@@ -198,7 +217,7 @@ Settings loadSettings(const std::filesystem::path& path)
 
 void saveSettings(const std::filesystem::path& path, const Settings& settings)
 {
-    if (settings.quality >= Quality::Count || !validPreset(static_cast<int>(settings.preset))
+    if (settings.upscaler >= Upscaler::Count || settings.quality >= Quality::Count || !validPreset(static_cast<int>(settings.preset))
         || settings.frameGeneration >= FrameGeneration::Count)
         throw std::runtime_error("Cannot save an unknown upscaler or frame generation mode.");
     if (!std::isfinite(settings.customScale) || settings.customScale < Settings::MinScale || settings.customScale > Settings::MaxScale
@@ -212,7 +231,8 @@ void saveSettings(const std::filesystem::path& path, const Settings& settings)
     {
         std::ofstream output(temporary, std::ios::trunc);
         output.imbue(std::locale::classic());
-        output << "quality=" << QualityKeys[static_cast<std::size_t>(settings.quality)]
+        output << "upscaler=" << UpscalerKeys[static_cast<std::size_t>(settings.upscaler)]
+            << "\nquality=" << QualityKeys[static_cast<std::size_t>(settings.quality)]
             << "\ncustom_scale=" << std::setprecision(std::numeric_limits<float>::max_digits10) << settings.customScale
             << "\npreset=" << static_cast<int>(settings.preset)
             << "\nmip_bias_offset=" << settings.mipBiasOffset

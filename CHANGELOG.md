@@ -1,5 +1,12 @@
 # Days Gone DLSS changelog
 
+## Unreleased
+
+- Add AMD FSR upscaling, chosen with the new **Upscaler** setting. It runs on any GPU: FSR 4 on
+  Radeon RX 7000 and 9000, FSR 3.1 on the rest. The modes are AMD's, with Native AA in place of DLAA.
+- Add FSR frame generation (2x) on any GPU, with either upscaler. It presents through AMD's swap
+  chain; switching between DLSS and FSR frame generation takes a restart.
+
 ## 1.5.0
 
 - Add NVIDIA DLSS Frame Generation: 2x to 6x, or Dynamic to reach the display's refresh rate.
