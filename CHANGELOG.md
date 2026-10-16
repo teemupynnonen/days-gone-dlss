@@ -1,6 +1,6 @@
 # Days Gone DLSS changelog
 
-## Unreleased
+## 1.6.0
 
 - Add AMD FSR upscaling, chosen with the new **Upscaler** setting. It runs on any GPU: FSR 4 on
   Radeon RX 7000 and 9000, FSR 3.1 on the rest. The modes are AMD's, with Native AA in place of DLAA.
