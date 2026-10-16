@@ -30,14 +30,18 @@ void write(const fs::path& path, std::string_view text)
 
 void scales()
 {
-    expect(nominalScale(Quality::Dlaa, 0.5f) == 1.0f, "DLAA renders at output resolution.");
-    expect(approximately(nominalScale(Quality::Quality, 0), 2.0f / 3.0f) && approximately(nominalScale(Quality::Balanced, 0), 0.58f)
-        && nominalScale(Quality::Performance, 0) == 0.5f && approximately(nominalScale(Quality::UltraPerformance, 0), 1.0f / 3.0f),
+    constexpr auto dlss = Upscaler::Dlss, fsr = Upscaler::Fsr;
+    expect(nominalScale(dlss, Quality::Dlaa, 0.5f) == 1.0f, "DLAA renders at output resolution.");
+    expect(approximately(nominalScale(dlss, Quality::Quality, 0), 2.0f / 3.0f) && approximately(nominalScale(dlss, Quality::Balanced, 0), 0.58f)
+        && nominalScale(dlss, Quality::Performance, 0) == 0.5f && approximately(nominalScale(dlss, Quality::UltraPerformance, 0), 1.0f / 3.0f),
         "Fixed modes use NVIDIA's standard ratios.");
-    expect(nominalScale(Quality::Custom, 0.8f) == 0.8f, "Custom mode uses the chosen ratio.");
-    expect(nominalScale(Quality::Custom, 0.1f) == Settings::MinScale && nominalScale(Quality::Custom, 2) == Settings::MaxScale,
+    expect(approximately(nominalScale(fsr, Quality::Quality, 0), 1 / 1.5f) && approximately(nominalScale(fsr, Quality::Balanced, 0), 1 / 1.7f)
+        && nominalScale(fsr, Quality::Performance, 0) == 0.5f && approximately(nominalScale(fsr, Quality::UltraPerformance, 0), 1 / 3.0f),
+        "FSR's fixed modes use AMD's ratios.");
+    expect(nominalScale(dlss, Quality::Custom, 0.8f) == 0.8f, "Custom mode uses the chosen ratio.");
+    expect(nominalScale(dlss, Quality::Custom, 0.1f) == Settings::MinScale && nominalScale(dlss, Quality::Custom, 2) == Settings::MaxScale,
         "Custom ratios stay within the range DLSS supports.");
-    expect(nominalScale(Quality::Custom, std::numeric_limits<float>::quiet_NaN()) == Settings::DefaultCustomScale,
+    expect(nominalScale(dlss, Quality::Custom, std::numeric_limits<float>::quiet_NaN()) == Settings::DefaultCustomScale,
         "An invalid custom ratio cannot reach the renderer.");
 
     // DLSS asks for 8 * (output / render)^2 jitter phases.
@@ -59,12 +63,12 @@ void persistence(const fs::path& root)
     expect(loadSettings(path) == Settings{}, "A first launch keeps the game's own anti-aliasing.");
     expect(!fs::exists(path), "Loading defaults must not create a settings file.");
 
-    Settings chosen{Quality::Custom, 0.625f, Preset::K, -0.25f, 0.4f, false, FrameGeneration::X4};
+    Settings chosen{Upscaler::Fsr, Quality::Custom, 0.625f, Preset::K, -0.25f, 0.4f, false, FrameGeneration::X4};
     chosen.rayTracing.sunShadows = chosen.rayTracing.softSunShadows = chosen.rayTracing.lightShadows = true;
     chosen.rayTracing.offscreenGeometry = false;
     saveSettings(path, chosen);
-    expect(loadSettings(path) == chosen, "Restart restores the mode, custom scale, preset, texture bias, sharpening, indirect "
-        "lighting, frame generation and ray tracing.");
+    expect(loadSettings(path) == chosen, "Restart restores the upscaler, mode, custom scale, preset, texture bias, sharpening, "
+        "indirect lighting, frame generation and ray tracing.");
     for (int i = 0; i < static_cast<int>(Quality::Count); ++i)
     {
         auto mode = chosen;
@@ -81,12 +85,14 @@ void persistence(const fs::path& root)
     }
 
     write(path, "# DLSS\r\nunknown=future\r\n quality = performance \r\npreset=13\r\nbroken\r\n");
-    expect(loadSettings(path) == Settings{Quality::Performance, Settings::DefaultCustomScale, Preset::M, 0},
+    expect(loadSettings(path) == Settings{Upscaler::Dlss, Quality::Performance, Settings::DefaultCustomScale, Preset::M, 0},
         "CRLF, whitespace and unknown keys keep the valid fields.");
-    write(path, "quality=ludicrous\npreset=7\ncustom_scale=nan\nmip_bias_offset=5\nsharpness=7\n");
-    expect(loadSettings(path) == Settings{Quality::Off, Settings::DefaultCustomScale, Preset::Default, Settings::MaxMipBias,
-        Settings::MaxSharpness}, "Unknown modes and reserved presets fall back to defaults; bias and sharpening are clamped.");
+    write(path, "upscaler=xess\nquality=ludicrous\npreset=7\ncustom_scale=nan\nmip_bias_offset=5\nsharpness=7\n");
+    expect(loadSettings(path) == Settings{Upscaler::Dlss, Quality::Off, Settings::DefaultCustomScale, Preset::Default,
+        Settings::MaxMipBias, Settings::MaxSharpness},
+        "Unknown upscalers, modes and reserved presets fall back to defaults; bias and sharpening are clamped.");
     write(path, "quality=dlaa\n");
+    expect(loadSettings(path).upscaler == Upscaler::Dlss, "Settings saved before FSR keep DLSS.");
     expect(loadSettings(path).sharpness == Settings::DefaultSharpness, "Settings saved before sharpening get its default.");
     expect(loadSettings(path).indirectLighting, "Settings saved before the indirect lighting option keep it on.");
     expect(loadSettings(path).rayTracing == days_gone_dlss::ray_tracing::Features{}, "Settings saved before ray tracing keep it off.");
@@ -95,11 +101,12 @@ void persistence(const fs::path& root)
     write(path, "custom_scale=0.05\n");
     expect(loadSettings(path).customScale == Settings::MinScale, "Clamp a custom scale below what DLSS supports.");
 
-    for (const auto& invalid : {Settings{Quality::Custom, std::numeric_limits<float>::quiet_NaN()},
-        Settings{Quality::Custom, 1.5f}, Settings{Quality::Quality, 0.75f, static_cast<Preset>(7)},
-        Settings{Quality::Count}, Settings{Quality::Quality, 0.75f, Preset::Default, -3},
-        Settings{Quality::Quality, 0.75f, Preset::Default, 0, std::numeric_limits<float>::quiet_NaN()},
-        Settings{Quality::Quality, 0.75f, Preset::Default, 0, 2}})
+    for (const auto& invalid : {Settings{Upscaler::Dlss, Quality::Custom, std::numeric_limits<float>::quiet_NaN()},
+        Settings{Upscaler::Dlss, Quality::Custom, 1.5f}, Settings{Upscaler::Dlss, Quality::Quality, 0.75f, static_cast<Preset>(7)},
+        Settings{Upscaler::Dlss, Quality::Count}, Settings{Upscaler::Count, Quality::Quality},
+        Settings{Upscaler::Dlss, Quality::Quality, 0.75f, Preset::Default, -3},
+        Settings{Upscaler::Dlss, Quality::Quality, 0.75f, Preset::Default, 0, std::numeric_limits<float>::quiet_NaN()},
+        Settings{Upscaler::Dlss, Quality::Quality, 0.75f, Preset::Default, 0, 2}})
     {
         saveSettings(path, chosen);
         bool rejected = false;

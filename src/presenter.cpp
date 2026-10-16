@@ -1,5 +1,6 @@
 // The game's stand-in swap chain; presenter.hpp describes the route.
 #include "presenter.hpp"
+#include "fsr_frame_generation.hpp"
 
 #include <Windows.h>
 #include <d3d11_4.h>
@@ -39,6 +40,7 @@ using CreateSwapChainForHwnd = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory2* factor
 
 FrameCallback onFrame{};
 std::filesystem::path addonDirectory;
+Route presentRoute{};
 // What the factory's slot held before ours: ReShade's hook.
 CreateSwapChainForHwnd nextCreate{};
 std::atomic<bool> presenting{};
@@ -245,9 +247,10 @@ private:
     ComPtr<ID3D11Fence> fence11;
 
     // Direct3D 12, native: ReShade wraps the device it creates, and other add-ons would see this one as
-    // a game device. Streamline's proxies of the device and queue make the swap chain. The copies run
-    // on a queue of their own: frame generation blocks the presenting queue while it works, and
-    // Direct3D 11's next frame waits only for its copy, not for that.
+    // a game device. Streamline's proxies of the device and queue make its swap chain. The copies run
+    // on a queue of their own: DLSS Frame Generation blocks the presenting queue while it works, and
+    // Direct3D 11's next frame waits only for its copy, not for that. FSR generates on the queue it
+    // presents from, after the copy and the preparation it needs, so for FSR that is the copy queue.
     ComPtr<ID3D12Device> wrappedDevice, device12, streamlineDevice;
     ComPtr<ID3D12CommandQueue> streamlineQueue, presentQueue, copyQueue;
     ComPtr<ID3D12Fence> fence12;
@@ -260,7 +263,7 @@ private:
     std::atomic<UINT> gamePresents{};
     std::atomic<LONGLONG> lastPresentTime{};
 
-    // Streamline's proxy of the real swap chain.
+    // Streamline's proxy of the real swap chain, or AMD's swap chain.
     ComPtr<IDXGISwapChain4> chain;
     HWND window{};
     DXGI_SWAP_CHAIN_DESC1 desc{}; // As the game sees it
@@ -291,14 +294,18 @@ SwapChain::SwapChain(IDXGIFactory2* factory, IUnknown* device, HWND hwnd, const 
     check(dxgiDevice->GetAdapter(adapter.GetAddressOf()), "Finding the GPU");
     check(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&wrappedDevice)), "Creating the Direct3D 12 device");
     device12 = unwrapped<ID3D12Device>(wrappedDevice.Get());
-    if (!frame_generation::attach(device12.Get())) throw std::runtime_error("Streamline did not take the Direct3D 12 device.");
-    streamlineDevice = upgraded<ID3D12Device>(device12.Get(), "the Direct3D 12 device");
     const D3D12_COMMAND_QUEUE_DESC queueDesc{D3D12_COMMAND_LIST_TYPE_DIRECT};
-    check(streamlineDevice->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&streamlineQueue)), "Creating the Direct3D 12 queue");
-    ComPtr<IUnknown> nativeQueue;
-    nativeQueue.Attach(frame_generation::nativeOf(streamlineQueue.Get()));
-    if (!nativeQueue || FAILED(nativeQueue.As(&presentQueue))) throw std::runtime_error("Finding the native Direct3D 12 queue failed.");
+    if (presentRoute == Route::Streamline)
+    {
+        if (!frame_generation::attach(device12.Get())) throw std::runtime_error("Streamline did not take the Direct3D 12 device.");
+        streamlineDevice = upgraded<ID3D12Device>(device12.Get(), "the Direct3D 12 device");
+        check(streamlineDevice->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&streamlineQueue)), "Creating the Direct3D 12 queue");
+        ComPtr<IUnknown> nativeQueue;
+        nativeQueue.Attach(frame_generation::nativeOf(streamlineQueue.Get()));
+        if (!nativeQueue || FAILED(nativeQueue.As(&presentQueue))) throw std::runtime_error("Finding the native Direct3D 12 queue failed.");
+    }
     check(device12->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&copyQueue)), "Creating the Direct3D 12 copy queue");
+    if (presentRoute == Route::Fsr) presentQueue = copyQueue;
     HANDLE sharedFence{};
     check(fence11->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &sharedFence), "Sharing the fence");
     fence12 = openShared<ID3D12Fence>(device12.Get(), sharedFence, "Opening the shared fence");
@@ -316,11 +323,15 @@ SwapChain::SwapChain(IDXGIFactory2* factory, IUnknown* device, HWND hwnd, const 
     real.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     real.BufferCount = std::max(desc.BufferCount, 2u);
     if (real.SwapEffect != DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL) real.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-    const auto streamlineFactory = upgraded<IDXGIFactory2>(factory, "the DXGI factory");
-    ComPtr<IDXGISwapChain1> created;
-    check(streamlineFactory->CreateSwapChainForHwnd(streamlineQueue.Get(), window, &real, fullscreen, output, created.GetAddressOf()),
-        "Creating the Direct3D 12 swap chain");
-    check(created.As(&chain), "Finding IDXGISwapChain4");
+    if (presentRoute == Route::Streamline)
+    {
+        const auto streamlineFactory = upgraded<IDXGIFactory2>(factory, "the DXGI factory");
+        ComPtr<IDXGISwapChain1> created;
+        check(streamlineFactory->CreateSwapChainForHwnd(streamlineQueue.Get(), window, &real, fullscreen, output, created.GetAddressOf()),
+            "Creating the Direct3D 12 swap chain");
+        check(created.As(&chain), "Finding IDXGISwapChain4");
+    }
+    else chain.Attach(fsr_frame_generation::createSwapChain(factory, presentQueue.Get(), window, real, fullscreen));
 
     // A width or height of 0 takes the window's.
     DXGI_SWAP_CHAIN_DESC1 actual{};
@@ -339,11 +350,13 @@ SwapChain::~SwapChain()
     // DXGI refuses to release a swap chain in exclusive fullscreen.
     BOOL fullscreen{};
     if (SUCCEEDED(chain->GetFullscreenState(&fullscreen, nullptr)) && fullscreen) chain->SetFullscreenState(FALSE, nullptr);
-    // Streamline's proxies go before Streamline, and Streamline before the devices it was given.
+    // Streamline's proxies go before Streamline, and Streamline before the devices it was given. FSR's
+    // contexts go before its swap chain.
+    if (presentRoute == Route::Fsr) fsr_frame_generation::stop();
     chain.Reset();
     streamlineQueue.Reset();
     streamlineDevice.Reset();
-    frame_generation::stop();
+    if (presentRoute == Route::Streamline) frame_generation::stop();
     presenting = false;
     setStatus(level::info, "The game released its swap chain.");
 }
@@ -481,6 +494,7 @@ HRESULT SwapChain::ResizeBuffers(UINT count, UINT width, UINT height, DXGI_FORMA
         // Direct3D 12 resizes only once nothing uses the old buffers, ReShade's overlay included.
         destroyOverlay();
         waitIdle();
+        if (presentRoute == Route::Fsr) fsr_frame_generation::release();
         backBuffer.Reset();
         sharedBackBuffer.Reset();
         const auto result = chain->ResizeBuffers(count ? std::max(count, 2u) : 0, width, height, format, flags);
@@ -550,15 +564,24 @@ void SwapChain::copyFrame(const frame_generation::Inputs& inputs)
     list->CopyResource(target.Get(), sharedBackBuffer.Get());
     for (auto& barrier : barriers) std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
     list->ResourceBarrier(2, barriers);
-    if (inputs.valid)
+    try
     {
-        try
+        ID3D12Resource *depthResource{}, *motionResource{}, *hudlessResource{};
+        if (inputs.valid)
         {
-            frame_generation::tag(list.Get(), inputs, depth.open(device12.Get(), inputs.depth),
-                motion.open(device12.Get(), inputs.motion), hudless.open(device12.Get(), inputs.hudless));
+            depthResource = depth.open(device12.Get(), inputs.depth);
+            motionResource = motion.open(device12.Get(), inputs.motion);
+            hudlessResource = hudless.open(device12.Get(), inputs.hudless);
         }
-        catch (const Failure& failure) { logFailure(failure); }
+        // FSR also hears of frames without inputs, to stop generating.
+        if (presentRoute == Route::Fsr)
+        {
+            const bool hdr = colorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 || colorSpace == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
+            fsr_frame_generation::record(list.Get(), inputs, depthResource, motionResource, hudlessResource, hdr);
+        }
+        else if (inputs.valid) frame_generation::tag(list.Get(), inputs, depthResource, motionResource, hudlessResource);
     }
+    catch (const Failure& failure) { logFailure(failure); }
     check(list->Close(), "Recording the copy");
 
     check(copyQueue->Wait(fence12.Get(), rendered), "Waiting for the rendered frame");
@@ -623,12 +646,15 @@ HRESULT STDMETHODCALLTYPE createSwapChainForHwnd(IDXGIFactory2* factory, IUnknow
         return nextCreate(factory, device, window, desc, fullscreen, output, chain);
 
     // Without frame generation the game's own swap chain does the same job without the copy.
+    const bool fsr = presentRoute == Route::Fsr;
     ComPtr<IDXGIDevice> dxgiDevice;
     ComPtr<IDXGIAdapter> adapter;
-    if (FAILED(game.As(&dxgiDevice)) || FAILED(dxgiDevice->GetAdapter(adapter.GetAddressOf()))
-        || !frame_generation::start(addonDirectory, adapter.Get()))
+    const bool started = fsr ? fsr_frame_generation::start(addonDirectory)
+        : SUCCEEDED(game.As(&dxgiDevice)) && SUCCEEDED(dxgiDevice->GetAdapter(adapter.GetAddressOf()))
+            && frame_generation::start(addonDirectory, adapter.Get());
+    if (!started)
     {
-        setStatus(level::warning, "Frame generation did not start: " + frame_generation::status());
+        setStatus(level::warning, "Frame generation did not start: " + (fsr ? fsr_frame_generation::status() : frame_generation::status()));
         return nextCreate(factory, device, window, desc, fullscreen, output, chain);
     }
     SwapChain* created{};
@@ -638,7 +664,8 @@ HRESULT STDMETHODCALLTYPE createSwapChainForHwnd(IDXGIFactory2* factory, IUnknow
     }
     catch (const std::exception& error)
     {
-        frame_generation::stop();
+        if (fsr) fsr_frame_generation::stop();
+        else frame_generation::stop();
         setStatus(level::warning, std::string("Frame generation did not start: ") + error.what());
         return nextCreate(factory, device, window, desc, fullscreen, output, chain);
     }
@@ -650,13 +677,14 @@ HRESULT STDMETHODCALLTYPE createSwapChainForHwnd(IDXGIFactory2* factory, IUnknow
 }
 }
 
-void install(FrameCallback frame, const std::filesystem::path& directory) noexcept
+void install(FrameCallback frame, const std::filesystem::path& directory, Route route) noexcept
 {
     static bool installed{};
     if (std::exchange(installed, true)) return;
 
     onFrame = frame;
     addonDirectory = directory;
+    presentRoute = route;
     try
     {
         // DXGI's factories share one function table, which ReShade has hooked by now. Taking the slot
@@ -681,6 +709,11 @@ void install(FrameCallback frame, const std::filesystem::path& directory) noexce
 bool active() noexcept
 {
     return presenting;
+}
+
+Route route() noexcept
+{
+    return presentRoute;
 }
 
 std::string status()

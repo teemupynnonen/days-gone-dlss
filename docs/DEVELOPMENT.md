@@ -15,10 +15,12 @@ CMake downloads MinHook, the DLSS SDK v310.9.1 headers, loader and `nvngx_dlss.d
 ReShade 6.8.0 add-on headers, and Microsoft's DXBC checksum implementation, each pinned
 by commit and checked by SHA-256. Frame generation needs the Streamline SDK 2.14.1, which only
 its release archive carries: the first configure downloads it once (about 280 MB, checked by
-SHA-256) and keeps the headers, license and x64 runtime files. The ray-tracing experiment's trace
+SHA-256) and keeps the headers, license and x64 runtime files. FSR needs the AMD FSR SDK 2.3.0's API
+headers and AMD's signed Direct3D 12 DLLs, pinned by commit and checked by SHA-256 like the rest
+(about 66 MB). The ray-tracing experiment's trace
 shader is compiled with the Windows SDK's `dxc`, which the developer prompt puts on the PATH. The
-add-on is written to `build/release/DaysGoneDLSS.addon64` together with `nvngx_dlss.dll` and
-Streamline's `sl.*.dll` and `nvngx_dlssg.dll`.
+add-on is written to `build/release/DaysGoneDLSS.addon64` together with `nvngx_dlss.dll`,
+Streamline's `sl.*.dll` and `nvngx_dlssg.dll`, and AMD's `amd_fidelityfx_*_dx12.dll`.
 
 `cmake --install build/release --component addon --prefix <dir>` collects the add-on, its DLLs,
 player documentation and licenses for distribution. Runtime files are at
@@ -47,7 +49,10 @@ and local settings are excluded. ReShade is installed separately by the player.
 | `src/menu_style.hpp` | Colours, tooltips and status lines the overlay's sections share |
 | `src/upscaler_settings.cpp`, `src/upscaler_settings.hpp` | Modes, render scales and `DaysGoneDLSS.ini` |
 | `src/presenter.cpp`, `src/presenter.hpp` | Frame generation: the game's stand-in swap chain, presented through Direct3D 12 |
-| `src/frame_generation.cpp`, `src/frame_generation.hpp` | Frame generation: Streamline, its inputs and camera, Reflex |
+| `src/frame_generation.cpp`, `src/frame_generation.hpp` | DLSS Frame Generation: Streamline, its inputs and camera, Reflex |
+| `src/fidelityfx.cpp`, `src/fidelityfx.hpp` | Loads the AMD FSR API |
+| `src/fsr_upscaler.cpp`, `src/fsr_upscaler.hpp` | FSR upscaling on Direct3D 12 for the upscaler |
+| `src/fsr_frame_generation.cpp`, `src/fsr_frame_generation.hpp` | FSR frame generation: AMD's swap chain and its inputs |
 | `tests/upscaler_tests.cpp` | Settings tests |
 | `src/shader_bytecode.*` | Bounded DXBC parsing and checksum updates |
 | `src/ambient_occlusion.*`, `tests/ambient_occlusion_tests.cpp` | AO reconstruction weight correction and WARP regression tests |
@@ -162,6 +167,24 @@ percent screen percentage. The jitter is added to the projection with +Y up.
 Any frame the replacement cannot handle uses the game's TAA and logs why once. If the upscale
 composite does not follow a replaced TAA, DLSS stops instead of showing a stale history.
 
+## FSR upscaling
+
+With `upscaler=fsr` AMD FSR takes DLSS's place at the TAA dispatch, with the same inputs, composites
+and sharpening. AMD's runtime picks the version: FSR 4 on Radeon RX 7000 and 9000, FSR 3.1 on
+other GPUs, with the version in the overlay's status line. It runs on Direct3D 12 only.
+
+- **Interop.** The colour, depth, motion, colour bias and output textures are created shared. A
+  native Direct3D 12 device on the game's GPU opens them; Direct3D 11 signals a shared fence and
+  flushes after the prepare pass, Direct3D 12 runs FSR on its own queue, and Direct3D 11 waits on
+  the GPU before the composite reads the output.
+- **Inputs.** FSR works best on linear colour, so the prepare pass squares the square-root
+  encoding in SDR too and the composites treat FSR's output as linear, as for HDR. The colour bias
+  mask is FSR's reactive mask. Depth is reversed and infinite; the near plane and vertical field of
+  view come from the captured projection, and UE4's centimetres are 0.01 metres.
+- **Modes.** AMD's ratios: Quality 1.5x, Balanced 1.7x, Performance 2x, Ultra Performance 3x,
+  and Native AA in place of DLAA. The FSR context is created for the plan's render and output sizes
+  and HDR, like the DLSS feature, and the upscaler not chosen frees its memory.
+
 ## Frame generation
 
 DLSS Frame Generation runs through NVIDIA Streamline, which supports Direct3D 12 and Vulkan only.
@@ -226,6 +249,18 @@ FViewInfo (0x2D50 bytes): view family `+0x0`, ViewRect `+0xB28`, UnscaledViewRec
 ProjMatrix `+0xB60`, jittered `ViewMatrices.TranslatedViewProjectionMatrix` `+0xC20`, jitter
 `+0x10F0`, screen percentage `+0x1744`, camera cut `+0x1755`, anti-aliasing method `+0x1760` (3 is
 Bend TAA), view state `+0x1CE0`.
+
+## FSR frame generation
+
+With `frame_generation=fsr` the presenter makes AMD's frame generation swap chain in place of
+Streamline's proxy, on the same stand-in route; Streamline is not loaded and there is no Reflex.
+AMD's swap chain paces the frames and generates on the queue it presents from, so the presenter
+gives it the copy queue: the copy, the hudless copy and FSR's preparation of depth and motion come
+first on that queue, and Direct3D 11's next frame still waits only for the copy. FSR generates at
+present, after Direct3D 11 may have drawn the next frame's hudless colour, so it reads a Direct3D 12
+copy. Each frame configures generation with the game's frame number, which must rise by one, and
+frames without upscaling turn it off. The generation context follows the back buffer's size, format
+and HDR, and is recreated after a resize.
 
 ## Ray-tracing experiment
 

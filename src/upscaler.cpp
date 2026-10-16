@@ -1,5 +1,6 @@
 #include "upscaler.hpp"
 #include "upscaler_shaders.hpp"
+#include "fsr_upscaler.hpp"
 #include "ambient_occlusion.hpp"
 #include "indirect_lighting.hpp"
 #include "ray_tracing.hpp"
@@ -227,6 +228,7 @@ struct Target
     ComPtr<ID3D11ShaderResourceView> view;
     ComPtr<ID3D11UnorderedAccessView> access;
     UINT width{}, height{};
+    bool shared{}; // Direct3D 12 opens it: FSR or frame generation reads it
 };
 
 // The composite's colour before the UI, for frame generation: the back buffer's size and format.
@@ -373,12 +375,19 @@ struct Ngx
     bool reset{true};
 } ngx;
 
+// FSR runs in fsr_upscaler.cpp; a failure to start is kept until a mode is chosen again, as for NGX.
+struct Fsr
+{
+    bool failed{};
+    std::string message{"FSR starts when a mode is selected."};
+} fsr;
+
 struct Frame
 {
     std::uint64_t index{};
     bool motion{}; // Motion and depth were computed at this frame's depth resolve
     bool upscaled{};
-    bool linear{}; // DLSS ran in HDR mode on linear colour
+    bool linear{}; // The upscaler ran on linear colour: DLSS in HDR, FSR always
     std::int32_t outputOrigin[2]{};
     float renderScale[2]{1, 1};
     float sharpness{};
@@ -795,7 +804,7 @@ void createPipeline()
 
 void ensureTarget(Target& target, UINT width, UINT height, DXGI_FORMAT format, const char* name, bool shared = false)
 {
-    if (target.texture && target.width == width && target.height == height) return;
+    if (target.texture && target.width == width && target.height == height && target.shared == shared) return;
     target = {};
     D3D11_TEXTURE2D_DESC description{};
     description.Width = width;
@@ -812,6 +821,7 @@ void ensureTarget(Target& target, UINT width, UINT height, DXGI_FORMAT format, c
     check(device->CreateUnorderedAccessView(target.texture.Get(), nullptr, target.access.GetAddressOf()), name);
     target.width = width;
     target.height = height;
+    target.shared = shared;
 }
 
 // Matches the hudless texture to the composite's output, the back buffer. False when that is not a
@@ -917,6 +927,31 @@ bool initializeNgx()
     return true;
 }
 
+bool initializeFsr()
+{
+    if (fsr_upscaler::started()) return true;
+    if (fsr.failed || !device) return false;
+
+    try
+    {
+        fsr_upscaler::start(device.Get(), moduleDirectory());
+        fsr.message = "FSR ready.";
+        return true;
+    }
+    catch (const std::exception& error)
+    {
+        fsr.failed = true;
+        fsr.message = std::string("FSR could not start: ") + error.what();
+        log(fsr.message);
+        return false;
+    }
+}
+
+bool initializeUpscaler(Upscaler upscaler)
+{
+    return upscaler == Upscaler::Fsr ? initializeFsr() : initializeNgx();
+}
+
 NVSDK_NGX_PerfQuality_Value perfQuality(Quality quality, float scale)
 {
     switch (quality)
@@ -935,9 +970,9 @@ NVSDK_NGX_PerfQuality_Value perfQuality(Quality quality, float scale)
 
 Plan makePlan(const Settings& wanted, UINT outputWidth, UINT outputHeight)
 {
-    const auto scale = nominalScale(wanted.quality, wanted.customScale);
+    const auto scale = nominalScale(wanted.upscaler, wanted.quality, wanted.customScale);
     Plan result{0, 0, outputWidth, outputHeight, perfQuality(wanted.quality, scale)};
-    if (wanted.quality != Quality::Custom && wanted.quality != Quality::Dlaa)
+    if (wanted.upscaler == Upscaler::Dlss && wanted.quality != Quality::Custom && wanted.quality != Quality::Dlaa)
     {
         UINT maxWidth{}, maxHeight{}, minWidth{}, minHeight{};
         float sharpness{};
@@ -976,7 +1011,7 @@ void ensureFeature(ID3D11DeviceContext* context, const Plan& target, const Setti
     }
     ngx.key = key;
     ngx.reset = true;
-    log("Created DLSS " + std::string(label(wanted.quality)) + ": " + std::to_string(target.renderWidth) + "x"
+    log("Created DLSS " + std::string(label(wanted.quality, Upscaler::Dlss)) + ": " + std::to_string(target.renderWidth) + "x"
         + std::to_string(target.renderHeight) + " -> " + std::to_string(target.outputWidth) + "x" + std::to_string(target.outputHeight)
         + ", preset " + std::string(label(wanted.preset)) + ", flags " + hex(static_cast<std::uint32_t>(flags)) + ".");
 }
@@ -1084,11 +1119,13 @@ void computeMotion(ID3D11DeviceContext* context, UINT groupsX, UINT groupsY)
     logOnce("inputs-motion", "Motion inputs: pixel flags " + describe(pixels.Get()) + "; depth " + describe(depth.Get())
         + "; velocity " + describe(velocity.Get()) + ".");
 
+    const bool fsrReads = planSettings.upscaler == Upscaler::Fsr;
     ensureTarget(motionTarget, plan->renderWidth, plan->renderHeight, DXGI_FORMAT_R16G16_FLOAT, "Creating the DLSS motion texture",
-        frameGeneration);
+        frameGeneration || fsrReads);
     ensureTarget(depthTarget, plan->renderWidth, plan->renderHeight, DXGI_FORMAT_R32_FLOAT, "Creating the DLSS depth texture",
-        frameGeneration);
-    ensureTarget(biasTarget, plan->renderWidth, plan->renderHeight, DXGI_FORMAT_R8_UNORM, "Creating the DLSS colour bias texture");
+        frameGeneration || fsrReads);
+    // FSR takes it as its reactive mask.
+    ensureTarget(biasTarget, plan->renderWidth, plan->renderHeight, DXGI_FORMAT_R8_UNORM, "Creating the DLSS colour bias texture", fsrReads);
     inOwnState(context, [&]
     {
         ID3D11ShaderResourceView* inputs[]{pixels.Get(), depth.Get(), nullptr, velocity.Get()};
@@ -1111,8 +1148,8 @@ bool replaceTemporal(ID3D11DeviceContext* context, std::size_t slot, UINT groups
     const auto options = currentDiagnostics();
     const auto view = currentView();
     if (!plan) return fallback("no DLSS plan yet");
-    if (wanted.quality != planSettings.quality || wanted.customScale != planSettings.customScale)
-        return fallback("waiting for the requested DLSS mode");
+    if (wanted.upscaler != planSettings.upscaler || wanted.quality != planSettings.quality || wanted.customScale != planSettings.customScale)
+        return fallback("waiting for the requested upscaling mode");
     if (options.gameTemporalAA) return fallback("the diagnostics ask for the game's TAA");
     // Each view command precedes exactly one TAA dispatch; a repeat means the engine skipped one.
     if (!view.sequence || view.sequence == lastUsedView.sequence) return fallback("the engine did not report this frame's view");
@@ -1157,8 +1194,13 @@ bool replaceTemporal(ID3D11DeviceContext* context, std::size_t slot, UINT groups
         + std::to_string(renderWidth) + "x" + std::to_string(renderHeight) + " -> " + std::to_string(outputWidth) + "x"
         + std::to_string(outputHeight) + ".");
 
-    ensureTarget(colorTarget, plan->renderWidth, plan->renderHeight, DXGI_FORMAT_R16G16B16A16_FLOAT, "Creating the DLSS colour texture");
-    ensureTarget(outputTarget, plan->outputWidth, plan->outputHeight, DXGI_FORMAT_R16G16B16A16_FLOAT, "Creating the DLSS output texture");
+    // FSR reads its inputs and writes its output through Direct3D 12, and works best on linear colour.
+    const bool fsrUpscales = planSettings.upscaler == Upscaler::Fsr;
+    const bool linear = hdr || fsrUpscales;
+    ensureTarget(colorTarget, plan->renderWidth, plan->renderHeight, DXGI_FORMAT_R16G16B16A16_FLOAT, "Creating the DLSS colour texture",
+        fsrUpscales);
+    ensureTarget(outputTarget, plan->outputWidth, plan->outputHeight, DXGI_FORMAT_R16G16B16A16_FLOAT, "Creating the DLSS output texture",
+        fsrUpscales);
 
     // The motion vectors are per render pixel and undilated. Without MVLowRes DLSS reads them as
     // dilated output-resolution vectors.
@@ -1168,10 +1210,14 @@ bool replaceTemporal(ID3D11DeviceContext* context, std::size_t slot, UINT groups
     LARGE_INTEGER now{}, frequency{};
     QueryPerformanceCounter(&now);
     QueryPerformanceFrequency(&frequency);
+    const auto frameTime = lastEvaluation.QuadPart
+        ? static_cast<float>(static_cast<double>(now.QuadPart - lastEvaluation.QuadPart) * 1000.0 / static_cast<double>(frequency.QuadPart)) : 16.7f;
+    // Bend adds the jitter to the projection with +Y up; DLSS and FSR take render pixels with +Y down.
+    const float jitter[2]{view.jitter[0] * (options.invertJitterX ? -1.0f : 1.0f), view.jitter[1] * (options.invertJitterY ? -1.0f : 1.0f)};
 
     inOwnState(context, [&]
     {
-        const PrepareConstants prepare{{renderWidth, renderHeight}, hdr, {}};
+        const PrepareConstants prepare{{renderWidth, renderHeight}, linear, {}};
         context->UpdateSubresource(prepareConstants.Get(), 0, nullptr, &prepare, 0, 0);
         ID3D11ShaderResourceView* prepareInput = color.Get();
         ID3D11UnorderedAccessView* prepareOutput = colorTarget.access.Get();
@@ -1182,33 +1228,57 @@ bool replaceTemporal(ID3D11DeviceContext* context, std::size_t slot, UINT groups
         context->Dispatch(groupsX, groupsY, 1);
         context->ClearState();
 
-        ensureFeature(ngxContext.Get(), *plan, wanted, flags);
-        // Each scene render reports one view; a gap means DLSS missed frames and its history is stale.
-        const bool reset = ngx.reset || view.cameraCut || view.sequence != lastUsedView.sequence + 1;
-        NVSDK_NGX_D3D11_DLSS_Eval_Params evaluation{};
-        evaluation.Feature.pInColor = colorTarget.texture.Get();
-        evaluation.Feature.pInOutput = outputTarget.texture.Get();
-        evaluation.pInDepth = depthTarget.texture.Get();
-        evaluation.pInMotionVectors = motionTarget.texture.Get();
-        evaluation.pInBiasCurrentColorMask = biasTarget.texture.Get();
-        // Bend adds the jitter to the projection with +Y up; DLSS takes render pixels with +Y down.
-        evaluation.InJitterOffsetX = view.jitter[0] * (options.invertJitterX ? -1.0f : 1.0f);
-        evaluation.InJitterOffsetY = view.jitter[1] * (options.invertJitterY ? -1.0f : 1.0f);
-        evaluation.InRenderSubrectDimensions = {renderWidth, renderHeight};
-        evaluation.InReset = reset ? 1 : 0;
+        // Each scene render reports one view; a gap means the upscaler missed frames and its history is stale.
+        bool reset = view.cameraCut || view.sequence != lastUsedView.sequence + 1;
+        if (fsrUpscales)
+        {
+            fsr_upscaler::Inputs inputs;
+            inputs.color = colorTarget.texture.Get();
+            inputs.depth = depthTarget.texture.Get();
+            inputs.motion = motionTarget.texture.Get();
+            inputs.reactive = biasTarget.texture.Get();
+            inputs.output = outputTarget.texture.Get();
+            inputs.renderWidth = renderWidth;
+            inputs.renderHeight = renderHeight;
+            inputs.jitter[0] = jitter[0];
+            inputs.jitter[1] = jitter[1];
+            inputs.frameTime = frameTime;
+            // Reversed infinite projection: row 3's z is the near plane. Without a trusted camera, 10 cm
+            // and a 60 degree view.
+            inputs.cameraNear = view.cameraKnown ? view.camera.projection[14] : 10.0f;
+            inputs.verticalFov = view.cameraKnown ? 2 * std::atan(1 / view.camera.projection[5]) : 1.047f;
+            inputs.hdr = hdr;
+            inputs.reset = reset;
+            fsr_upscaler::evaluate(inputs);
+        }
+        else
+        {
+            ensureFeature(ngxContext.Get(), *plan, wanted, flags);
+            reset = reset || ngx.reset;
+            NVSDK_NGX_D3D11_DLSS_Eval_Params evaluation{};
+            evaluation.Feature.pInColor = colorTarget.texture.Get();
+            evaluation.Feature.pInOutput = outputTarget.texture.Get();
+            evaluation.pInDepth = depthTarget.texture.Get();
+            evaluation.pInMotionVectors = motionTarget.texture.Get();
+            evaluation.pInBiasCurrentColorMask = biasTarget.texture.Get();
+            evaluation.InJitterOffsetX = jitter[0];
+            evaluation.InJitterOffsetY = jitter[1];
+            evaluation.InRenderSubrectDimensions = {renderWidth, renderHeight};
+            evaluation.InReset = reset ? 1 : 0;
+            evaluation.InMVScaleX = 1;
+            evaluation.InMVScaleY = 1;
+            evaluation.InFrameTimeDeltaInMsec = frameTime;
+            const auto result = evaluateDlss(ngxContext.Get(), evaluation);
+            context->ClearState();
+            if (NVSDK_NGX_FAILED(result))
+                throw std::runtime_error("DLSS evaluation failed (" + hex(static_cast<std::uint32_t>(result)) + ").");
+            ngx.reset = false;
+        }
         if (reset) ++resets;
-        evaluation.InMVScaleX = 1;
-        evaluation.InMVScaleY = 1;
-        evaluation.InFrameTimeDeltaInMsec = lastEvaluation.QuadPart
-            ? static_cast<float>(static_cast<double>(now.QuadPart - lastEvaluation.QuadPart) * 1000.0 / static_cast<double>(frequency.QuadPart)) : 16.7f;
-        const auto result = evaluateDlss(ngxContext.Get(), evaluation);
-        context->ClearState();
-        if (NVSDK_NGX_FAILED(result))
-            throw std::runtime_error("DLSS evaluation failed (" + hex(static_cast<std::uint32_t>(result)) + ").");
 
         if (pass == Pass::TemporalFull)
         {
-            const ComputeConstants output{{outputWidth, outputHeight}, static_cast<std::uint32_t>(options.debugView), hdr, hdr,
+            const ComputeConstants output{{outputWidth, outputHeight}, static_cast<std::uint32_t>(options.debugView), hdr, linear,
                 wanted.sharpness, {}};
             context->UpdateSubresource(computeConstants.Get(), 0, nullptr, &output, 0, 0);
             ID3D11Buffer* buffers[]{temporal.Get(), computeConstants.Get()};
@@ -1222,19 +1292,18 @@ bool replaceTemporal(ID3D11DeviceContext* context, std::size_t slot, UINT groups
             context->CSSetUnorderedAccessViews(0, static_cast<UINT>(std::size(outputs)), outputs, nullptr);
             context->Dispatch((outputWidth + 7) / 8, (outputHeight + 7) / 8, 1);
         }
-        ngx.reset = false;
         frame.reset = reset;
-        frame.jitter[0] = evaluation.InJitterOffsetX;
-        frame.jitter[1] = evaluation.InJitterOffsetY;
     });
 
     lastEvaluated = frame.index;
     lastEvaluation = now;
     lastUsedView = view;
     ++evaluations;
-    if (evaluations == 1) log("First DLSS frame evaluated.");
+    if (evaluations == 1) log(std::string("First ") + (fsrUpscales ? "FSR" : "DLSS") + " frame evaluated.");
     frame.upscaled = pass == Pass::TemporalUpscale;
-    frame.linear = hdr;
+    frame.linear = linear;
+    frame.jitter[0] = jitter[0];
+    frame.jitter[1] = jitter[1];
     frame.outputOrigin[0] = view.unscaled[0];
     frame.outputOrigin[1] = view.unscaled[1];
     frame.renderScale[0] = static_cast<float>(renderWidth) / static_cast<float>(outputWidth);
@@ -1381,6 +1450,7 @@ void releaseRenderer()
     ngx.parameters = nullptr;
     if (ngx.initialized && ngxDevice) NVSDK_NGX_D3D11_Shutdown1(ngxDevice.Get());
     ngx.initialized = false;
+    fsr_upscaler::stop();
     frame = {};
     biasedSamplers.clear();
     motionTarget = depthTarget = biasTarget = colorTarget = outputTarget = {};
@@ -1418,32 +1488,35 @@ void releaseRenderer()
     log("Released DLSS resources.");
 }
 
-// Decides whether DLSS can run and what the game thread should render at.
+// Decides whether the upscaler can run and what the game thread should render at.
 void updatePlan(const Settings& wanted)
 {
+    // The upscaler not chosen gives back its memory.
+    if ((wanted.quality == Quality::Off || wanted.upscaler != Upscaler::Dlss) && ngx.feature) releaseFeature();
+    if ((wanted.quality == Quality::Off || wanted.upscaler != Upscaler::Fsr) && fsr_upscaler::started()) fsr_upscaler::stop();
     const auto view = latestView();
     const auto outputWidth = static_cast<UINT>(std::max(0, view.unscaled[2] - view.unscaled[0]));
     const auto outputHeight = static_cast<UINT>(std::max(0, view.unscaled[3] - view.unscaled[1]));
-    if (wanted.quality == Quality::Off || failed || !outputWidth || !outputHeight || !initializeNgx() || !shadersReady())
+    if (wanted.quality == Quality::Off || failed || !outputWidth || !outputHeight || !initializeUpscaler(wanted.upscaler) || !shadersReady())
     {
         replacing = false;
         targetScale = 0;
         targetMipBias = 0;
-        if (wanted.quality == Quality::Off && ngx.feature) releaseFeature();
         plan.reset();
         return;
     }
-    // Only the mode and custom scale decide the render size; a new plan would also undo the rounding
-    // absorbed in replaceTemporal and recreate the feature while a slider is dragged.
-    if (!plan || planSettings.quality != wanted.quality || planSettings.customScale != wanted.customScale
-        || planOutput[0] != outputWidth || planOutput[1] != outputHeight)
+    // Only the upscaler, mode and custom scale decide the render size; a new plan would also undo the
+    // rounding absorbed in replaceTemporal and recreate the feature while a slider is dragged.
+    if (!plan || planSettings.upscaler != wanted.upscaler || planSettings.quality != wanted.quality
+        || planSettings.customScale != wanted.customScale || planOutput[0] != outputWidth || planOutput[1] != outputHeight)
     {
         plan = makePlan(wanted, outputWidth, outputHeight);
         planSettings = wanted;
         planOutput[0] = outputWidth;
         planOutput[1] = outputHeight;
-        log("DLSS " + std::string(label(wanted.quality)) + " plan: render " + std::to_string(plan->renderWidth) + "x"
-            + std::to_string(plan->renderHeight) + " for " + std::to_string(outputWidth) + "x" + std::to_string(outputHeight) + ".");
+        log(std::string(label(wanted.upscaler)) + " " + std::string(label(wanted.quality, wanted.upscaler)) + " plan: render "
+            + std::to_string(plan->renderWidth) + "x" + std::to_string(plan->renderHeight) + " for " + std::to_string(outputWidth) + "x"
+            + std::to_string(outputHeight) + ".");
     }
     const auto scale = static_cast<float>(plan->renderWidth) / static_cast<float>(plan->outputWidth);
     targetScale = scale;
@@ -1480,6 +1553,7 @@ void applySettings(const Settings& wanted)
     // Choosing a mode again retries after a failure.
     failed = false;
     ngx.failed = false;
+    fsr.failed = false;
     try { saveSettings(settingsPath, wanted); }
     catch (const std::exception& error) { log("Could not save upscaler settings: " + std::string(error.what())); }
 }
@@ -1517,7 +1591,7 @@ static void hookEngineTick(Address base)
     engineTickAddress = nullptr;
 }
 
-void initialize(const std::filesystem::path& directory, bool withFrameGeneration)
+void initialize(const std::filesystem::path& directory, bool withReflex)
 {
     {
         std::lock_guard lock(logMutex);
@@ -1564,11 +1638,12 @@ void initialize(const std::filesystem::path& directory, bool withFrameGeneration
         MH_RemoveHook(preVisibilityAddress);
         throw std::runtime_error(std::string("Enabling the view hook: ") + MH_StatusToString(status));
     }
-    if (withFrameGeneration) hookEngineTick(base);
+    if (withReflex) hookEngineTick(base);
     releaseRequested = false;
     active = true;
+    const auto chosen = currentSettings();
     log("Upscaler ready: r.ScreenPercentage " + std::to_string(percentage) + ", r.TemporalAASamples "
-        + std::to_string(samples) + ", mode " + std::string(label(currentSettings().quality)) + ".");
+        + std::to_string(samples) + ", " + std::string(label(chosen.upscaler)) + " " + std::string(label(chosen.quality, chosen.upscaler)) + ".");
 }
 
 void tick() noexcept
@@ -2011,8 +2086,10 @@ Status status()
     result.active = active;
     result.failed = failed;
     result.failure = failure;
-    result.ngxFailed = ngx.failed;
-    result.ngxMessage = ngx.message;
+    const bool fsrChosen = currentSettings().upscaler == Upscaler::Fsr;
+    result.upscalerName = fsrChosen ? fsr_upscaler::name() : "DLSS";
+    result.upscalerFailed = fsrChosen ? fsr.failed : ngx.failed;
+    result.upscalerMessage = fsrChosen ? fsr.message : ngx.message;
     result.shadersReady = shadersReady();
     result.planned = plan.has_value();
     if (plan)
