@@ -35,6 +35,7 @@ constexpr std::pair<std::string_view, bool ray_tracing::Features::*> RayTracingK
     {"ray_tracing_light_shadows", &ray_tracing::Features::lightShadows},
     {"ray_tracing_soft_light_shadows", &ray_tracing::Features::softLightShadows},
     {"ray_tracing_light_bounce", &ray_tracing::Features::lightBounce},
+    {"ray_tracing_reuse_bounce_rays", &ray_tracing::Features::reuseBounceRays},
 };
 
 std::string_view trim(std::string_view text)

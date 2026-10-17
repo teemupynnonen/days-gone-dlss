@@ -2,9 +2,10 @@
 // light without its shadow into a slot of its own. From each pixel a slot lights, rays toward the
 // light decide how much of it reaches the pixel: one at its centre, or with soft shadows a few at
 // points across its size. With bounce light, one cosine-weighted ray per pixel finds the surface the
-// lights light in that direction, as the sun's bounce does.
+// lights light in that direction, as the sun's bounce does, and with reuse `reuse` lights the pixel
+// from its reservoir and its neighbours' once `main` has run (ray_tracing_reservoirs.hlsli).
 #define LightsRootSignature "RootConstants(num32BitConstants=48, b0), SRV(t0), SRV(t2), SRV(t3), SRV(t4), " \
-    "DescriptorTable(SRV(t5, numDescriptors=25), UAV(u0, numDescriptors=3))"
+    "DescriptorTable(SRV(t5, numDescriptors=26), UAV(u0, numDescriptors=4)), CBV(b1)"
 
 static const uint MaxLights = 16;
 // A light's fixture (a lamp's glass, the logs of a fire) would shadow it, so rays stop this far (cm)
@@ -19,6 +20,7 @@ static const float PointSizePerReach = 0.025, SpotSize = 5;
 // counts as at least 50 cm away: closer, its inverse square makes the odd ray that lands beside a
 // fire hundreds of times brighter than its neighbours.
 static const float BounceDistance = 5000, CopyDistance = 100, CopyDistancePerDistance = 0.01, BounceNearest = 50;
+static const uint CopyMask = 6;
 // The diffuse colour of points the game did not draw: about that of earth, rock and bark.
 static const float3 UnknownAlbedo = 0.25;
 static const uint Soft = 1, Bounce = 2;
@@ -67,9 +69,8 @@ float3 Unproject(float2 screen, float depth)
     return world.xyz / world.w;
 }
 
-float3 CosineDirection(float3 normal, uint seed)
+float3 CosineDirection(float3 normal, float2 random)
 {
-    float2 random = RandomPair(seed);
     float3 tangent, bitangent;
     Basis(normal, tangent, bitangent);
     float radius = sqrt(random.x), angle = 6.2831853 * random.y;
@@ -178,17 +179,25 @@ float3 Irradiance(float3 position, float3 normal, float bias, float near)
     return sum * Lights[uint2(0, MaxLights)].y;
 }
 
-// The light bounced toward a pixel once, over the pixel's diffuse colour: one cosine-weighted ray,
-// and the lights' irradiance where it hits times that point's colour over pi.
-float3 BouncedLight(uint2 pixel, float3 surface, float3 normal)
+// The light the lights shine on a point and it sends back: their irradiance times its colour over pi.
+float3 LightFrom(float3 position, float3 normal)
+{
+    float distance = length(position);
+    float3 start = position + normal * (0.5 + distance * 1e-3);
+    return AlbedoAt(position) / 3.14159265 * Irradiance(start, normal, 0.5 + distance * 1e-3, 30 + distance * 2e-3);
+}
+
+#include "ray_tracing_reservoirs.hlsli"
+
+// The point a pixel's cosine-weighted bounce ray finds, and the light it sends back: none where the
+// ray finds nothing. Its blue noise is read apart from the sun bounce's, so the two do not share
+// their directions.
+Sample TraceBounce(uint2 pixel, float3 surface, float3 normal)
 {
     float viewDistance = length(surface);
-    // Moving toward the eye as well keeps the start in front of the surface where the G-buffer's normal
-    // tilts into it.
-    float bias = 0.5 + viewDistance * 1e-3;
     RayDesc ray;
-    ray.Origin = surface + (normal - surface / viewDistance) * bias;
-    ray.Direction = CosineDirection(normal, Hash(pixel.x + Hash(pixel.y + Hash(Frame * 2 + 1))));
+    ray.Origin = RayOrigin(surface, normal, viewDistance);
+    ray.Direction = CosineDirection(normal, BlueNoisePair(pixel + uint2(17, 41)));
     ray.TMin = 0;
     ray.TMax = BounceDistance;
     RayQuery<RAY_FLAG_NONE> view;
@@ -199,18 +208,21 @@ float3 BouncedLight(uint2 pixel, float3 surface, float3 normal)
     RayQuery<RAY_FLAG_NONE> copies;
     if (ray.TMin < ray.TMax)
     {
-        copies.TraceRayInline(Scene, RAY_FLAG_NONE, 6, ray);
+        copies.TraceRayInline(Scene, RAY_FLAG_NONE, CopyMask, ray);
         Resolve(copies);
     }
     bool hitCopy = ray.TMin < ray.TMax && copies.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
-    if (!hitCopy && view.CommittedStatus() != COMMITTED_TRIANGLE_HIT) return 0;
+    Sample found;
+    found.position = ray.Origin + ray.Direction * BounceDistance;
+    found.normal = -ray.Direction;
+    found.light = 0;
+    if (!hitCopy && view.CommittedStatus() != COMMITTED_TRIANGLE_HIT) return found;
 
-    float3 hit = ray.Origin + ray.Direction * (hitCopy ? copies.CommittedRayT() : view.CommittedRayT());
+    found.position = ray.Origin + ray.Direction * (hitCopy ? copies.CommittedRayT() : view.CommittedRayT());
     float3 hitNormal = hitCopy ? HitNormal(copies) : HitNormal(view);
-    if (dot(hitNormal, ray.Direction) > 0) hitNormal = -hitNormal;
-    float hitDistance = length(hit);
-    float3 start = hit + hitNormal * (0.5 + hitDistance * 1e-3);
-    return AlbedoAt(hit) / 3.14159265 * Irradiance(start, hitNormal, 0.5 + hitDistance * 1e-3, 30 + hitDistance * 2e-3);
+    found.normal = dot(hitNormal, ray.Direction) > 0 ? -hitNormal : hitNormal;
+    found.light = LightFrom(found.position, found.normal);
+    return found;
 }
 
 [RootSignature(LightsRootSignature)]
@@ -226,6 +238,7 @@ void main(uint2 pixel : SV_DispatchThreadID)
         Visibility[pixel] = 0;
         Unshadowed[pixel] = 0;
         if (Flags & Bounce) Bounced[pixel] = 0;
+        if ((Flags & Bounce) && Reuse) Clear(pixel);
         return;
     }
 
@@ -253,5 +266,26 @@ void main(uint2 pixel : SV_DispatchThreadID)
     Unshadowed[pixel] = float4(unshadowed, 0);
     if (!(Flags & Bounce)) return;
 
-    Bounced[pixel] = packedNormal ? float4(BouncedLight(pixel, surface, DecodeNormal(packedNormal)), 1) : 0;
+    if (!packedNormal)
+    {
+        Bounced[pixel] = 0;
+        if (Reuse) Clear(pixel);
+        return;
+    }
+
+    float3 normal = DecodeNormal(packedNormal);
+    Sample found = TraceBounce(pixel, surface, normal);
+    if (Reuse) StoreChoice(pixel, surface, normal, packedNormal, found);
+    else Bounced[pixel] = float4(found.light, 1);
+}
+
+[RootSignature(LightsRootSignature)]
+[numthreads(8, 8, 1)]
+void reuse(uint2 pixel : SV_DispatchThreadID)
+{
+    if (any(pixel >= Size)) return;
+    float3 surface, normal;
+    uint packedNormal;
+    bool known = SurfaceAt(pixel, surface, normal, packedNormal);
+    Bounced[pixel] = known ? float4(ReusedLight(pixel, surface, normal, length(surface)), 1) : 0;
 }

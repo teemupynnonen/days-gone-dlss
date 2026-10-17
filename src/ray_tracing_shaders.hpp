@@ -12,8 +12,10 @@ namespace days_gone_dlss::ray_tracing::shaders
 // Positions come from clip x, y and w: some draws, Bend's foliage among them, narrow the viewport's
 // depth range and scale clip z to match, which would move their vertices along the view ray. Clip z
 // still tells the sky, drawn at reversed-Z depth 0, at infinity, where the world position has no
-// finite value. A NaN x on every vertex marks such a triangle inactive; any other NaN or infinity is
-// undefined for DXR and in practice leaves the whole acceleration structure without hits. Shadow
+// finite value. The moon is a disc about 207 km away (its depth pinned near the far plane), which
+// every ray toward the moon would hit, so triangles beyond MaxSceneDistance go as well. A NaN x on
+// every vertex marks such a triangle inactive; any other NaN or infinity is undefined for DXR and in
+// practice leaves the whole acceleration structure without hits. Shadow
 // casters from the sun shadow maps follow the view's geometry in both ranges; their place in their
 // map gives their position.
 // The coordinates of a material that tiles its texture are scaled into the tile its coverage holds.
@@ -101,6 +103,15 @@ float Finite(uint vertex, bool masked)
     return mul(Clip(vertex, masked), WorldFromClip).w;
 }
 
+// Nothing the game draws as scenery lies this far (cm) from the camera; its moon does.
+static const float MaxSceneDistance = 1e7;
+
+// A view vertex's place in the translated world, which has the camera at its origin.
+float3 ViewWorld(uint vertex, bool masked)
+{
+    return mul(float4(Clip(vertex, masked).xyw, 1), WorldFromClipXYW).xyz;
+}
+
 float4 LightRow(uint row)
 {
     return asfloat(LightSpace.Load4((row - 28) * 16));
@@ -149,8 +160,8 @@ void main(uint index : SV_DispatchThreadID)
     else
     {
         float finite = min(Finite(first, masked), min(Finite(first + 1, masked), Finite(first + 2, masked)));
-        float3 world = mul(float4(Clip(local, masked).xyw, 1), WorldFromClipXYW).xyz;
-        position = finite > 1e-6 ? float4(world, 1) : float4(asfloat(0x7fc00000), 0, 0, 1);
+        float nearest = min(length(ViewWorld(first, masked)), min(length(ViewWorld(first + 1, masked)), length(ViewWorld(first + 2, masked))));
+        position = finite > 1e-6 && nearest < MaxSceneDistance ? float4(ViewWorld(local, masked), 1) : float4(asfloat(0x7fc00000), 0, 0, 1);
     }
     Positions[uint2(vertex % 4096, vertex / 4096)] = position;
     if (masked)
@@ -335,12 +346,19 @@ void main(uint2 pixel : SV_DispatchThreadID)
 }
 )";
 
-// Accumulates a traced signal over frames (the bounced light, the lights' visibility): each pixel
-// finds where its surface was last frame and blends this frame's rays into what it had there, up to
-// MaxFrames. History from a depth that does not match belongs to another surface, which the pixel
-// did not see then. With Clamp, a pixel far brighter than all its neighbours (a bounce ray that found
-// the brightest spot near a light) is brought down to twice the brightest of them: foliage keeps
-// little history, and such a pixel would show as a firefly.
+// Accumulates a traced signal over frames (the bounced light, the soft shadows' visibility): each
+// pixel finds where its surface was last frame and blends this frame's rays into what it had there,
+// up to MaxFrames. History from a depth that does not match belongs to another surface, which the
+// pixel did not see then. The history is the filter's first pass over last frame's accumulation, so
+// the noise that pass removed does not come back (SVGF, Schied et al. 2017). Beside it the pixel
+// keeps the mean and mean square of its rays' luminance; their difference, the variance, tells the
+// filter how noisy the pixel still is. Under 4 frames the variance comes from the 3 by 3 neighbours'
+// rays instead.
+// With Clamp, a pixel with under 4 frames of history (foliage keeps little) has a ray more than twice
+// as bright as all its neighbours' (one that found the brightest spot beside a fire) brought down to
+// that, or it would show as a firefly. Longer history dilutes such a ray anyway. Clamping there too
+// would throw the light away in a dark room lit through a small patch, where the rare ray that finds
+// the patch is the light and its neighbours are all dark.
 inline constexpr char BounceAccumulate[] = R"(
 cbuffer BounceParameters : register(b0)
 {
@@ -351,14 +369,18 @@ cbuffer BounceParameters : register(b0)
     uint History;   // Last frame's accumulation covers this view
     uint Final;     // Filter: the last pass turns the sun's bounce into the scene colour's units
     uint MaxFrames; // Accumulation: frames a pixel keeps
-    uint Clamp;     // Accumulation: bring down lone bright pixels
+    uint Clamp;     // Accumulation: bring down lone bright rays
     uint Padding;
 };
-Texture2D<float4> Traced : register(t0);       // rgb: this frame's signal, a: 1 on the game's surfaces
-Texture2D<float4> Previous : register(t1);     // rgb: last frame's accumulation, a: its frames
-Texture2D<float> Depth : register(t2);         // The game's device depth over the view
-Texture2D<float> PreviousDepth : register(t3); // Last frame's
-RWTexture2D<float4> Output : register(u0);
+Texture2D<float4> Traced : register(t0);          // rgb: this frame's signal, a: 1 where it has one
+Texture2D<float4> PreviousColor : register(t1);   // rgb: last frame's accumulation after the filter's first pass
+Texture2D<float> Depth : register(t2);            // The game's device depth over the view
+Texture2D<float> PreviousDepth : register(t3);    // Last frame's
+Texture2D<float4> PreviousMoments : register(t4); // Last frame's luminance mean, root mean square and frames
+RWTexture2D<float4> Output : register(u0);  // rgb: the accumulation, a: its variance, -1 where the signal has none
+RWTexture2D<float4> Moments : register(u1); // The mean square is kept as its root, which half precision holds for bright lights
+
+static const float HalfMax = 65504; // Half precision turns larger values infinite, which the filter would spread
 
 float Luminance(float3 color)
 {
@@ -372,23 +394,27 @@ void main(uint2 pixel : SV_DispatchThreadID)
     float4 traced = Traced[pixel];
     if (traced.a == 0)
     {
-        Output[pixel] = 0;
+        Output[pixel] = float4(0, 0, 0, -1);
+        Moments[pixel] = 0;
         return;
     }
-    if (Clamp)
-    {
-        float brightest = 0;
-        for (int y = -1; y <= 1; ++y)
-            for (int x = -1; x <= 1; ++x)
-            {
-                int2 texel = clamp(int2(pixel) + int2(x, y), 0, int2(Size) - 1);
-                if ((x || y) && Traced[texel].a > 0) brightest = max(brightest, Luminance(Traced[texel].rgb));
-            }
-        float own = Luminance(traced.rgb), limit = 2 * brightest;
-        if (own > limit) traced.rgb *= limit / own;
-    }
+    if (!all(isfinite(traced.rgb))) traced.rgb = 0;
 
-    float4 history = 0;
+    float brightest = 0, sum = 0, squares = 0, count = 0;
+    for (int y = -1; y <= 1; ++y)
+        for (int x = -1; x <= 1; ++x)
+        {
+            float4 value = Traced[clamp(int2(pixel) + int2(x, y), 0, int2(Size) - 1)];
+            if (value.a == 0) continue;
+
+            float luminance = Luminance(value.rgb);
+            sum += luminance;
+            squares += luminance * luminance;
+            count += 1;
+            if (x || y) brightest = max(brightest, luminance);
+        }
+
+    float4 history = 0, moments = 0;
     float2 screen = (pixel + 0.5) / Size * float2(2, -2) + float2(-1, 1);
     float4 world = mul(float4(screen, Depth[pixel], 1), WorldFromClip);
     float4 clip = mul(float4(world.xyz / world.w, 1), PreviousClipFromWorld);
@@ -397,33 +423,51 @@ void main(uint2 pixel : SV_DispatchThreadID)
         float2 position = (clip.xy / clip.w * float2(0.5, -0.5) + 0.5) * Size - 0.5;
         int2 corner = int2(floor(position));
         float2 fraction = position - corner;
-        float4 sum = 0;
+        float4 colorSum = 0, momentSum = 0;
         float weights = 0;
         for (uint i = 0; i < 4; ++i)
         {
             int2 texel = corner + int2(i & 1, i >> 1);
             if (any(texel < 0) || any(texel >= int2(Size))) continue;
 
-            float4 previous = Previous[texel];
+            float4 previous = PreviousMoments[texel];
             // Reversed-Z device depth is proportional to 1 / view depth.
-            if (previous.a == 0 || abs(PreviousDepth[texel] * clip.w / clip.z - 1) > 0.03) continue;
+            if (previous.b == 0 || abs(PreviousDepth[texel] * clip.w / clip.z - 1) > 0.03) continue;
 
             float weight = (i & 1 ? fraction.x : 1 - fraction.x) * (i >> 1 ? fraction.y : 1 - fraction.y);
-            sum += previous * weight;
+            colorSum += PreviousColor[texel] * weight;
+            momentSum += previous * weight;
             weights += weight;
         }
-        if (weights > 0.01) history = sum / weights;
+        if (weights > 0.01)
+        {
+            history = colorSum / weights;
+            moments = momentSum / weights;
+        }
     }
-    float frames = min(history.a + 1, float(MaxFrames));
-    Output[pixel] = float4(lerp(history.rgb, traced.rgb, 1 / frames), frames);
+
+    float own = Luminance(traced.rgb);
+    if (Clamp && moments.b < 4 && own > 2 * brightest)
+    {
+        traced.rgb *= 2 * brightest / own;
+        own = 2 * brightest;
+    }
+
+    float frames = min(moments.b + 1, float(MaxFrames)), blend = 1 / frames;
+    float mean = lerp(moments.r, own, blend), meanSquare = min(lerp(moments.g * moments.g, own * own, blend), HalfMax * HalfMax);
+    float spatialMean = sum / count, variance = frames < 4 ? squares / count - spatialMean * spatialMean : meanSquare - mean * mean;
+    Output[pixel] = float4(min(lerp(history.rgb, traced.rgb, blend), HalfMax), clamp(variance, 0, HalfMax));
+    Moments[pixel] = float4(mean, sqrt(meanSquare), frames, 0);
 }
 )";
 
 // One pass of an edge-avoiding a-trous filter over an accumulated signal: a 5 by 5 B3-spline kernel
-// with Step texels between taps, weighted down by distance from the pixel's plane and by normals
-// apart. For the sun's bounce, the last pass turns the light into the scene colour's units as Bend's
-// lighting does with the sun: its colour, which grows with height above the world's origin, the
-// exposure, and 1 / pi for a diffuse surface.
+// with Step texels between taps, weighted down by distance from the pixel's plane, by normals apart,
+// and by luminance apart in proportion to how noisy the pixel still is: its variance, smoothed over
+// its 3 by 3 neighbours. Noisy pixels are blurred hard and converged ones keep their detail. Each
+// pass filters the variance along (SVGF, Schied et al. 2017). For the sun's bounce, the last pass
+// turns the light into the scene colour's units as Bend's lighting does with the sun: its colour,
+// which grows with height above the world's origin, the exposure, and 1 / pi for a diffuse surface.
 inline constexpr char BounceFilter[] = R"(
 cbuffer BounceParameters : register(b0)
 {
@@ -437,15 +481,22 @@ cbuffer BounceParameters : register(b0)
     uint Clamp;
     uint Padding;
 };
-Texture2D<float4> Input : register(t0);
+Texture2D<float4> Input : register(t0); // rgb: the signal, a: its variance, -1 where it has none
 Texture2D<float> Depth : register(t1);
 Texture2D<uint> Normals : register(t2);
 // Rows of the lighting's constants: the sun's colour at height 0, the exposure (y), the colour the sun
 // tends to with height (doubled) and the camera's height (z).
 ByteAddressBuffer Lighting : register(t3);
-RWTexture2D<float4> Output : register(u0);
+RWTexture2D<float4> Output : register(u0); // As Input
 
 static const float Kernel[3] = { 3.0 / 8, 1.0 / 4, 1.0 / 16 };
+// SVGF's: luminance this many standard deviations apart weighs 1 / e.
+static const float LuminanceDeviations = 4;
+
+float Luminance(float3 color)
+{
+    return dot(color, float3(0.2126, 0.7152, 0.0722));
+}
 
 float3 Unproject(int2 texel, float depth)
 {
@@ -471,16 +522,30 @@ float4 LightingRow(uint row)
 void main(uint2 pixel : SV_DispatchThreadID)
 {
     if (any(pixel >= Size)) return;
-    if (Input[pixel].a == 0)
+    float4 center = Input[pixel];
+    if (center.a < 0)
     {
-        Output[pixel] = 0;
+        Output[pixel] = float4(0, 0, 0, -1);
         return;
     }
 
+    float variance = 0, varianceWeights = 0;
+    for (int row = -1; row <= 1; ++row)
+        for (int column = -1; column <= 1; ++column)
+        {
+            float neighbour = Input[clamp(int2(pixel) + int2(column, row), 0, int2(Size) - 1)].a;
+            float weight = (column ? 0.25 : 0.5) * (row ? 0.25 : 0.5);
+            if (neighbour < 0) continue;
+
+            variance += neighbour * weight;
+            varianceWeights += weight;
+        }
+
     float3 position = Unproject(pixel, Depth[pixel]), normal = DecodeNormal(Normals[pixel]);
     float tolerance = 10 + 0.01 * length(position - Unproject(pixel, 1));
+    float luminance = Luminance(center.rgb), spread = LuminanceDeviations * sqrt(variance / varianceWeights) + 1e-6;
     float3 sum = 0;
-    float weights = 0;
+    float weights = 0, varianceSum = 0;
     for (int y = -2; y <= 2; ++y)
         for (int x = -2; x <= 2; ++x)
         {
@@ -488,12 +553,13 @@ void main(uint2 pixel : SV_DispatchThreadID)
             if (any(texel < 0) || any(texel >= int2(Size))) continue;
 
             float4 value = Input[texel];
-            if (value.a == 0) continue;
+            if (value.a < 0) continue;
 
             float apart = abs(dot(normal, Unproject(texel, Depth[texel]) - position));
-            float weight = Kernel[abs(x)] * Kernel[abs(y)] * exp(-apart / tolerance)
+            float weight = Kernel[abs(x)] * Kernel[abs(y)] * exp(-apart / tolerance - abs(Luminance(value.rgb) - luminance) / spread)
                 * pow(saturate(dot(normal, DecodeNormal(Normals[texel]))), 8);
             sum += value.rgb * weight;
+            varianceSum += value.a * weight * weight;
             weights += weight;
         }
     float3 light = sum / weights;
@@ -503,7 +569,8 @@ void main(uint2 pixel : SV_DispatchThreadID)
         float3 sun = LightingRow(0).rgb + height * (2 * LightingRow(2).rgb - LightingRow(0).rgb);
         light *= sun * LightingRow(1).y / 3.14159265;
     }
-    Output[pixel] = float4(light, 1);
+    // Half precision turns larger values infinite, which the next pass would spread.
+    Output[pixel] = float4(light, min(varianceSum / (weights * weights), 65504));
 }
 )";
 

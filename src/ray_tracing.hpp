@@ -58,6 +58,10 @@ struct Features
     // With sun shadows: rays across the sun's (or moon's) disc rather than at its centre, filtered over
     // frames and neighbouring pixels, for shadows that soften with distance from their caster.
     bool softSunShadows{};
+    // With global illumination or the lights' bounce: pixels reuse the bounce rays of their
+    // neighbours and of earlier frames (ReSTIR GI), so a room lit through a small patch fills in with
+    // far less noise.
+    bool reuseBounceRays{};
 
     // Whether anything is traced; the other switches only change how.
     bool any() const { return sunShadows || ambientOcclusion || globalIllumination || lightShadows; }

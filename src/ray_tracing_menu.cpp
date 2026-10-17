@@ -276,6 +276,15 @@ void drawMenu()
         ImGui::SetTooltip("Adds the lights' light bounced once off the same geometry, accumulated over frames and filtered, so\n"
             "their shadows fill in as in a real room. Needs the ray-traced light shadows.");
     ImGui::Unindent();
+
+    const bool bounces = features.globalIllumination || (features.lightShadows && features.lightBounce);
+    ImGui::BeginDisabled(!bounces);
+    if (ImGui::Checkbox("Reuse bounce rays", &features.reuseBounceRays)) save(features);
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("Pixels reuse the bounce rays of their neighbours and of earlier frames (ReSTIR GI), so a room lit through a\n"
+            "small patch, such as the flashlight's spot or a moonlit window, fills in with far less noise. Costs about one more\n"
+            "shadow ray per pixel and light. Needs the global illumination or the lights' bounce light.");
 }
 
 void drawDiagnostics(float width)
