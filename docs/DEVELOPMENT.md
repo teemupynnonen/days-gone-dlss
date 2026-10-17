@@ -420,10 +420,13 @@ is read when it changes, with or without DLSS, overrides them without saving the
   2.5 ms of the render thread at 4K in a forest, so the trees are now placed only at the first draw
   of a frame after a read-back or reload landed or the templates changed, and the frame after the
   read-back, not with it: a quiet frame does neither. The trace copies the result, less the copies
-  of any template its own additions evicted (placed again the next frame). Sun rays test the copies
-  from 30 cm plus 0.2% of the distance on, so a copy never shadows its own tree's leaves. Once a mesh's copy is ready, the view stops capturing its draws:
-  the copies stand in for them, which saves most of the rebuild. The copies keep the pose the
-  template was captured in, so their shadows do not sway with the wind.
+  of any template its own additions evicted (placed again the next frame). Once a mesh's copy is
+  ready, the view stops capturing its draws: the copies stand in for them, which saves most of the
+  rebuild. The copies keep the pose the template was captured in, so their shadows do not sway
+  with the wind. Rays from foliage (lighting model 2, which the shared normals carry in their top
+  bits) test the copies from 30 cm plus 0.2% of the distance on, so a copy never shadows its own
+  tree's leaves; rays from other surfaces test them from the start, or leaf litter and grass would
+  shadow nothing within 30 cm of the ground under them.
 - **Interop and trace.** Direct3D 11 cannot share buffers with Direct3D 12, and D3D12-created
   resources do not open in D3D11 on this driver, so Direct3D 11 creates every shared resource:
   textures with `SHARED | SHARED_NTHANDLE` and a shared fence. A D3D12 device on the same
@@ -494,7 +497,8 @@ is read when it changes, with or without DLSS, overrides them without saving the
   of that radius leaves t² of the light: a linear falloff left the ground under a car most of it.
   Rays see the view's geometry, including the cached draws standing in for it, and the cached
   geometry off screen too, so a wall just outside the view still occludes where screen-space AO
-  cannot. They see the trees' copies from 30 cm plus 0.2% of the view distance on, as sun rays do.
+  cannot. They see the trees' copies as sun rays do: from foliage only from 30 cm plus 0.2% of the
+  view distance on, from other surfaces from the start.
   The shadow casters are a coarser level of detail and are left out. With half the rays, each pixel
   traces two corners, in a checkerboard that changes every frame, and takes the other two from its
   horizontal or else vertical neighbour if that sees the same corners within 2% of its distance;
@@ -503,8 +507,8 @@ is read when it changes, with or without DLSS, overrides them without saving the
   rays then take 0.47 instead of 0.73 ms at the bridge. The result is written in the game's
   packing, with the four untraced corners and pixels without a surface fully visible, and a pass
   keeps per corner the lower of it and the game's own (with the game's depth): the usual hybrid of
-  traced and screen-space AO. The copies keep their template's wind and occlude only from 30 cm,
-  so in the trace grass no longer darkens the ground under it; the game's AO gives that near
+  traced and screen-space AO. The copies keep their template's wind and occlude foliage only from
+  30 cm, so in the trace grass does not darken its own blades; the game's AO gives that near
   contact, and the rays what the screen does not hold. Capturing the foliage of trees within 20 m
   in the view instead, for the rays, pulled whole grass draws (every visible instance, across the
   view) into the capture as alpha-tested geometry: it doubled the view's rebuilt triangles, and the

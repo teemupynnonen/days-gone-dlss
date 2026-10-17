@@ -607,6 +607,8 @@ struct Gpu
     ComPtr<ID3D11Texture2D> normals;
     ComPtr<ID3D11ShaderResourceView> normalsView;
     ComPtr<ID3D11UnorderedAccessView> normalsAccess;
+    ComPtr<ID3D11ShaderResourceView> normalsSourceView, stencilView; // Of the game's textures
+    ComPtr<ID3D11ComputeShader> normalsShader;
     bool normalsKnown{}; // This frame's are copied
     ID3D11Resource* depthResource{}; // The game's depth texture behind depthView
     ComPtr<ID3D11Texture2D> shadowCopy; // The game's sun shadow as its resolve passes left it
@@ -1590,6 +1592,9 @@ std::unique_ptr<Gpu> create(ID3D11DeviceContext* context)
     code = compile(shaders::BakeCopy, "ray-tracing-bake-copy", "cs_5_0");
     check(g.device->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, g.bakeCopyShader.GetAddressOf()),
         "Creating the coverage copy shader");
+    code = compile(shaders::GameNormals, "ray-tracing-game-normals", "cs_5_0");
+    check(g.device->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, g.normalsShader.GetAddressOf()),
+        "Creating the normals copy shader");
     code = compile(shaders::FullScreen, "ray-tracing-full-screen", "vs_5_0");
     check(g.device->CreateVertexShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, g.fullScreenShader.GetAddressOf()),
         "Creating the full-screen shader");
@@ -1745,33 +1750,6 @@ void ensureTraced(Gpu& g, UINT width, UINT height)
     g.d3d12->CreateUnorderedAccessView(g.sunSoft12.Get(), nullptr, nullptr, handle);
     g.tracedWidth = width;
     g.tracedHeight = height;
-}
-
-// Copies the game's G-buffer normal over the view: the G-buffer's second target, so it does not
-// depend on the game's own ambient occlusion, or else the normal that occlusion pass read. Frames
-// without either (menus) clear it to 0, unknown.
-void prepareNormals(Gpu& g, const Capture& frame)
-{
-    const auto& source = frame.gbuffer[1] ? frame.gbuffer[1] : frame.normals;
-    ComPtr<ID3D11Texture2D> normals;
-    D3D11_TEXTURE2D_DESC description{};
-    if (source && SUCCEEDED(source.As(&normals))) normals->GetDesc(&description);
-    g.normalsKnown = (description.Format == DXGI_FORMAT_R32_UINT || description.Format == DXGI_FORMAT_R32_TYPELESS)
-        && description.Width >= static_cast<UINT>(frame.rect[2]) && description.Height >= static_cast<UINT>(frame.rect[3]);
-    if (!g.normalsKnown)
-    {
-        static bool reported{};
-        if (normals && !std::exchange(reported, true))
-            upscaler::log("The game's G-buffer normal is not an R32_UINT texture covering the view; ambient occlusion, bounced light and "
-                "soft light shadows are not traced, and sun rays take the traced normals.");
-        constexpr UINT unknown[4]{};
-        g.context->ClearUnorderedAccessViewUint(g.normalsAccess.Get(), unknown);
-        return;
-    }
-
-    const D3D11_BOX view{static_cast<UINT>(frame.rect[0]), static_cast<UINT>(frame.rect[1]), 0, static_cast<UINT>(frame.rect[2]),
-        static_cast<UINT>(frame.rect[3]), 1};
-    g.context->CopySubresourceRegion(g.normals.Get(), 0, 0, 0, 0, normals.Get(), 0, &view);
 }
 
 void readTimings(Gpu& g, UINT slot)
@@ -2368,6 +2346,39 @@ ID3D11ShaderResourceView* gameView(Gpu& g, ComPtr<ID3D11ShaderResourceView>& vie
         || FAILED(g.device->CreateShaderResourceView(texture.Get(), &readable, view.GetAddressOf())))
         return nullptr;
     return view.Get();
+}
+
+// Copies the game's G-buffer normal over the view with each pixel's lighting model (GameNormals): the
+// G-buffer's second target, so it does not depend on the game's own ambient occlusion, or else the
+// normal that occlusion pass read. Frames without either (menus) clear it to 0, unknown. Without the
+// stencil every lighting model reads as 0.
+void prepareNormals(Gpu& g, const Capture& frame, UINT width, UINT height)
+{
+    const auto& source = frame.gbuffer[1] ? frame.gbuffer[1] : frame.normals;
+    auto* normals = gameView(g, g.normalsSourceView, source.Get(), DXGI_FORMAT_R32_UINT, frame.rect);
+    g.normalsKnown = normals != nullptr;
+    if (!g.normalsKnown)
+    {
+        static bool reported{};
+        if (source && !std::exchange(reported, true))
+            upscaler::log("The game's G-buffer normal is not a readable R32_UINT texture covering the view; ambient occlusion, bounced "
+                "light and soft light shadows are not traced, and sun rays take the traced normals.");
+        constexpr UINT unknown[4]{};
+        g.context->ClearUnorderedAccessViewUint(g.normalsAccess.Get(), unknown);
+        return;
+    }
+
+    ID3D11ShaderResourceView* inputs[]{normals, gameView(g, g.stencilView, frame.depth.Get(), DXGI_FORMAT_UNKNOWN, frame.rect)};
+    const RegionConstants region{{frame.rect[0], frame.rect[1]}, {width, height}};
+    inOwnState(g, [&]
+    {
+        g.context->UpdateSubresource(g.regionConstants.Get(), 0, nullptr, &region, 0, 0);
+        g.context->CSSetShader(g.normalsShader.Get(), nullptr, 0);
+        g.context->CSSetConstantBuffers(0, 1, g.regionConstants.GetAddressOf());
+        g.context->CSSetShaderResources(0, static_cast<UINT>(std::size(inputs)), inputs);
+        g.context->CSSetUnorderedAccessViews(0, 1, g.normalsAccess.GetAddressOf(), nullptr);
+        g.context->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
+    });
 }
 
 // Copies the game's diffuse colours over the view for the bounce rays and the lights' bounce, when
@@ -3208,7 +3219,7 @@ bool trace(Gpu& g, const Capture& frame)
     ensureTraced(g, width, height);
     ensureBuildSpace(g, view, casters);
     g.timer->begin(g.context, Pass::Prepare);
-    prepareNormals(g, frame);
+    prepareNormals(g, frame, width, height);
     prepareAmbient(g, frame, width, height);
     prepareBounce(g, frame, width, height);
     auto* depth = gameDepth(g, frame.depth.Get());
