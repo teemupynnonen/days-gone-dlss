@@ -197,8 +197,8 @@ With `frame_generation` set to `2x` to `6x` or `dynamic` in `DaysGoneDLSS.ini`, 
 through Direct3D 12 from its next start; changing the multiplier, or turning generation off, applies
 at once.
 
-- **Swap chain.** When the add-on loads it takes over the `CreateSwapChainForHwnd` slot of DXGI's
-  factory function table, in front of ReShade's hook. The game's swap chain becomes a stand-in
+- **Swap chain.** When the add-on loads it detours DXGI's own `CreateSwapChainForHwnd`, which
+  ReShade's proxy of the game's factory calls. The game's swap chain becomes a stand-in
   (`src/presenter.cpp`) whose back buffer is a texture Direct3D 11 shares with Direct3D 12. A
   native Direct3D 12 device on the same GPU makes its queue and the real swap chain through
   Streamline's proxies, so Streamline owns presentation. Each present signals a shared fence after
@@ -210,11 +210,15 @@ at once.
   chain's counts are not the game's. The stand-in reports its own: `GetLastPresentCount` and
   `GetFrameStatistics` count the game's presents, with the time of the last one. 1.07 needs this
   (DIFFERENCES.md, Frame timing).
-- **Overlay.** ReShade wraps only swap chains made on its own proxies, and frame generation presents
-  from a queue of its own, so ReShade's runtime is created on the stand-in instead
-  (`create_effect_runtime`). It draws into the back buffer before the copy and is recreated when
-  the buffers resize or the colour space changes; the stand-in keeps the colour space where ReShade
-  reads it.
+- **ReShade.** Behind ReShade's hook, the stand-in is what ReShade wraps as the game's swap chain:
+  its overlay and effects draw into the back buffer before the copy, and add-ons get Direct3D 11
+  `init_swapchain` and `present` events as without frame generation. RenoDX's DLSS 5 add-on needs
+  them to follow DLSS; with the stand-in in front of ReShade it saw only the Direct3D 12 frame
+  generation. The detour goes on the real factory's function table, behind ReShade's proxy; the
+  function is read from the table entry in `dxgi.dll`'s file and relocated, since some setups
+  (ReShade with Ubisoft's overlay loaded) replace the entry in memory. The add-on's present event
+  hands the frame's inputs to the stand-in, whose `Present` follows it. The Direct3D 12 swap chain
+  is made on the real factory and passes the detour unwrapped.
 - **Inputs.** The upscaler's depth and render-resolution motion vectors are created shared, and
   both composites write a second output: the frame before the UI, as the hudless colour. Each
   present tags the three through Direct3D 12 as `eOnlyValidNow`, so Streamline copies them in the

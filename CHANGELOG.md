@@ -1,5 +1,11 @@
 # Days Gone DLSS changelog
 
+## Unreleased
+
+- With frame generation on, ReShade and its add-ons now see the game as Direct3D 11, as without it.
+  RenoDX's DLSS 5 Neural Rendering add-on found no DLSS with frame generation on; it now runs on
+  the game's DLSS.
+
 ## 1.7.0
 
 - Ray-traced sun shadows now fall on skin (faces, hands), not only on clothes. Bend keeps skin's
