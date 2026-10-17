@@ -1,6 +1,6 @@
 # Days Gone DLSS changelog
 
-## Unreleased
+## 1.7.1
 
 - With frame generation on, ReShade and its add-ons now see the game as Direct3D 11, as without it.
   RenoDX's DLSS 5 Neural Rendering add-on found no DLSS with frame generation on; it now runs on
