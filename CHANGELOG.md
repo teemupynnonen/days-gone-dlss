@@ -1,6 +1,6 @@
 # Days Gone DLSS changelog
 
-## Unreleased
+## 1.7.0
 
 - Ray-traced sun shadows now fall on skin (faces, hands), not only on clothes. Bend keeps skin's
   sun shadow in another channel of its shadow texture, which the traced shadows did not write.
@@ -22,6 +22,10 @@
 - Ray tracing: the moon lights the night again with ray-traced sun shadows on, and global
   illumination bounces its light. The moon's disc, about 207 km away, was traced as geometry, so
   every ray toward the moon hit the moon itself and the traced shadows removed all moonlight.
+- Ray tracing only starts when one of its features is on as the game starts, so it costs nothing
+  while unused. Turning ray tracing on now takes a restart.
+- Fix memory the ray tracer kept holding over long sessions, and cut work it repeated every frame.
+  Moving a slider no longer rewrites the settings file every frame.
 
 ## 1.6.0
 
