@@ -129,6 +129,11 @@ percent screen percentage. The jitter is added to the projection with +Y up.
   the game's own constant buffer, so vignette, grain, UI and HDR brightness match the original.
   Mode changes wait until the RHI reaches a view near the requested render size; queued
   views from the previous mode use game TAA instead of violating DLSS's input-size limits.
+  The colour is already tone-mapped, with white at 1, so DLSS is handed a 1x1 exposure texture
+  holding a constant 1 (pre-exposure and exposure scale 1 too). Bend's own scene exposure is
+  applied in its lighting, before this, and would be the wrong number here. The texture is for
+  add-ons that follow the evaluation: OptiScaler's DLSS 5 neural rendering takes its white point
+  from it, and without one OptiScaler's Direct3D 11 bridge turns on DLSS's auto-exposure.
 - **HDR.** The square-root encoding exceeds 1 in HDR, so the prepare shader squares the colour
   and DLSS runs with `IsHDR` on linear values. The composites then skip their squaring, apply
   the game's scene and UI brightness and encode PQ.

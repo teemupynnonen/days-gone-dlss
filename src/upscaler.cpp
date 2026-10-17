@@ -333,6 +333,7 @@ ComPtr<ID3D11ComputeShader> motionShader, prepareShader, compositeComputeShader;
 ComPtr<ID3D11PixelShader> compositePixelShader;
 ComPtr<ID3D11Buffer> prepareConstants, pixelConstants, computeConstants;
 Target motionTarget, depthTarget, biasTarget, colorTarget, outputTarget;
+ComPtr<ID3D11Texture2D> exposureTexture; // 1x1, the constant 1 DLSS is told as the exposure
 // Frame generation reads depth, motion and the hudless colour through Direct3D 12, so they are shared.
 bool frameGeneration{};
 Hudless hudless;
@@ -824,6 +825,28 @@ void ensureTarget(Target& target, UINT width, UINT height, DXGI_FORMAT format, c
     target.shared = shared;
 }
 
+// The colour DLSS receives is already tone-mapped, with white at 1, so the exposure it is told is a
+// constant 1. Handing that over as a texture, rather than leaving it out, lets add-ons that read the
+// evaluation (OptiScaler's neural rendering takes its white point from it) see the game's exposure,
+// and keeps OptiScaler from turning on DLSS's auto-exposure when it finds none.
+void ensureExposure()
+{
+    if (exposureTexture) return;
+
+    D3D11_TEXTURE2D_DESC description{};
+    description.Width = 1;
+    description.Height = 1;
+    description.MipLevels = 1;
+    description.ArraySize = 1;
+    description.Format = DXGI_FORMAT_R32_FLOAT;
+    description.SampleDesc.Count = 1;
+    description.Usage = D3D11_USAGE_IMMUTABLE;
+    description.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    constexpr float exposure = 1.0f;
+    const D3D11_SUBRESOURCE_DATA data{&exposure, sizeof(exposure), sizeof(exposure)};
+    check(device->CreateTexture2D(&description, &data, exposureTexture.GetAddressOf()), "Creating the DLSS exposure texture");
+}
+
 // Matches the hudless texture to the composite's output, the back buffer. False when that is not a
 // plain 2D texture the hudless copy can follow.
 bool ensureHudless(ID3D11View* output)
@@ -1027,7 +1050,7 @@ NVSDK_NGX_Result evaluateDlss(ID3D11DeviceContext* context, const NVSDK_NGX_D3D1
     NVSDK_NGX_Parameter_SetD3d11Resource(parameters, NVSDK_NGX_Parameter_Depth, evaluation.pInDepth);
     NVSDK_NGX_Parameter_SetD3d11Resource(parameters, NVSDK_NGX_Parameter_MotionVectors, evaluation.pInMotionVectors);
     NVSDK_NGX_Parameter_SetD3d11Resource(parameters, NVSDK_NGX_Parameter_TransparencyMask, nullptr);
-    NVSDK_NGX_Parameter_SetD3d11Resource(parameters, NVSDK_NGX_Parameter_ExposureTexture, nullptr);
+    NVSDK_NGX_Parameter_SetD3d11Resource(parameters, NVSDK_NGX_Parameter_ExposureTexture, evaluation.pInExposureTexture);
     NVSDK_NGX_Parameter_SetD3d11Resource(parameters, NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_Mask, evaluation.pInBiasCurrentColorMask);
     NVSDK_NGX_Parameter_SetF(parameters, NVSDK_NGX_Parameter_Jitter_Offset_X, evaluation.InJitterOffsetX);
     NVSDK_NGX_Parameter_SetF(parameters, NVSDK_NGX_Parameter_Jitter_Offset_Y, evaluation.InJitterOffsetY);
@@ -1254,12 +1277,14 @@ bool replaceTemporal(ID3D11DeviceContext* context, std::size_t slot, UINT groups
         else
         {
             ensureFeature(ngxContext.Get(), *plan, wanted, flags);
+            ensureExposure();
             reset = reset || ngx.reset;
             NVSDK_NGX_D3D11_DLSS_Eval_Params evaluation{};
             evaluation.Feature.pInColor = colorTarget.texture.Get();
             evaluation.Feature.pInOutput = outputTarget.texture.Get();
             evaluation.pInDepth = depthTarget.texture.Get();
             evaluation.pInMotionVectors = motionTarget.texture.Get();
+            evaluation.pInExposureTexture = exposureTexture.Get();
             evaluation.pInBiasCurrentColorMask = biasTarget.texture.Get();
             evaluation.InJitterOffsetX = jitter[0];
             evaluation.InJitterOffsetY = jitter[1];
@@ -1454,6 +1479,7 @@ void releaseRenderer()
     frame = {};
     biasedSamplers.clear();
     motionTarget = depthTarget = biasTarget = colorTarget = outputTarget = {};
+    exposureTexture.Reset();
     hudless = {};
     {
         std::lock_guard lock(shaderMutex);

@@ -1,5 +1,12 @@
 # Days Gone DLSS changelog
 
+## Unreleased
+
+- Hand DLSS an exposure texture (a constant 1: the colour it upscales is already tone-mapped).
+  Add-ons that follow the evaluation can read it; OptiScaler's DLSS 5 neural rendering takes its
+  white point from it instead of reporting that the game supplies no exposure, and OptiScaler no
+  longer turns on DLSS's auto-exposure for lack of one.
+
 ## 1.6.0
 
 - Add AMD FSR upscaling, chosen with the new **Upscaler** setting. It runs on any GPU: FSR 4 on
