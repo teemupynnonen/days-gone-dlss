@@ -36,7 +36,8 @@ struct Settings
     // The game then presents through Direct3D 12, which is set up with its swap chain at startup, so
     // turning frame generation on, or switching between DLSS and FSR, applies after a restart.
     FrameGeneration frameGeneration{FrameGeneration::Off};
-    // The ray-tracing experiment's features, applied at startup on 1.13.
+    // The ray-tracing experiment's features on 1.13. It prepares the game's shaders as they are created,
+    // so it only runs when one is on at startup, and turning it on applies after a restart.
     ray_tracing::Features rayTracing;
 
     bool operator==(const Settings&) const = default;

@@ -31,7 +31,7 @@ constexpr GUID UnwrappedObject{0x7f2c9a11, 0x3b4e, 0x4d6a, {0x81, 0x2f, 0x5e, 0x
 
 HMODULE self{};
 bool engineReady{}, engineFailed{};
-bool rayTracing{}; // The game build supports the ray-tracing experiment; nothing calls into it otherwise.
+void* exceptionHandler{}; // TEMPORARY
 ID3D11Device* nativeDevice{};
 ID3D11DeviceContext* nativeContext{};
 ID3D11DeviceContext* wrappedContext{};
@@ -100,7 +100,7 @@ void onDestroyCommandQueue(command_queue* queue)
 {
     if (reinterpret_cast<ID3D11DeviceContext*>(queue->get_native()) != nativeContext) return;
     upscaler::detach();
-    if (rayTracing) ray_tracing::release();
+    if (upscaler::rayTracingArmed()) ray_tracing::release();
     nativeContext = wrappedContext = nullptr;
     nativeDevice = nullptr;
 }
@@ -115,7 +115,7 @@ void onInitPipeline(device* device, pipeline_layout, uint32_t count, const pipel
         auto* object = reinterpret_cast<IUnknown*>(pipeline.handle);
         if (subobjects[i].type == pipeline_subobject_type::compute_shader || subobjects[i].type == pipeline_subobject_type::pixel_shader)
             upscaler::shaderCreated(shader->code, shader->code_size, object);
-        if (!rayTracing) continue;
+        if (!upscaler::rayTracingArmed()) continue;
         if (subobjects[i].type == pipeline_subobject_type::pixel_shader)
             ray_tracing::pixelShaderCreated(shader->code, shader->code_size, object);
         else if (subobjects[i].type == pipeline_subobject_type::vertex_shader)
@@ -146,19 +146,19 @@ void onPushDescriptors(command_list* list, shader_stage stages, pipeline_layout,
 
 bool onDispatch(command_list* list, uint32_t x, uint32_t y, uint32_t z)
 {
-    if (rayTracing) ray_tracing::dispatch(native(list));
+    if (upscaler::rayTracingArmed()) ray_tracing::dispatch(native(list));
     return upscaler::dispatch(native(list), x, y, z);
 }
 
 bool onDraw(command_list* list, uint32_t vertices, uint32_t instances, uint32_t first, uint32_t firstInstance)
 {
-    if (rayTracing && ray_tracing::draw(native(list), vertices, instances, first, 0, firstInstance, false)) return true;
+    if (upscaler::rayTracingArmed() && ray_tracing::draw(native(list), vertices, instances, first, 0, firstInstance, false)) return true;
     return instances == 1 && !firstInstance && upscaler::draw(native(list), vertices, first, 0, false);
 }
 
 bool onDrawIndexed(command_list* list, uint32_t indices, uint32_t instances, uint32_t first, int32_t offset, uint32_t firstInstance)
 {
-    if (rayTracing && ray_tracing::draw(native(list), indices, instances, first, offset, firstInstance, true)) return true;
+    if (upscaler::rayTracingArmed() && ray_tracing::draw(native(list), indices, instances, first, offset, firstInstance, true)) return true;
     return instances == 1 && !firstInstance && upscaler::draw(native(list), indices, first, offset, true);
 }
 
@@ -194,7 +194,7 @@ frame_generation::Inputs frame(ID3D11Texture2D* backBuffer)
     fsr_frame_generation::select(mode == upscaler::FrameGeneration::Fsr);
     const auto inputs = upscaler::frameGenerationInputs();
     upscaler::endFrame();
-    if (rayTracing && nativeContext) ray_tracing::present(nativeContext, backBuffer);
+    if (upscaler::rayTracingArmed() && nativeContext) ray_tracing::present(nativeContext, backBuffer);
 
     return inputs;
 }
@@ -212,12 +212,12 @@ void onPresent(command_queue*, swapchain* chain, const rect*, const rect*, uint3
 // F9 switches the ray-traced features off and on, for A/B comparison with the overlay closed.
 void onReshadePresent(effect_runtime* runtime)
 {
-    if (engineReady && rayTracing && runtime->is_key_pressed(VK_F9)) ray_tracing::toggleFeatures();
+    if (engineReady && upscaler::rayTracingArmed() && runtime->is_key_pressed(VK_F9)) ray_tracing::toggleFeatures();
 }
 
 void onReshadeOverlay(effect_runtime*)
 {
-    if (engineReady && rayTracing) ray_tracing::drawIndicator();
+    if (engineReady && upscaler::rayTracingArmed()) ray_tracing::drawIndicator();
 }
 
 void onOverlay(effect_runtime*)
@@ -227,14 +227,15 @@ void onOverlay(effect_runtime*)
     else upscaler::drawMenu(1.0f);
 }
 
-// The game's swap chain is created once, early, so the frame generation setting is read at load.
-upscaler::FrameGeneration frameGenerationSetting()
+// The game's swap chain is created once, early, and ray tracing prepares each shader as the game
+// creates it, so frame generation and ray tracing are decided from the settings at load.
+upscaler::Settings startupSettings()
 {
-    try { return upscaler::loadSettings(dataDirectory() / "DaysGoneDLSS.ini").frameGeneration; }
+    try { return upscaler::loadSettings(dataDirectory() / "DaysGoneDLSS.ini"); }
     catch (const std::exception& error)
     {
         reshade::log::message(reshade::log::level::warning, (std::string("Days Gone DLSS: ") + error.what()).c_str());
-        return upscaler::FrameGeneration::Off;
+        return {};
     }
 }
 }
@@ -288,17 +289,19 @@ LONG CALLBACK logFatalException(EXCEPTION_POINTERS* info)
 
 extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon, HMODULE reshadeModule)
 {
-    AddVectoredExceptionHandler(1, logFatalException); // TEMPORARY
     if (!upscaler::selectBuild(reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr)))
         || !reshade::register_addon(addon, reshadeModule))
         return false;
-    rayTracing = upscaler::rayTracingSupported();
+
+    if (!exceptionHandler) exceptionHandler = AddVectoredExceptionHandler(1, logFatalException); // TEMPORARY
     self = addon;
     // The view hook and pending RHI commands point into this module; keep it loaded until exit.
     HMODULE pinned{};
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
         reinterpret_cast<LPCWSTR>(&AddonInit), &pinned);
-    if (const auto mode = frameGenerationSetting(); mode != upscaler::FrameGeneration::Off)
+    const auto settings = startupSettings();
+    upscaler::armRayTracing(settings.rayTracing);
+    if (const auto mode = settings.frameGeneration; mode != upscaler::FrameGeneration::Off)
         presenter::install(frame, dataDirectory(), mode == upscaler::FrameGeneration::Fsr ? presenter::Route::Fsr : presenter::Route::Streamline);
     reshade::register_event<reshade::addon_event::init_command_queue>(onInitCommandQueue);
     reshade::register_event<reshade::addon_event::destroy_command_queue>(onDestroyCommandQueue);
@@ -322,9 +325,11 @@ extern "C" __declspec(dllexport) void AddonUninit(HMODULE addon, HMODULE reshade
     upscaler::disable();
     // ReShade unloads add-ons when its last device goes; the next load reports the game's device again.
     upscaler::detach();
-    if (rayTracing) ray_tracing::release();
+    if (upscaler::rayTracingArmed()) ray_tracing::release();
     nativeContext = wrappedContext = nullptr;
     nativeDevice = nullptr;
     reshade::unregister_overlay("Days Gone DLSS", onOverlay);
     reshade::unregister_addon(addon, reshadeModule);
+    RemoveVectoredExceptionHandler(exceptionHandler); // TEMPORARY
+    exceptionHandler = nullptr;
 }

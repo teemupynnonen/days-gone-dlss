@@ -37,8 +37,8 @@ works with either upscaler and needs upscaling on. Turning it on, or switching b
 takes a restart.
 
 **Ray tracing (experimental)**, on 1.13 only: sun shadows, ambient occlusion, global illumination
-and light shadows, each with its own checkbox. It costs a lot of performance. F9 switches it off
-and on to compare with the game.
+and light shadows, each with its own checkbox. Turning it on takes a restart. It costs a lot of
+performance. F9 switches it off and on to compare with the game.
 
 Settings are saved in `DaysGoneDLSS.ini` beside the add-on.
 

@@ -56,6 +56,12 @@ struct Status
 const char* selectBuild(std::uintptr_t imageBase) noexcept;
 // The ray-tracing experiment only knows the selected build's view layout on 1.13.
 bool rayTracingSupported() noexcept;
+// When the add-on first loads, from the settings then: ray tracing runs this session where it is
+// supported and one of its features is on. It prepares each shader as the game creates it, so it
+// cannot start later.
+void armRayTracing(const ray_tracing::Features& features) noexcept;
+// True when ray tracing runs this session; nothing calls into it otherwise.
+bool rayTracingArmed() noexcept;
 // Outside the loader lock, after MinHook is initialized and a build is selected: settings, console
 // variables, view hook. With Reflex (DLSS Frame Generation) also the game thread's frame.
 void initialize(const std::filesystem::path& directory, bool withReflex);
@@ -97,6 +103,7 @@ void endFrame() noexcept;
 // ---- Settings UI (upscaler_menu.cpp), on the render thread ----
 Status status();
 Settings currentSettings();
+// Applies at once; DaysGoneDLSS.ini is written when the settings settle, or at disable().
 void applySettings(const Settings& settings);
 Diagnostics currentDiagnostics();
 void applyDiagnostics(const Diagnostics& diagnostics);

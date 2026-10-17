@@ -277,15 +277,17 @@ lights to the game's lighting. **Ray tracing
 the debug view selector and statistics are under **Diagnostics**. F9 switches every feature off and back on for A/B comparison, with a note in
 the corner for two seconds; the work goes on underneath, so switching back is instant.
 The checkboxes are saved in `DaysGoneDLSS.ini` under the keys below and applied at startup.
-`DaysGoneDLSS-diagnostics.ini` is read when it changes, with or without DLSS, overrides them without
-saving them, and takes:
+Ray tracing runs only when sun shadows, ambient occlusion, global illumination or light shadows are
+on then: it prepares each shader as the game creates it, so otherwise the add-on never calls into
+it, as on 1.07, and turning one on takes a restart. While it runs, `DaysGoneDLSS-diagnostics.ini`
+is read when it changes, with or without DLSS, overrides them without saving them, and takes:
 
 | Key | Default | Effect |
 | --- | --- | --- |
 | `ray_tracing_sun_shadows` | 0 | Traced sun shadows |
 | `ray_tracing_replace_canopy_shadows` | 0 | With them, leave out the game's soft shadow under tree canopies |
 | `ray_tracing_soft_sun_shadows` | 0 | With them, rays across the sun's or moon's disc, filtered |
-| `ray_tracing_offscreen_geometry` | 1 | Also trace cached static draws and copies of the trees, so their shadows stay off screen |
+| `ray_tracing_offscreen_geometry` | 1 | Also trace cached static draws and copies of the trees, so their shadows stay off screen; off, the caches stay empty and the trees are not read back |
 | `ray_tracing_ambient_occlusion` | 0 | Traced ambient occlusion, combined with the game's (the darker of the two) |
 | `ray_tracing_half_ambient_rays` | 0 | With it, each pixel traces two of its four rays and takes the other two from a neighbour |
 | `ray_tracing_global_illumination` | 0 | One bounce of sunlight added to the game's lighting |
@@ -293,7 +295,7 @@ saving them, and takes:
 | `ray_tracing_soft_light_shadows` | 0 | With them, rays across each light's size, filtered |
 | `ray_tracing_light_bounce` | 0 | With them, one bounce of the local lights added to the game's lighting |
 | `ray_tracing_view` | 0 | A debug view drawn over the image (below) |
-| `ray_tracing_performance_overlay` | 0 | The cost table over the game, also with the overlay closed |
+| `ray_tracing_performance_overlay` | 0 | The cost table over the game, also with the overlay closed, and in `DaysGoneDLSS-performance.txt` (below) |
 | `ray_tracing_measure_cost` | 0 | A new non-zero number starts a real-cost measurement (below) |
 
 | View | Shows |
@@ -332,7 +334,9 @@ saving them, and takes:
   its alpha test samples. `src/alpha_test.cpp` slices the pixel shader's DXBC back from its
   `discard` to the input the samples read and makes a vertex shader that runs the game's own
   pixel shader over those coordinates. The material (pixel shader plus the textures it declares)
-  is baked once into a 256² slot of an 8192² `R8` coverage atlas, which starts again when full.
+  is baked once into a 256² slot of an 8192² `R8` coverage atlas. A material neither drawn for
+  1800 frames (about a minute) nor used by a cached draw lets go of the game's textures, and its
+  slot is reused; the atlas starts again only when all 1024 slots are in use.
   Most prepass tests also scale the opacity by one per-vertex value, a fade or a vertex colour
   channel; that value is captured too, and the bake sweeps it over 16 levels and keeps each
   texel's lowest passing level. The trace treats alpha-tested triangles as non-opaque and
@@ -378,8 +382,10 @@ saving them, and takes:
   each with its own bottom-level structure (`PREFER_FAST_TRACE`) in rings of vertices,
   coordinates and structures that evict the oldest. A draw is identified by the static constant
   buffers its vertex shader declares (the primitive's own; per-draw constants are dynamic) and its
-  instances; draws with a velocity target move and are never cached. Cached draws the view did not
-  draw this frame are traced with mask 2. A static draw the cache already holds is not captured
+  instances; draws with a velocity target move and are never cached. An object that starts moving
+  leaves the cache, and a moving one not drawn for 1800 frames (about a minute) is forgotten, since
+  the game reuses its buffers' addresses for other objects. Cached draws the view did not draw this
+  frame are traced with mask 2. A static draw the cache already holds is not captured
   again: its entry stands in for it, traced with masks 1 and 2, and the rebuild leaves it out. The
   cache also stands in for the shadow casters of an object it holds whole: every draw the view last
   drew of it is cached and none has been evicted since. New entries never evict one standing in
@@ -404,7 +410,10 @@ saving them, and takes:
   gives it other meshes, its transforms are reloaded or one of its templates changes; each frame
   only adds the camera's position as the trace writes the instances. A tree neither near nor seen
   lately is dropped until it is seen again, so placing goes through the live trees, not every tree
-  ever seen. A tree keeps up to eight sections. Reading back and placing ran every frame and took
+  ever seen. A transform buffer with no live trees that has not been drawn for the transforms'
+  reload interval (1800 frames, about a minute) is dropped with the templates taken from it, so the
+  tiles the game streams out stop holding memory.
+  A tree keeps up to eight sections. Reading back and placing ran every frame and took
   2.5 ms of the render thread at 4K in a forest, so the trees are now placed only at the first draw
   of a frame after a read-back or reload landed or the templates changed, and the frame after the
   read-back, not with it: a quiet frame does neither. The trace copies the result, less the copies
@@ -534,9 +543,10 @@ saving them, and takes:
   preparing and submitting the trace is broken down into reading back and placing the foliage, the
   cache plans and instances, the Direct3D 11 flush, recording and submitting, the preparation
   before the flush and the rest. The foliage's part comes in bursts, a read-back every fourth frame
-  and the placing the frame after, averaged with the quiet frames between. While ray tracing runs,
-  `DaysGoneDLSS-performance.txt` beside the log holds the same numbers, rewritten every second,
-  and the log has them every 600 traced frames.
+  and the placing the frame after, averaged with the quiet frames between. While the costs are
+  shown over the game or measured, `DaysGoneDLSS-performance.txt` beside the log holds the same
+  numbers, rewritten every second and once more after, so it keeps a finished measurement's result.
+  The log has them every 600 traced frames.
 
 Measured on an RTX 5080: the forest at Hot Springs (4K output, DLSS Ultra Performance) captures
 about 3.9 million triangles from 1,600 of 1,900 G-buffer draws, about 730 of them alpha-tested

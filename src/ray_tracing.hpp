@@ -59,6 +59,9 @@ struct Features
     // frames and neighbouring pixels, for shadows that soften with distance from their caster.
     bool softSunShadows{};
 
+    // Whether anything is traced; the other switches only change how.
+    bool any() const { return sunShadows || ambientOcclusion || globalIllumination || lightShadows; }
+
     bool operator==(const Features&) const = default;
 };
 

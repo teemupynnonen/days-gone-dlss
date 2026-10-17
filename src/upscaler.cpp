@@ -51,8 +51,6 @@ constexpr std::size_t NativeShaderOffset = 0x98;
 constexpr char MismatchStatus[] = "bytecode does not match this game build";
 // Any GUID identifies a custom-engine NGX project.
 constexpr char NgxProjectId[] = "8d3b6f2e-5c1a-4e7b-9f0d-2a6c4b8e1d73";
-constexpr GUID FullResolutionAmbientShader{0x761c968b, 0xb189, 0x4ae7, {0x89, 0xab, 0xb0, 0x4d, 0xae, 0x84, 0xfb, 0x32}};
-constexpr GUID AmbientTextureSlot{0x292946db, 0x06c3, 0x43e7, {0x90, 0x34, 0xc4, 0x6b, 0x29, 0xb7, 0xcf, 0x51}};
 // Which IndirectLightingPass a game shader is, one byte.
 constexpr GUID IndirectLightingPassMarker{0x3e81c5d2, 0x6a47, 0x4b0f, {0x92, 0x1d, 0x48, 0xe6, 0x0b, 0x7c, 0xa5, 0x13}};
 std::atomic<unsigned> ambientShaders{}, ambientShaderFailures{};
@@ -260,11 +258,13 @@ std::mutex logMutex;
 std::ofstream logFile;
 std::mutex settingsMutex;
 Settings settings;
+std::optional<std::uint64_t> unsavedChange; // GetTickCount64 of the latest change DaysGoneDLSS.ini does not have yet
 Diagnostics diagnostics;
 std::filesystem::path dataDirectory, settingsPath;
 Address imageBase{};
 // Chosen when the add-on loads, before the game creates its shaders.
 const GameBuild* build{};
+bool armed{}; // Ray tracing runs this session
 
 std::atomic<bool> active{}, releaseRequested{}, released{true}, hooked{};
 // Published by the render thread when DLSS can run: render width over output width, and jitter phases.
@@ -347,6 +347,14 @@ std::array<std::array<std::atomic<IUnknown*>, CopiesPerShader>, std::size(Shader
 std::array<std::array<ComPtr<IUnknown>, CopiesPerShader>, std::size(Shaders)> shaderOwners;
 std::array<std::string, std::size(Shaders)> shaderStatus;
 std::array<bool, std::size(Shaders)> foundInCache{};
+// Each patched lighting shader's full-resolution ambient variant, by the game's shader, under the
+// mutex. Holding the game's shader keeps its address from being freed and reused by another shader.
+struct AmbientReplacement
+{
+    ComPtr<ID3D11PixelShader> original, shader;
+    unsigned textureSlot{};
+};
+std::unordered_map<ID3D11PixelShader*, AmbientReplacement> ambientReplacements;
 
 struct BiasedSampler { ComPtr<ID3D11SamplerState> original, biased; };
 std::unordered_map<ID3D11SamplerState*, BiasedSampler> biasedSamplers;
@@ -465,7 +473,7 @@ void executeViewCommand(Address, ViewCommand* command)
         executingView = command->view;
     }
     const auto& view = command->view;
-    if (build->rayTracingView)
+    if (rayTracingArmed())
         ray_tracing::beginView(view.clipFromWorld, view.rect, view.unscaled, view.preViewTranslation, view.translationKnown);
 }
 
@@ -557,8 +565,9 @@ void preVisibility(Address renderer, Address commandList)
         capture.cameraKnown = readCamera(view, capture.camera);
         capture.frame = *reinterpret_cast<const std::uint32_t*>(*reinterpret_cast<const Address*>(view) + FamilyFrameNumberOffset);
         frame_generation::beginRender(capture.frame);
-        if (const auto* rayTracing = build->rayTracingView)
+        if (rayTracingArmed())
         {
+            const auto* rayTracing = build->rayTracingView;
             std::memcpy(capture.clipFromWorld, reinterpret_cast<const void*>(view + rayTracing->translatedViewProjection),
                 sizeof(capture.clipFromWorld));
             std::memcpy(capture.preViewTranslation, reinterpret_cast<const void*>(view + rayTracing->preViewTranslation),
@@ -584,7 +593,7 @@ void preVisibility(Address renderer, Address commandList)
             capture.sequence = ++captureSequence;
             capturedView = capture;
         }
-        if (fullJitter || (build->rayTracingView && ray_tracing::wanted())) enqueueView(commandList, capture);
+        if (fullJitter || (rayTracingArmed() && ray_tracing::wanted())) enqueueView(commandList, capture);
     }
 }
 
@@ -1451,6 +1460,9 @@ void bindAmbientLighting(ID3D11DeviceContext* context)
 // same. Returns false for any other shader, or when the setting is on.
 bool skipIndirectLighting(ID3D11DeviceContext* context, ID3D11ComputeShader* shader)
 {
+    // Only 1.07 has marked passes; on 1.13 the private-data lookup would cost every dispatch and never match.
+    if (build->version != 107) return false;
+
     auto pass = IndirectLightingPass::None;
     UINT size = sizeof(pass);
     if (!shader || FAILED(shader->GetPrivateData(IndirectLightingPassMarker, &size, &pass)) || pass == IndirectLightingPass::None
@@ -1493,6 +1505,7 @@ void releaseRenderer()
             shaderStatus[slot].clear();
             foundInCache[slot] = false;
         }
+        ambientReplacements.clear();
     }
     currentPixelShader = nullptr;
     currentAmbientShader.Reset();
@@ -1575,12 +1588,27 @@ void applySettings(const Settings& wanted)
     {
         std::lock_guard lock(settingsMutex);
         settings = wanted;
+        unsavedChange = GetTickCount64();
     }
     // Choosing a mode again retries after a failure.
     failed = false;
     ngx.failed = false;
     fsr.failed = false;
-    try { saveSettings(settingsPath, wanted); }
+}
+
+// A dragged slider changes the settings every frame; the file is written once they have stayed
+// unchanged for `settle` milliseconds.
+static void savePendingSettings(std::uint64_t settle)
+{
+    Settings unsaved;
+    {
+        std::lock_guard lock(settingsMutex);
+        if (!unsavedChange || GetTickCount64() - *unsavedChange < settle) return;
+
+        unsaved = settings;
+        unsavedChange.reset();
+    }
+    try { saveSettings(settingsPath, unsaved); }
     catch (const std::exception& error) { log("Could not save upscaler settings: " + std::string(error.what())); }
 }
 
@@ -1600,6 +1628,18 @@ const char* selectBuild(std::uintptr_t base) noexcept
 bool rayTracingSupported() noexcept
 {
     return build && build->rayTracingView;
+}
+
+// ReShade can load the add-on again in a session, while the view hook runs; the first load decides.
+void armRayTracing(const ray_tracing::Features& features) noexcept
+{
+    static bool decided{};
+    if (!std::exchange(decided, true)) armed = rayTracingSupported() && features.any();
+}
+
+bool rayTracingArmed() noexcept
+{
+    return armed;
 }
 
 // Reflex's sleep and simulation markers belong to the game thread. Without this hook frame
@@ -1634,7 +1674,7 @@ void initialize(const std::filesystem::path& directory, bool withReflex)
         settings = loadSettings(settingsPath);
     }
     catch (const std::exception& error) { log("Could not load upscaler settings: " + std::string(error.what())); }
-    if (build->rayTracingView) ray_tracing::enable(currentSettings().rayTracing);
+    if (rayTracingArmed()) ray_tracing::enable(currentSettings().rayTracing);
 
     Address screenData{}, samplesData{};
     float percentage{};
@@ -1703,6 +1743,9 @@ void tick() noexcept
 
 void disable() noexcept
 {
+    // ReShade unloads the add-on here, maybe within a slider's settling time.
+    savePendingSettings(0);
+
     if (!active.exchange(false)) return;
     replacing = false;
     targetScale = 0;
@@ -1828,12 +1871,16 @@ void pixelShader(ID3D11DeviceContext* context, ID3D11PixelShader* shader) noexce
     if (context != immediate || bypass) return;
     currentPixelShader = shader;
     currentAmbientShader.Reset();
-    if (!shader || !replacing.load(std::memory_order_relaxed)) return;
+    // Until a lighting shader is patched (never on 1.07), no bind needs the lock.
+    if (!shader || !replacing.load(std::memory_order_relaxed) || !ambientShaders.load(std::memory_order_relaxed)) return;
     try
     {
-        UINT slotSize = sizeof(currentAmbientTexture), shaderSize = sizeof(ID3D11PixelShader*);
-        if (SUCCEEDED(shader->GetPrivateData(AmbientTextureSlot, &slotSize, &currentAmbientTexture)))
-            shader->GetPrivateData(FullResolutionAmbientShader, &shaderSize, currentAmbientShader.GetAddressOf());
+        std::lock_guard lock(shaderMutex);
+        const auto found = ambientReplacements.find(shader);
+        if (found == ambientReplacements.end()) return;
+
+        currentAmbientShader = found->second.shader;
+        currentAmbientTexture = found->second.textureSlot;
     }
     catch (...) {}
 }
@@ -1904,8 +1951,8 @@ void shaderCreated(const void* code, std::size_t size, IUnknown* shader) noexcep
             Bypass guard;
             check(shaderDevice->CreatePixelShader(patch.bytecode.data(), patch.bytecode.size() * 4, nullptr, &replacement),
                 "Creating the full-resolution ambient lighting shader");
-            check(original->SetPrivateDataInterface(FullResolutionAmbientShader, replacement.Get()), "Storing the ambient lighting shader");
-            check(original->SetPrivateData(AmbientTextureSlot, sizeof(patch.textureSlot), &patch.textureSlot), "Storing the ambient texture slot");
+            std::lock_guard lock(shaderMutex);
+            ambientReplacements[original.Get()] = {original, replacement, patch.textureSlot};
             ++ambientShaders;
         }
         const auto lightingPass = indirectLightingPass(code, size);
@@ -1923,17 +1970,20 @@ void shaderCreated(const void* code, std::size_t size, IUnknown* shader) noexcep
     }
 }
 
-// While ray tracing runs or its costs are shown, DaysGoneDLSS-performance.txt beside the log holds
-// them, rewritten every second, so they can be read without the overlay.
+// While the costs are shown or measured, DaysGoneDLSS-performance.txt beside the log holds them,
+// rewritten every second, so they can be read without the overlay, and once more after, so it keeps
+// a finished measurement's result. Not otherwise: opening a file while presenting can hitch the game.
 static void writePerformanceReport()
 {
     static std::uint64_t written{};
+    static bool asked{};
     const auto now = GetTickCount64();
     if (now - written < 1000) return;
 
     written = now;
     const auto state = ray_tracing::status();
-    if (!ray_tracing::wanted() && !state.performanceOverlay && !state.measurement.running) return;
+    const auto askedBefore = std::exchange(asked, state.performanceOverlay || state.measurement.running);
+    if (!asked && !askedBefore) return;
 
     std::ofstream(dataDirectory / "DaysGoneDLSS-performance.txt", std::ios::trunc) << ray_tracing::performanceReport();
 }
@@ -1966,7 +2016,7 @@ static void reloadDiagnostics()
         else if (key == "debug_view" && value >= 0 && value <= 4) options.debugView = value;
         else if (key == "game_taa") options.gameTemporalAA = value != 0;
         else if (key == "full_resolution_ao") options.fullResolutionAmbientOcclusion = value != 0;
-        else if (key == "ray_tracing_view" && build->rayTracingView && value >= 0 && value <= 9) ray_tracing::select(static_cast<ray_tracing::View>(value));
+        else if (key == "ray_tracing_view" && rayTracingArmed() && value >= 0 && value <= 9) ray_tracing::select(static_cast<ray_tracing::View>(value));
         else if (key == "ray_tracing_sun_shadows")
         {
             features.sunShadows = value != 0;
@@ -2023,12 +2073,12 @@ static void reloadDiagnostics()
             features.softSunShadows = value != 0;
             featuresRead = true;
         }
-        else if (key == "ray_tracing_performance_overlay" && build->rayTracingView) ray_tracing::showPerformance(value != 0);
+        else if (key == "ray_tracing_performance_overlay" && rayTracingArmed()) ray_tracing::showPerformance(value != 0);
         // A new number starts a measurement, so rewriting the file with the same one does not.
-        else if (key == "ray_tracing_measure_cost" && build->rayTracingView && value && value != std::exchange(measureRequest, value))
+        else if (key == "ray_tracing_measure_cost" && rayTracingArmed() && value && value != std::exchange(measureRequest, value))
             ray_tracing::measureCosts();
     }
-    if (featuresRead && build->rayTracingView) ray_tracing::enable(features);
+    if (featuresRead && rayTracingArmed()) ray_tracing::enable(features);
     applyDiagnostics(options);
     log("Diagnostics: invert jitter X " + std::to_string(options.invertJitterX) + ", Y " + std::to_string(options.invertJitterY)
         + ", jittered motion " + std::to_string(options.jitteredMotion) + ", debug view " + std::to_string(options.debugView)
@@ -2066,6 +2116,9 @@ void endFrame() noexcept
 {
     try
     {
+        // The settings also change while DLSS is off, so this comes before the returns below.
+        savePendingSettings(500);
+
         if (releaseRequested)
         {
             if (!released.exchange(true) && hooked) releaseRenderer();
@@ -2074,7 +2127,7 @@ void endFrame() noexcept
         // The ray-tracing switches live in the same file and work without DLSS.
         static std::uint64_t presents{};
         if (active && ++presents % 30 == 0) reloadDiagnostics();
-        if (active && build->rayTracingView) writePerformanceReport();
+        if (active && rayTracingArmed()) writePerformanceReport();
         if (!active || !hooked) return;
         const auto wanted = currentSettings();
         // Missing slots cost one memory read each until the engine fills its caches.
