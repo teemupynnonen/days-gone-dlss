@@ -448,8 +448,10 @@ is read when it changes, with or without DLSS, overrides them without saving the
   the video memory manager demoted it to system memory at 4K, which made the copy and builds many
   times slower.
 - **Sun shadows.** Twelve `FBendSceneDirectionalShadow...ScreenSpaceResolvePS` variants, known by
-  checksum, resolve the sun's shadow into an `R8G8_UNORM` target before lighting. Its red channel
-  holds the square root of the sun's visibility; lighting squares it and skips the sun at 0. Their
+  checksum, resolve the sun's shadow into an `R8G8_UNORM` target before lighting, one variant per
+  lighting model. Its red channel holds the square root of the sun's visibility; lighting squares
+  it and skips the sun at 0. Skin (lighting model 3) is the exception: its resolve leaves red at 0
+  and writes the visibility to green, the only channel skin lighting reads. Their
   constants are Bend's global uniform buffer, which lighting reads as slot 2: row 32
   (`DirectionalLight`) is the direction the light travels, the sun's by day and the moon's at night
   (lighting takes N·L with it negated), and row 33 its colour. Row 20, the canopy map's basis
@@ -461,7 +463,8 @@ is read when it changes, with or without DLSS, overrides them without saving the
   feature. Primary rays run for the debug views, and where the game's depth or normal cannot be
   read: there sun rays start from their hits, along the traced normal where the hit is the same
   surface. A full-screen pass then writes the lower of the game's and the traced visibility, so
-  shadows only the game sees stay. The game's visibility multiplies its shadow maps by a soft tree
+  shadows only the game sees stay, into the channel the pixel's lighting model reads (from the
+  shared normals' model bits). The game's visibility multiplies its shadow maps by a soft tree
   shadow from a light-space map of the canopies (two cascades of depth layers and densities), the
   only array texture every variant reads. Replacing the canopy shadows, the add-on draws the
   resolve itself with zeros there, which leaves that term at 1, and puts the game's binding back.

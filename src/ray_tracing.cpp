@@ -660,7 +660,6 @@ struct Gpu
     ComPtr<ID3D11ComputeShader> positionShader, depthShader, bakeCopyShader;
     ComPtr<ID3D11VertexShader> fullScreenShader;
     ComPtr<ID3D11PixelShader> compositeShader, injectShader;
-    ComPtr<ID3D11BlendState> redOnly;
     ComPtr<ID3D11Buffer> positionConstants, regionConstants, compositeConstants, bakeConstants, bakeLevel;
     // Alpha-tested geometry: streamed vertices, their coordinates for D3D12, and the coverage atlas.
     ComPtr<ID3D11Buffer> maskedStreamed, transformRows, transformDraws, materialDraws;
@@ -1649,9 +1648,6 @@ std::unique_ptr<Gpu> create(ID3D11DeviceContext* context)
     code = compile(shaders::Composite, "ray-tracing-composite", "ps_5_0");
     check(g.device->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, g.compositeShader.GetAddressOf()),
         "Creating the ray-tracing composite shader");
-    D3D11_BLEND_DESC redOnly{};
-    redOnly.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_RED;
-    check(g.device->CreateBlendState(&redOnly, g.redOnly.GetAddressOf()), "Creating the sun shadow blend state");
     g.positionConstants = constantBuffer(g.device.Get(), sizeof(PositionConstants));
     g.regionConstants = constantBuffer(g.device.Get(), sizeof(RegionConstants));
     g.compositeConstants = constantBuffer(g.device.Get(), sizeof(CompositeConstants));
@@ -3545,10 +3541,10 @@ void inject(Gpu& g, Capture& frame)
     {
         g.context->UpdateSubresource(g.regionConstants.Get(), 0, nullptr, &region, 0, 0);
         const D3D11_VIEWPORT viewport{0, 0, static_cast<float>(description.Width), static_cast<float>(description.Height), 0, 1};
-        ID3D11ShaderResourceView* inputs[]{g.sunlitView.Get(), g.shadowView.Get(), g.sunFiltered ? g.sunFiltered : g.sunlitView.Get()};
+        ID3D11ShaderResourceView* inputs[]{g.sunlitView.Get(), g.shadowView.Get(), g.sunFiltered ? g.sunFiltered : g.sunlitView.Get(),
+            g.normalsView.Get()};
         g.context->RSSetViewports(1, &viewport);
         g.context->OMSetRenderTargets(1, target.GetAddressOf(), nullptr);
-        g.context->OMSetBlendState(g.redOnly.Get(), nullptr, 0xffffffff);
         g.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         g.context->VSSetShader(g.fullScreenShader.Get(), nullptr, 0);
         g.context->PSSetShader(g.injectShader.Get(), nullptr, 0);
