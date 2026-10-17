@@ -294,6 +294,7 @@ is read when it changes, with or without DLSS, overrides them without saving the
 | `ray_tracing_light_shadows` | 0 | Traced shadows for the game's local lights, in place of their shadow maps |
 | `ray_tracing_soft_light_shadows` | 0 | With them, rays across each light's size, filtered |
 | `ray_tracing_light_bounce` | 0 | With them, one bounce of the local lights added to the game's lighting |
+| `ray_tracing_reuse_bounce_rays` | 0 | With global illumination or the light bounce, pixels reuse the bounce rays of their neighbours and earlier frames (ReSTIR GI) |
 | `ray_tracing_view` | 0 | A debug view drawn over the image (below) |
 | `ray_tracing_performance_overlay` | 0 | The cost table over the game, also with the overlay closed, and in `DaysGoneDLSS-performance.txt` (below) |
 | `ray_tracing_measure_cost` | 0 | A new non-zero number starts a real-cost measurement (below) |
@@ -327,7 +328,10 @@ is read when it changes, with or without DLSS, overrides them without saving the
   clip z to match, so the full inverse would move their vertices about 12 times nearer along the
   view ray. Clip z still marks vertices at infinity (reversed-Z depth 0), which get a NaN x
   across their triangle so DXR treats it as inactive; any other NaN or infinity left the whole
-  structure without hits.
+  structure without hits. Triangles more than 100 km from the camera go too: the moon is a disc
+  about 207 km away, its depth pinned at 2⁻²¹ (about 210 km), which the trace captured like any
+  other draw. It took every ray aimed at it, so at night traced shadows removed all moonlight and
+  the global illumination bounced none.
 - **Alpha-tested foliage.** Bend alpha-tests only in its depth prepass; the G-buffer pass then
   matches that depth without discarding, so masked meshes are recognised by their prepass draw's
   index range and instances. The prepass draw is captured instead, with the texture coordinates
@@ -445,8 +449,12 @@ is read when it changes, with or without DLSS, overrides them without saving the
   times slower.
 - **Sun shadows.** Twelve `FBendSceneDirectionalShadow...ScreenSpaceResolvePS` variants, known by
   checksum, resolve the sun's shadow into an `R8G8_UNORM` target before lighting. Its red channel
-  holds the square root of the sun's visibility; lighting squares it and skips the sun at 0. Row
-  20 of their constants is the shadow projection's depth axis, the sun direction. When lighting
+  holds the square root of the sun's visibility; lighting squares it and skips the sun at 0. Their
+  constants are Bend's global uniform buffer, which lighting reads as slot 2: row 32
+  (`DirectionalLight`) is the direction the light travels, the sun's by day and the moon's at night
+  (lighting takes N·L with it negated), and row 33 its colour. Row 20, the canopy map's basis
+  (rows 18 to 23, `CascadeTreeShadowBasis`), which the add-on read first, holds the same direction.
+  The light moves on a tilted circle, so logged directions have y = ±z. When lighting
   first reads the target, the frame is traced: a sun ray starts from each pixel of the game's
   depth, along its G-buffer normal, which also gives the N·L that leaves surfaces facing away to
   the lighting. The G-buffer normal is copied over the view once a frame and shared by every
@@ -481,15 +489,41 @@ is read when it changes, with or without DLSS, overrides them without saving the
   Direct3D 11 adds their product to the scene colour, so texture detail stays the game's. With
   soft shadows two rays a light aim across its size (the game's source radius, else 2.5% of a
   point light's reach or 5 cm for a spot), and the share is filtered over 6 frames. With bounce
-  light a cosine-weighted ray per pixel finds a surface and adds up the lights there (colour,
-  falloff, cone, N·L, a shadow ray each, the light at least 50 cm away), filtered over 16 frames
-  and multiplied by the pixel's diffuse colour. The second hand-over costs about 0.3 ms; the rays
-  for a few lights 0.03 to 0.06 ms, soft shadows and bounce about 2 ms at 4K.
-- **Denoiser.** The sun's bounce, the lights' bounce and both soft shadows share one filter:
-  reprojected accumulation that rejects history at another depth, then à-trous passes weighted by
-  plane distance and normals. For the bounces, a pixel more than twice as bright as all its
-  neighbours is first brought down to that, or a ray beside a fire shows as a firefly where foliage
-  keeps little history.
+  light a cosine-weighted ray per pixel, its direction from blue noise read apart from the sun
+  bounce's, finds a surface and adds up the lights there (colour, falloff, cone, N·L, a shadow ray
+  each, the light at least 50 cm away), filtered over 16 frames and multiplied by the pixel's
+  diffuse colour. The second hand-over costs about 0.3 ms; the rays for a few lights 0.03 to
+  0.06 ms, soft shadows and bounce about 2 ms at 4K.
+- **Denoiser.** The sun's bounce, the lights' bounce and both soft shadows share one filter, SVGF
+  (Schied et al. 2017): reprojected accumulation that rejects history at another depth and keeps
+  the mean and mean square of each pixel's luminance, then à-trous passes weighted by plane
+  distance, normals and luminance apart in proportion to the pixel's variance (from the moments,
+  or its 3×3 neighbours under 4 frames), which each pass filters along. Noisy pixels blur hard,
+  converged ones keep their detail. The first pass's result is the next frame's history, so the
+  noise it removed does not come back. For the bounces, where a pixel has under 4 frames of history,
+  a ray more than twice as bright as all its neighbours' is first brought down to that, or a ray
+  beside a fire shows as a firefly where foliage keeps little history. Clamping every pixel so threw
+  away the light in dark rooms at night: there the rare ray that finds the flashlight's spot or a
+  moonlit patch has only dark neighbours, so only clusters of hits survived, and they showed as
+  blotches. With longer history the accumulation dilutes a bright ray instead. Values are kept
+  within half precision's range: an infinite one would turn the filter's weights into NaN, and the
+  history would spread it over the surface frame by frame.
+- **Reuse of bounce rays.** With **Reuse bounce rays** both bounces reuse their samples over frames
+  and neighbouring pixels (ReSTIR GI, Ouyang et al. 2021; `src/ray_tracing_reservoirs.hlsli`). A
+  sample is the point a bounce ray found, its normal and the light it sends back. Each pixel keeps
+  a reservoir, a sample chosen from many in proportion to the light it brings the pixel, in a
+  Direct3D 12 buffer of two halves, this frame's and last frame's (32 bytes a pixel each). The
+  bounce shaders' `main` streams the pixel's new sample and the reservoir its surface had last
+  frame (reprojected, same depth within 5% and normals within 25°, at most 20 frames' worth) into
+  it; the old sample is relit by this frame's light (a sun ray, or the lights' shadow rays), so a
+  moving flashlight leaves no trail. Relit, it counts for at most 10 times what it did: its weight
+  was made for the light it had, and one chosen while barely lit (at a spot's edge) would otherwise
+  outshine everything around it. The buffer is let go when reuse is off; with both bounces it takes
+  about 360 MB at 4K Balanced and 1 GB at 4K DLAA. A second pass, `reuse`, combines the pixel's reservoir with
+  those of 4 neighbours within 2.5% of the view's height on the same surface, weighting their
+  samples by the change of solid angle (the reconnection Jacobian, rejected beyond 10×), checks a
+  neighbour's chosen point with a ray, and lights the pixel with the chosen sample. The result goes
+  to the same denoiser.
 - **Ambient occlusion.** Bend's screen-space AO is an `R32G32_UINT` target: eight cube-corner
   visibilities of 6 bits and the square root of depth in half precision. Of each opposite pair the
   lighting reads the corner on the normal's side, so `src/ray_tracing_ao.hlsl` traces those four,
@@ -526,13 +560,16 @@ is read when it changes, with or without DLSS, overrides them without saving the
   (the normals are the copy every feature shares), and the lighting's sun colour (rows 33 and 140
   of constant buffer 2; it moves toward twice row 140 by 1.6e-5 per cm of height, the camera's in
   row 53 of buffer 1) and exposure (row 43) are copied. `src/ray_tracing_bounce.hlsl` sends one
-  cosine-weighted ray per pixel from the game's surface, up to 50 m, through the view's geometry
+  cosine-weighted ray per pixel from the game's surface, its direction from a 64×64 blue-noise tile
+  (void-and-cluster, made at startup, `src/blue_noise.cpp`) moved along the R2 sequence each frame,
+  so neighbouring pixels take evenly spread directions that the filter smooths far better than white
+  noise's clumps. The ray reaches up to 50 m, through the view's geometry
   and, from 1 m plus 1% of the view distance on, the casters, cached draws and foliage instances:
   their copies of on-screen geometry would otherwise light a surface from itself. A sun ray tests
   the hit. The hit's diffuse colour is the G-buffer's where it projects onto a pixel at the same
   depth, 0.25 grey otherwise. Direct3D 11 reprojects last frame's result, rejecting depths more
-  than 3% apart, accumulates up to 24 frames, filters with three passes of a 5×5 à-trous kernel
-  weighted by plane distance and normals, and scales by the sun's colour, the exposure and 1/π. The
+  than 3% apart, accumulates up to 24 frames, filters with four passes of the denoiser's 5×5
+  à-trous kernel (the lights' bounce too), and scales by the sun's colour, the exposure and 1/π. The
   first draw or dispatch after lighting that does not read the sun shadow adds it, times the
   pixel's diffuse colour, to the scene colour.
 - **Costs.** Diagnostics shows what each feature costs per frame, averaged over about half a
@@ -543,7 +580,7 @@ is read when it changes, with or without DLSS, overrides them without saving the
   beyond Direct3D 12's work. The sun rays run only for sun shadows and the debug views, the primary
   rays only for the debug views. The repeated draws run inside the game's passes and are not timed,
   so **Measure the real cost** times the frame with everything on, then leaves out the debug view,
-  the light bounce, soft light shadows, light shadows, global illumination, ambient occlusion, soft
+  the bounce ray reuse, the light bounce, soft light shadows, light shadows, global illumination, ambient occlusion, soft
   sun shadows and sun shadows in turn (the scene is still captured and
   built), then pauses ray tracing as F9 does: 1.5 s to settle and 2.5 s timed per step. The
   difference between steps is what the left-out part really costs. The render thread's time

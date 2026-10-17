@@ -12,6 +12,14 @@
   Add-ons that follow the evaluation can read it; OptiScaler's DLSS 5 neural rendering takes its
   white point from it instead of reporting that the game supplies no exposure, and OptiScaler no
   longer turns on DLSS's auto-exposure for lack of one.
+- Ray tracing: less noise in the bounce light, most of all in dark rooms at night. The filter keeps
+  the rare rays that find a small lit patch instead of discarding them as fireflies, filters
+  harder where the light is still noisy, and the rays' directions come from blue noise. The new
+  **Reuse bounce rays** option (ReSTIR GI) lets pixels share the bounce rays of their neighbours
+  and earlier frames.
+- Ray tracing: the moon lights the night again with ray-traced sun shadows on, and global
+  illumination bounces its light. The moon's disc, about 207 km away, was traced as geometry, so
+  every ray toward the moon hit the moon itself and the traced shadows removed all moonlight.
 
 ## 1.6.0
 

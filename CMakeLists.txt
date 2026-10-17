@@ -158,27 +158,33 @@ add_custom_command(OUTPUT "${GENERATED_DIR}/ray_tracing_ao.h"
     DEPENDS src/ray_tracing_ao.hlsl src/ray_tracing_scene.hlsli
     VERBATIM
 )
-add_custom_command(OUTPUT "${GENERATED_DIR}/ray_tracing_bounce.h"
+# Each bounce shader has a second entry point, `reuse`, which runs after `main` with the reuse of samples on.
+add_custom_command(OUTPUT "${GENERATED_DIR}/ray_tracing_bounce.h" "${GENERATED_DIR}/ray_tracing_bounce_reuse.h"
     COMMAND "${CMAKE_COMMAND}" -E make_directory "${GENERATED_DIR}"
     COMMAND "${DXC_EXECUTABLE}" -nologo -T cs_6_5 -E main -Vn BounceTraceShader -Fh "${GENERATED_DIR}/ray_tracing_bounce.h"
         "${CMAKE_SOURCE_DIR}/src/ray_tracing_bounce.hlsl"
-    DEPENDS src/ray_tracing_bounce.hlsl src/ray_tracing_scene.hlsli
+    COMMAND "${DXC_EXECUTABLE}" -nologo -T cs_6_5 -E reuse -Vn BounceReuseShader -Fh "${GENERATED_DIR}/ray_tracing_bounce_reuse.h"
+        "${CMAKE_SOURCE_DIR}/src/ray_tracing_bounce.hlsl"
+    DEPENDS src/ray_tracing_bounce.hlsl src/ray_tracing_scene.hlsli src/ray_tracing_reservoirs.hlsli
     VERBATIM
 )
-add_custom_command(OUTPUT "${GENERATED_DIR}/ray_tracing_lights.h"
+add_custom_command(OUTPUT "${GENERATED_DIR}/ray_tracing_lights.h" "${GENERATED_DIR}/ray_tracing_lights_reuse.h"
     COMMAND "${CMAKE_COMMAND}" -E make_directory "${GENERATED_DIR}"
     COMMAND "${DXC_EXECUTABLE}" -nologo -T cs_6_5 -E main -Vn LightsTraceShader -Fh "${GENERATED_DIR}/ray_tracing_lights.h"
         "${CMAKE_SOURCE_DIR}/src/ray_tracing_lights.hlsl"
-    DEPENDS src/ray_tracing_lights.hlsl src/ray_tracing_scene.hlsli
+    COMMAND "${DXC_EXECUTABLE}" -nologo -T cs_6_5 -E reuse -Vn LightsReuseShader -Fh "${GENERATED_DIR}/ray_tracing_lights_reuse.h"
+        "${CMAKE_SOURCE_DIR}/src/ray_tracing_lights.hlsl"
+    DEPENDS src/ray_tracing_lights.hlsl src/ray_tracing_scene.hlsli src/ray_tracing_reservoirs.hlsli
     VERBATIM
 )
 add_custom_target(ray_tracing_shaders DEPENDS "${GENERATED_DIR}/ray_tracing_trace.h" "${GENERATED_DIR}/ray_tracing_ao.h"
-    "${GENERATED_DIR}/ray_tracing_bounce.h" "${GENERATED_DIR}/ray_tracing_lights.h")
+    "${GENERATED_DIR}/ray_tracing_bounce.h" "${GENERATED_DIR}/ray_tracing_bounce_reuse.h" "${GENERATED_DIR}/ray_tracing_lights.h"
+    "${GENERATED_DIR}/ray_tracing_lights_reuse.h")
 
 add_library(days_gone_dlss SHARED src/upscaler.cpp src/upscaler_settings.cpp src/upscaler_menu.cpp src/upscaler_addon.cpp
     src/ambient_occlusion.cpp src/indirect_lighting.cpp src/shader_bytecode.cpp src/presenter.cpp src/frame_generation.cpp
     src/fidelityfx.cpp src/fsr_upscaler.cpp src/fsr_frame_generation.cpp
-    src/ray_tracing.cpp src/ray_tracing_menu.cpp src/alpha_test.cpp src/pass_timer.cpp)
+    src/ray_tracing.cpp src/ray_tracing_menu.cpp src/alpha_test.cpp src/blue_noise.cpp src/pass_timer.cpp)
 add_dependencies(days_gone_dlss ray_tracing_shaders)
 target_include_directories(days_gone_dlss PRIVATE src "${GENERATED_DIR}")
 target_include_directories(days_gone_dlss SYSTEM PRIVATE "${RESHADE_DIR}/include" "${RESHADE_DIR}/imgui" "${STREAMLINE_DIR}/include"
@@ -228,8 +234,8 @@ if(BUILD_TESTING)
     target_compile_options(ambient_occlusion_tests PRIVATE /W4 /WX /permissive- /utf-8)
     target_link_libraries(ambient_occlusion_tests PRIVATE dxbc_hash d3d11 d3dcompiler)
     add_test(NAME ambient_occlusion_rendering COMMAND ambient_occlusion_tests)
-    add_executable(ray_tracing_tests tests/ray_tracing_tests.cpp src/ray_tracing.cpp src/alpha_test.cpp src/shader_bytecode.cpp
-        src/pass_timer.cpp)
+    add_executable(ray_tracing_tests tests/ray_tracing_tests.cpp src/ray_tracing.cpp src/alpha_test.cpp src/blue_noise.cpp
+        src/shader_bytecode.cpp src/pass_timer.cpp)
     add_dependencies(ray_tracing_tests ray_tracing_shaders)
     target_include_directories(ray_tracing_tests PRIVATE src "${GENERATED_DIR}")
     target_compile_features(ray_tracing_tests PRIVATE cxx_std_20)
@@ -239,6 +245,11 @@ if(BUILD_TESTING)
     # Needs a DXR 1.1 GPU; reports 77 without one.
     add_test(NAME ray_tracing_capture COMMAND ray_tracing_tests)
     set_tests_properties(ray_tracing_capture PROPERTIES SKIP_RETURN_CODE 77)
+    add_executable(blue_noise_tests tests/blue_noise_tests.cpp src/blue_noise.cpp)
+    target_include_directories(blue_noise_tests PRIVATE src)
+    target_compile_features(blue_noise_tests PRIVATE cxx_std_20)
+    target_compile_options(blue_noise_tests PRIVATE /W4 /WX /permissive- /utf-8)
+    add_test(NAME blue_noise COMMAND blue_noise_tests)
 endif()
 
 # Package only runtime files and documentation, not dependency development files.

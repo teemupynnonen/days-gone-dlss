@@ -1,11 +1,14 @@
 #include "ray_tracing.hpp"
 #include "alpha_test.hpp"
+#include "blue_noise.hpp"
 #include "pass_timer.hpp"
 #include "ray_tracing_shaders.hpp"
 #include "ray_tracing_trace.h" // TraceShader: ray_tracing_trace.hlsl compiled by dxc at build time
 #include "ray_tracing_ao.h"    // AmbientTraceShader: ray_tracing_ao.hlsl, likewise
 #include "ray_tracing_bounce.h" // BounceTraceShader: ray_tracing_bounce.hlsl, likewise
+#include "ray_tracing_bounce_reuse.h" // BounceReuseShader: its `reuse` entry point
 #include "ray_tracing_lights.h" // LightsTraceShader: ray_tracing_lights.hlsl, likewise
+#include "ray_tracing_lights_reuse.h" // LightsReuseShader: its `reuse` entry point
 #include "shader_bytecode.hpp"
 #include "upscaler.hpp"
 
@@ -105,8 +108,9 @@ struct TransformDraw { std::uint32_t first, end, row, sources; float literals[4]
 
 // Bend resolves the sun's shadow into a screen-space target before lighting
 // (FBendSceneDirectionalShadowWithScreenSpaceResolvePS, its fast path and their lighting-model
-// variants). Each transforms world positions into shadow space with rows 18 to 20 of one constant
-// buffer; row 20, the shadow projection's depth axis, is parallel to the sun direction.
+// variants). Their constants are Bend's global uniform buffer, which lighting reads as slot 2. Row 32
+// (DirectionalLight) is the direction the light travels, the sun's by day and the moon's at night:
+// lighting takes N.L with it negated.
 struct ShadowResolve { std::array<std::uint8_t, 16> checksum; UINT constantSlot; };
 constexpr ShadowResolve ShadowResolves[]{
     {upscaler::dxbcHash("4ed0a93784d641d6d3ca4719e7d4d12f"), 1}, {upscaler::dxbcHash("0f8efb57483b0cbc07fb7539e7bce746"), 2},
@@ -116,7 +120,7 @@ constexpr ShadowResolve ShadowResolves[]{
     {upscaler::dxbcHash("48c30d8394ef59761718d0e340543a2d"), 1}, {upscaler::dxbcHash("92452d5ea33a1d9a27b5910adc7cd12b"), 1},
     {upscaler::dxbcHash("ce16d1de7e4c487731ad58f49fd1da0d"), 1}, {upscaler::dxbcHash("c5d6e8d2b20f573fe4fdd2801998b4a0"), 1},
 };
-constexpr UINT SunRow = 20;
+constexpr UINT SunRow = 32;
 // Rows 28 to 31 take the main view's translated world to the far shadow map's u, v and depth; row 35.z
 // scales u into the atlas the far map shares with two nearer cascades. Copied for the shadow casters.
 constexpr UINT LightRows = 28, LightRowCount = 8;
@@ -176,14 +180,20 @@ constexpr auto LightVolumeShader = upscaler::dxbcHash("704bf50f025973c175c38a06c
 constexpr auto DeferredLightShader = upscaler::dxbcHash("aefaa9f51b2cdbbef44287091ea4a803"); // BendDeferredLightShaders VertexMain
 constexpr UINT MaxLights = 16, LightConstantRows = 4;
 constexpr int NoLightSlot = -1;
-// The lights' descriptor table (LightsRootSignature): t5 to t29, then u0 to u2.
+// The lights' descriptor table (LightsRootSignature): t5 to t30, then u0 to u3.
 namespace LightDescriptor
 {
 constexpr UINT Depth = 0, Coordinates = 1, Coverage = 2, Table = 3, Slots = 4, Normals = Slots + MaxLights, Albedo = Normals + 1,
-    Vertices = Albedo + 1, CacheVertices = Vertices + 1, TemplateVertices = CacheVertices + 1, Visibility = TemplateVertices + 1,
-    Unshadowed = Visibility + 1, Bounced = Unshadowed + 1;
+    Vertices = Albedo + 1, CacheVertices = Vertices + 1, TemplateVertices = CacheVertices + 1, BlueNoise = TemplateVertices + 1,
+    Visibility = BlueNoise + 1, Unshadowed = Visibility + 1, Bounced = Unshadowed + 1, Reservoirs = Bounced + 1;
 }
-constexpr UINT LightDescriptors = LightDescriptor::Bounced + 1;
+constexpr UINT LightDescriptors = LightDescriptor::Reservoirs + 1;
+// The sun bounce's descriptor table (BounceRootSignature): t3 to t5, t11 and t12, u0, t30, u3.
+namespace BounceDescriptor
+{
+constexpr UINT Depth = 0, Coordinates = 1, Coverage = 2, Normals = 3, Albedo = 4, Traced = 5, BlueNoise = 6, Reservoirs = 7;
+}
+constexpr UINT BounceDescriptors = BounceDescriptor::Reservoirs + 1;
 
 // How shaders::Composite shows the traced images.
 enum class CompositeMode : std::uint32_t
@@ -238,6 +248,16 @@ struct BounceFilterConstants
     float worldFromClip[16], previousClipFromWorld[16];
     std::uint32_t size[2], step, history, final, maxFrames, clamp, padding;
 };
+// The bounces' reuse of samples (ReuseParameters in ray_tracing_reservoirs.hlsli), a set per frame in
+// flight at ReuseConstantsStride apart.
+struct ReuseConstants
+{
+    float previousClipFromWorld[16], cameraMovement[3];
+    std::uint32_t reuse, history, current, padding[2];
+};
+static_assert(sizeof(ReuseConstants) == 6 * 16, "ReuseParameters takes six rows");
+constexpr UINT ReuseConstantsStride = D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
+constexpr UINT ReservoirBytes = 32; // PackedReservoir
 enum LightFlags : std::uint32_t { SoftLightShadows = 1, LightBounce = 2 };
 struct LightConstants
 {
@@ -353,7 +373,7 @@ private:
 
 std::atomic<View> selected{View::Off};
 std::atomic<bool> sunShadows{}, ambientOcclusion{}, halfAmbientRays{}, replaceCanopyShadows{}, offscreenGeometry{true}, globalIllumination{},
-    lightShadows{}, softLightShadows{}, lightBounce{}, softSunShadows{}, bypassed{}, failed{};
+    lightShadows{}, softLightShadows{}, lightBounce{}, softSunShadows{}, reuseBounceRays{}, bypassed{}, failed{};
 std::atomic<std::uint64_t> toggledAt{};
 std::mutex statusMutex;
 Status published;
@@ -483,23 +503,43 @@ struct AmbientGpu
     float milliseconds{};
 };
 
+// Last frame's view, for reprojecting what a feature kept from it (Denoiser, Reservoirs).
+struct PreviousView
+{
+    UINT64 usedIn{}; // The frame (Gpu::frames) it was taken in: what was kept carries over only from the frame before
+    bool valid{};
+    float clipFromWorld[16]{}, translation[3]{};
+};
+
 // A noisy traced signal over the view, accumulated over frames and filtered (shaders::BounceAccumulate,
-// BounceFilter): the sun's bounce, the lights' bounce and the lights' soft shadows each have one.
+// BounceFilter): the sun's bounce, the lights' bounce and both soft shadows each have one.
 struct Denoiser
 {
-    // The accumulation, written to each in turn, with the depth it was last taken at; the filter's
-    // passes take turns too.
-    std::array<ComPtr<ID3D11Texture2D>, 2> history, filtered;
-    std::array<ComPtr<ID3D11ShaderResourceView>, 2> historyViews, filteredViews;
-    std::array<ComPtr<ID3D11UnorderedAccessView>, 2> historyAccess, filteredAccess;
+    // The accumulation as the filter's first pass left it and the moments of its luminance, each
+    // written to in turn, with the depth they were last taken at; the filter's other passes take
+    // turns too.
+    std::array<ComPtr<ID3D11Texture2D>, 2> history, moments, filtered;
+    std::array<ComPtr<ID3D11ShaderResourceView>, 2> historyViews, momentsViews, filteredViews;
+    std::array<ComPtr<ID3D11UnorderedAccessView>, 2> historyAccess, momentsAccess, filteredAccess;
     ComPtr<ID3D11Texture2D> previousDepth;
     ComPtr<ID3D11ShaderResourceView> previousDepthView;
     UINT width{}, height{};
     UINT current{}; // The history written next
-    UINT64 usedIn{}; // The frame (Gpu::frames) it last took: history carries over only from the frame before
-    bool historyValid{};
-    float previousClipFromWorld[16]{}, previousTranslation[3]{};
+    PreviousView previous;
     ID3D11ShaderResourceView* output{}; // The last pass's
+};
+
+// A bounce's samples kept per pixel for reuse over frames and neighbours (ray_tracing_reservoirs.hlsli):
+// this frame's and last frame's reservoirs in the halves of one buffer only Direct3D 12 uses, made
+// when reuse is first on at the view's size, and the constants each frame in flight hands the shaders,
+// in upload memory that stays mapped.
+struct Reservoirs
+{
+    ComPtr<ID3D12Resource> buffer, constants;
+    std::byte* mapped{};
+    UINT width{}, height{};
+    UINT current{}; // The half this frame writes
+    PreviousView previous;
 };
 
 // Sunlight bounced once off the captured geometry, created on first use. Direct3D 12 traces a ray
@@ -527,12 +567,14 @@ struct BounceGpu
 
     ComPtr<ID3D12Resource> albedo12, traced12;
     ComPtr<ID3D12RootSignature> rootSignature;
-    ComPtr<ID3D12PipelineState> pipeline;
+    ComPtr<ID3D12PipelineState> pipeline, reusePipeline;
     ComPtr<ID3D12DescriptorHeap> descriptors;
     ComPtr<ID3D12QueryHeap> timestamps;
     ComPtr<ID3D12Resource> timestampReadback;
+    Reservoirs reservoirs;
     std::array<bool, FramesInFlight> recorded{};
     bool tracing{}; // The frame being traced includes the bounce
+    bool reuse{};   // Its samples go through the reservoirs
     float milliseconds{};
 };
 
@@ -565,9 +607,10 @@ struct LightsGpu
     ID3D12Resource* depth12{}; // The depth copy the descriptors point at
     ID3D12Resource* albedo12{}; // The bounce's diffuse colours they point at
     Denoiser shadows, bounce;
+    Reservoirs reservoirs;
 
     ComPtr<ID3D12RootSignature> rootSignature;
-    ComPtr<ID3D12PipelineState> pipeline;
+    ComPtr<ID3D12PipelineState> pipeline, reusePipeline;
     ComPtr<ID3D12DescriptorHeap> descriptors;
     ComPtr<ID3D12QueryHeap> timestamps;
     ComPtr<ID3D12Resource> timestampReadback;
@@ -612,6 +655,7 @@ struct Gpu
     bool normalsKnown{}; // This frame's are copied
     ID3D11Resource* depthResource{}; // The game's depth texture behind depthView
     ComPtr<ID3D11Texture2D> shadowCopy; // The game's sun shadow as its resolve passes left it
+    ComPtr<ID3D11Texture2D> blueNoise; // For the bounce rays' directions, shared with D3D12 (blueNoise())
     UINT tracedWidth{}, tracedHeight{};
     ComPtr<ID3D11ComputeShader> positionShader, depthShader, bakeCopyShader;
     ComPtr<ID3D11VertexShader> fullScreenShader;
@@ -661,8 +705,8 @@ struct Gpu
     ComPtr<ID3D12GraphicsCommandList4> list;
     ComPtr<ID3D12Fence> d3d12Fence;
     std::unique_ptr<void, EventCloser> event;
-    ComPtr<ID3D12Resource> positions12, traced12, sunlit12, sunSoft12, depthCopy12, normals12, coordinates12, coverage12, vertices, bottom,
-        casterBottom, top, scratch, instances;
+    ComPtr<ID3D12Resource> positions12, traced12, sunlit12, sunSoft12, depthCopy12, normals12, coordinates12, coverage12, blueNoise12, vertices,
+        bottom, casterBottom, top, scratch, instances;
     ComPtr<ID3D12Resource> cacheTable; // Per frame in flight: the traced cached draws' coordinates and slots
     std::unique_ptr<GeometryCache> cache, templates;
     bool cacheReset{}; // The coverage atlas started again; cached slots are stale
@@ -831,6 +875,7 @@ Features activeFeatures()
         result.softLightShadows = softLightShadows;
         result.lightBounce = lightBounce;
         result.softSunShadows = softSunShadows;
+        result.reuseBounceRays = reuseBounceRays;
     }
     return result;
 }
@@ -1634,6 +1679,11 @@ std::unique_ptr<Gpu> create(ID3D11DeviceContext* context)
     g.positions12 = openTexture(g.d3d12.Get(), g.positions.Get(), "Opening the shared positions texture");
     g.coordinates12 = openTexture(g.d3d12.Get(), g.coordinates.Get(), "Opening the shared texture coordinates");
     g.coverage12 = openTexture(g.d3d12.Get(), g.coverage.Get(), "Opening the coverage atlas");
+    const auto noise = blueNoise();
+    g.blueNoise = sharedTexture(g.device.Get(), BlueNoiseSize, BlueNoiseSize, DXGI_FORMAT_R16_UNORM, "Creating the blue noise",
+        D3D11_BIND_SHADER_RESOURCE);
+    g.context->UpdateSubresource(g.blueNoise.Get(), 0, nullptr, noise.data(), BlueNoiseSize * sizeof(noise[0]), 0);
+    g.blueNoise12 = openTexture(g.d3d12.Get(), g.blueNoise.Get(), "Opening the blue noise");
 
     g.vertices = buffer(g.d3d12.Get(), UINT64{Capacity} * VertexBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST,
         D3D12_RESOURCE_FLAG_NONE, "Creating the vertex buffer");
@@ -2218,6 +2268,103 @@ void recordAmbient(Gpu& g, UINT slot, const TraceConstants& trace)
 
 // ---- Global illumination ----
 
+// Whether what a feature kept in last frame's view carries over into this frame's, with last frame's
+// clip from this frame's translated world and the camera's movement in between. Takes this frame's
+// view as the next one's previous.
+bool advance(PreviousView& previous, UINT64 frameNumber, const Capture& frame, float (&previousClipFromWorld)[16], float (&cameraMovement)[3])
+{
+    const bool continued = previous.valid && previous.usedIn + 1 == frameNumber && frame.cameraKnown;
+    // Translated world is world plus the negated camera position, so last frame's is this frame's
+    // moved by the camera's movement since.
+    for (int axis = 0; axis < 3; ++axis) cameraMovement[axis] = previous.translation[axis] - frame.preViewTranslation[axis];
+    std::memcpy(previousClipFromWorld, previous.clipFromWorld, sizeof(previousClipFromWorld));
+    for (int column = 0; column < 4; ++column)
+        for (int axis = 0; axis < 3; ++axis) previousClipFromWorld[12 + column] += cameraMovement[axis] * previous.clipFromWorld[axis * 4 + column];
+
+    previous.usedIn = frameNumber;
+    previous.valid = frame.cameraKnown;
+    std::memcpy(previous.clipFromWorld, frame.clipFromWorld, sizeof(previous.clipFromWorld));
+    std::memcpy(previous.translation, frame.preViewTranslation, sizeof(previous.translation));
+    return continued;
+}
+
+void createReuseConstants(Gpu& g, Reservoirs& r)
+{
+    r.constants = buffer(g.d3d12.Get(), FramesInFlight * ReuseConstantsStride, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ,
+        D3D12_RESOURCE_FLAG_NONE, "Creating the reuse constants");
+    void* mapped{};
+    check(r.constants->Map(0, nullptr, &mapped), "Mapping the reuse constants");
+    r.mapped = static_cast<std::byte*>(mapped);
+}
+
+// Whether the reservoirs are as reuse wants them: covering the view while it is on, let go while it
+// is off, as they take 64 bytes a pixel.
+bool reservoirsFit(const Reservoirs& r, UINT width, UINT height, bool reuse)
+{
+    return reuse ? r.buffer && r.width == width && r.height == height : !r.buffer;
+}
+
+// Makes the reservoirs fit. The caller has waited for the GPU and writes the descriptors again.
+void fitReservoirs(Gpu& g, Reservoirs& r, UINT width, UINT height, bool reuse)
+{
+    if (reservoirsFit(r, width, height, reuse)) return;
+
+    r.buffer.Reset();
+    r.previous.valid = false;
+    if (!reuse) return;
+
+    r.buffer = buffer(g.d3d12.Get(), UINT64{width} * height * 2 * ReservoirBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, "Creating the bounce reservoirs");
+    r.width = width;
+    r.height = height;
+}
+
+// A null view until reuse makes the buffer: the shaders touch it only with reuse on.
+void writeReservoirsView(const Gpu& g, const Reservoirs& r, D3D12_CPU_DESCRIPTOR_HANDLE handle)
+{
+    D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+    view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    view.Buffer.NumElements = r.buffer ? r.width * r.height * 2 : 1;
+    view.Buffer.StructureByteStride = ReservoirBytes;
+    g.d3d12->CreateUnorderedAccessView(r.buffer.Get(), nullptr, &view, handle);
+}
+
+// This frame's reuse constants for a bounce, written for the frame in flight `slot`: whether last
+// frame's reservoirs carry over, and which half this frame writes. Returns their address.
+D3D12_GPU_VIRTUAL_ADDRESS writeReuseConstants(const Gpu& g, Reservoirs& r, const Capture& frame, UINT slot, bool reuse)
+{
+    ReuseConstants constants{};
+    constants.reuse = reuse;
+    if (reuse)
+    {
+        constants.history = advance(r.previous, g.frames, frame, constants.previousClipFromWorld, constants.cameraMovement);
+        r.current ^= 1;
+        constants.current = r.current;
+    }
+    else r.previous.valid = false;
+    std::memcpy(r.mapped + slot * ReuseConstantsStride, &constants, sizeof(constants));
+    return r.constants->GetGPUVirtualAddress() + slot * ReuseConstantsStride;
+}
+
+// With reuse, a bounce's second pass lights each pixel from the reservoirs its first pass wrote,
+// its neighbours' too.
+void recordReuse(ID3D12GraphicsCommandList* list, const Reservoirs& r, ID3D12PipelineState* pipeline, const std::uint32_t (&size)[2])
+{
+    D3D12_RESOURCE_BARRIER written{};
+    written.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    written.UAV.pResource = r.buffer.Get();
+    list->ResourceBarrier(1, &written);
+    list->SetPipelineState(pipeline);
+    list->Dispatch((size[0] + 7) / 8, (size[1] + 7) / 8, 1);
+}
+
+D3D12_CPU_DESCRIPTOR_HANDLE bounceDescriptor(const Gpu& g, UINT index)
+{
+    auto handle = g.bounce.descriptors->GetCPUDescriptorHandleForHeapStart();
+    handle.ptr += index * g.descriptorSize;
+    return handle;
+}
+
 void createBounce(Gpu& g)
 {
     auto& b = g.bounce;
@@ -2256,30 +2403,32 @@ void createBounce(Gpu& g)
     pipeline.pRootSignature = b.rootSignature.Get();
     pipeline.CS = {BounceTraceShader, sizeof(BounceTraceShader)};
     check(g.d3d12->CreateComputePipelineState(&pipeline, IID_PPV_ARGS(&b.pipeline)), "Creating the bounce pipeline");
-    // The game's depth, the texture coordinates, the coverage atlas, the game's normals and diffuse
-    // colours, and the traced bounce. Those sized by the view are written in ensureBounce.
-    D3D12_DESCRIPTOR_HEAP_DESC descriptors{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 6, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
+    pipeline.CS = {BounceReuseShader, sizeof(BounceReuseShader)};
+    check(g.d3d12->CreateComputePipelineState(&pipeline, IID_PPV_ARGS(&b.reusePipeline)), "Creating the bounce reuse pipeline");
+    // BounceDescriptor order. Those sized by the view are written in ensureBounce.
+    D3D12_DESCRIPTOR_HEAP_DESC descriptors{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, BounceDescriptors, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
     check(g.d3d12->CreateDescriptorHeap(&descriptors, IID_PPV_ARGS(&b.descriptors)), "Creating the bounce descriptors");
-    auto handle = b.descriptors->GetCPUDescriptorHandleForHeapStart();
-    for (auto* texture : {g.coordinates12.Get(), g.coverage12.Get()})
-    {
-        handle.ptr += g.descriptorSize;
-        g.d3d12->CreateShaderResourceView(texture, nullptr, handle);
-    }
+    g.d3d12->CreateShaderResourceView(g.coordinates12.Get(), nullptr, bounceDescriptor(g, BounceDescriptor::Coordinates));
+    g.d3d12->CreateShaderResourceView(g.coverage12.Get(), nullptr, bounceDescriptor(g, BounceDescriptor::Coverage));
+    g.d3d12->CreateShaderResourceView(g.blueNoise12.Get(), nullptr, bounceDescriptor(g, BounceDescriptor::BlueNoise));
+    createReuseConstants(g, b.reservoirs);
     D3D12_QUERY_HEAP_DESC timestamps{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, FramesInFlight * 2};
     check(g.d3d12->CreateQueryHeap(&timestamps, IID_PPV_ARGS(&b.timestamps)), "Creating the bounce timestamps");
     b.timestampReadback = buffer(g.d3d12.Get(), FramesInFlight * 2 * sizeof(UINT64), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST,
         D3D12_RESOURCE_FLAG_NONE, "Creating the bounce timestamp readback");
 }
 
-// The textures cover the view, and the views and descriptors also point at the depth copy and the
-// normals ensureTraced makes; it makes both again together.
+// The textures, and with reuse the reservoirs, cover the view, and the views and descriptors also
+// point at the depth copy and the normals ensureTraced makes; it makes both again together.
 void ensureBounce(Gpu& g, UINT width, UINT height)
 {
     auto& b = g.bounce;
-    if (b.albedo && b.width == width && b.height == height && b.depth == g.depthCopy.Get()) return;
+    if (b.albedo && b.width == width && b.height == height && b.depth == g.depthCopy.Get()
+        && reservoirsFit(b.reservoirs, width, height, b.reuse))
+        return;
 
     waitIdle(g);
+    fitReservoirs(g, b.reservoirs, width, height, b.reuse);
     if (!b.albedo || b.width != width || b.height != height)
     {
         b.albedo = sharedTexture(g.device.Get(), width, height, DXGI_FORMAT_R16G16B16A16_FLOAT, "Creating the shared diffuse colours");
@@ -2294,21 +2443,16 @@ void ensureBounce(Gpu& g, UINT width, UINT height)
     }
 
     check(g.device->CreateShaderResourceView(g.depthCopy.Get(), nullptr, b.depthView.ReleaseAndGetAddressOf()), "Creating the bounce depth view");
-    auto handle = b.descriptors->GetCPUDescriptorHandleForHeapStart();
     D3D12_SHADER_RESOURCE_VIEW_DESC depth{};
     depth.Format = DXGI_FORMAT_R32_FLOAT;
     depth.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     depth.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     depth.Texture2D.MipLevels = 1;
-    g.d3d12->CreateShaderResourceView(g.depthCopy12.Get(), &depth, handle);
-    handle.ptr += 2 * g.descriptorSize;
-    for (auto* texture : {g.normals12.Get(), b.albedo12.Get()})
-    {
-        handle.ptr += g.descriptorSize;
-        g.d3d12->CreateShaderResourceView(texture, nullptr, handle);
-    }
-    handle.ptr += g.descriptorSize;
-    g.d3d12->CreateUnorderedAccessView(b.traced12.Get(), nullptr, nullptr, handle);
+    g.d3d12->CreateShaderResourceView(g.depthCopy12.Get(), &depth, bounceDescriptor(g, BounceDescriptor::Depth));
+    g.d3d12->CreateShaderResourceView(g.normals12.Get(), nullptr, bounceDescriptor(g, BounceDescriptor::Normals));
+    g.d3d12->CreateShaderResourceView(b.albedo12.Get(), nullptr, bounceDescriptor(g, BounceDescriptor::Albedo));
+    g.d3d12->CreateUnorderedAccessView(b.traced12.Get(), nullptr, nullptr, bounceDescriptor(g, BounceDescriptor::Traced));
+    writeReservoirsView(g, b.reservoirs, bounceDescriptor(g, BounceDescriptor::Reservoirs));
     b.depth = g.depthCopy.Get();
 }
 
@@ -2389,6 +2533,7 @@ void prepareBounce(Gpu& g, const Capture& frame, UINT width, UINT height)
     auto& b = g.bounce;
     b.tracing = b.surfaces = false;
     const bool sunBounce = bounceWanted();
+    b.reuse = sunBounce && activeFeatures().reuseBounceRays;
     if ((!sunBounce && !lightSurfacesWanted()) || !g.normalsKnown) return;
 
     if (!b.pipeline) createBounce(g);
@@ -2418,7 +2563,7 @@ void prepareBounce(Gpu& g, const Capture& frame, UINT width, UINT height)
 }
 
 // Traces the bounce once the frame's structures are built, timed on its own.
-void recordBounce(Gpu& g, UINT slot, const TraceConstants& trace)
+void recordBounce(Gpu& g, UINT slot, const Capture& frame, const TraceConstants& trace)
 {
     auto& b = g.bounce;
     b.milliseconds = 0;
@@ -2427,8 +2572,8 @@ void recordBounce(Gpu& g, UINT slot, const TraceConstants& trace)
         const D3D12_RANGE range{slot * 2 * sizeof(UINT64), (slot + 1) * 2 * sizeof(UINT64)};
         void* ticks{};
         check(b.timestampReadback->Map(0, &range, &ticks), "Reading the bounce timestamps");
-        const auto* frame = static_cast<const UINT64*>(ticks) + slot * 2;
-        b.milliseconds = static_cast<float>(static_cast<double>(frame[1] - frame[0]) * g.millisecondsPerTick);
+        const auto* times = static_cast<const UINT64*>(ticks) + slot * 2;
+        b.milliseconds = static_cast<float>(static_cast<double>(times[1] - times[0]) * g.millisecondsPerTick);
         const D3D12_RANGE nothing{};
         b.timestampReadback->Unmap(0, &nothing);
     }
@@ -2458,7 +2603,9 @@ void recordBounce(Gpu& g, UINT slot, const TraceConstants& trace)
     list->SetComputeRootShaderResourceView(6, g.cache->vertices());
     list->SetComputeRootShaderResourceView(7, g.templates->vertices());
     list->SetComputeRootDescriptorTable(8, b.descriptors->GetGPUDescriptorHandleForHeapStart());
+    list->SetComputeRootConstantBufferView(9, writeReuseConstants(g, b.reservoirs, frame, slot, b.reuse));
     list->Dispatch((constants.size[0] + 7) / 8, (constants.size[1] + 7) / 8, 1);
+    if (b.reuse) recordReuse(list, b.reservoirs, b.reusePipeline.Get(), constants.size);
     list->EndQuery(b.timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot * 2 + 1);
     list->ResolveQueryData(b.timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot * 2, 2, b.timestampReadback.Get(), slot * 2 * sizeof(UINT64));
 }
@@ -2472,7 +2619,7 @@ void ensureDenoiser(Gpu& g, Denoiser& d, UINT width, UINT height)
         D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS};
     for (UINT i = 0; i < 2; ++i)
         for (auto [texture, view, access] : {std::tie(d.history[i], d.historyViews[i], d.historyAccess[i]),
-            std::tie(d.filtered[i], d.filteredViews[i], d.filteredAccess[i])})
+            std::tie(d.moments[i], d.momentsViews[i], d.momentsAccess[i]), std::tie(d.filtered[i], d.filteredViews[i], d.filteredAccess[i])})
         {
             check(g.device->CreateTexture2D(&description, nullptr, texture.ReleaseAndGetAddressOf()), "Creating a filter texture");
             check(g.device->CreateShaderResourceView(texture.Get(), nullptr, view.ReleaseAndGetAddressOf()), "Creating a filter view");
@@ -2485,14 +2632,14 @@ void ensureDenoiser(Gpu& g, Denoiser& d, UINT width, UINT height)
         "Creating a filter's previous depth view");
     d.width = width;
     d.height = height;
-    d.historyValid = false;
+    d.previous.valid = false;
 }
 
-// Accumulates a traced signal over the view into the denoiser's history, up to `maxFrames`, and
-// filters it in `passes` passes with taps 1, 2, 4... texels apart, once Direct3D 11 has waited for
-// it. A bounce has its lone bright pixels brought down first, and the sun's turns into the scene
-// colour's units in its last pass. Filters along the game's normals (prepareNormals) with the bounce's
-// shaders. Returns the result.
+// Accumulates a traced signal over the view, up to `maxFrames`, and filters it in `passes` passes with
+// taps 1, 2, 4... texels apart, once Direct3D 11 has waited for it. The first pass's result is the
+// next frame's history, so `passes` is at least 2: the sun's bounce turns into the scene colour's
+// units in the last. A bounce has its lone bright rays brought down first. Filters along the game's
+// normals (prepareNormals) with the bounce's shaders. Returns the result.
 enum class Signal { SunBounce, LightBounce, Visibility };
 ID3D11ShaderResourceView* denoise(Gpu& g, Denoiser& d, const Capture& frame, const float (&worldFromClip)[16], ID3D11ShaderResourceView* traced,
     UINT maxFrames, UINT passes, Signal signal)
@@ -2500,61 +2647,50 @@ ID3D11ShaderResourceView* denoise(Gpu& g, Denoiser& d, const Capture& frame, con
     auto& b = g.bounce;
     if (!b.pipeline) createBounce(g);
     ensureDenoiser(g, d, g.tracedWidth, g.tracedHeight);
-    // History carries over only from the frame before.
-    const bool continued = d.historyValid && d.usedIn + 1 == g.frames;
-    d.usedIn = g.frames;
     BounceFilterConstants constants{};
     std::memcpy(constants.worldFromClip, worldFromClip, sizeof(constants.worldFromClip));
-    // Translated world is world plus the negated camera position, so last frame's is this frame's
-    // moved by the camera's movement since.
-    std::memcpy(constants.previousClipFromWorld, d.previousClipFromWorld, sizeof(constants.previousClipFromWorld));
-    for (int column = 0; column < 4; ++column)
-        for (int axis = 0; axis < 3; ++axis)
-            constants.previousClipFromWorld[12 + column] += (d.previousTranslation[axis] - frame.preViewTranslation[axis])
-                * d.previousClipFromWorld[axis * 4 + column];
-
+    float cameraMovement[3]{};
+    constants.history = advance(d.previous, g.frames, frame, constants.previousClipFromWorld, cameraMovement);
     constants.size[0] = d.width;
     constants.size[1] = d.height;
-    constants.history = continued && frame.cameraKnown;
     constants.maxFrames = maxFrames;
     constants.clamp = signal != Signal::Visibility;
     const auto previous = d.current ^ 1;
     const UINT groupsX = (d.width + 7) / 8, groupsY = (d.height + 7) / 8;
     inOwnState(g, [&]
     {
-        // The output is bound before the inputs: Direct3D 11 does not read what is still bound for writing.
-        const auto pass = [&](ID3D11ComputeShader* shader, ID3D11UnorderedAccessView* output, std::initializer_list<ID3D11ShaderResourceView*> inputs)
+        // The outputs are bound before the inputs: Direct3D 11 does not read what is still bound for writing.
+        const auto pass = [&](ID3D11ComputeShader* shader, std::array<ID3D11UnorderedAccessView*, 2> outputs,
+            std::initializer_list<ID3D11ShaderResourceView*> inputs)
         {
             g.context->UpdateSubresource(b.constants.Get(), 0, nullptr, &constants, 0, 0);
             g.context->CSSetShader(shader, nullptr, 0);
             g.context->CSSetConstantBuffers(0, 1, b.constants.GetAddressOf());
-            g.context->CSSetUnorderedAccessViews(0, 1, &output, nullptr);
+            g.context->CSSetUnorderedAccessViews(0, static_cast<UINT>(outputs.size()), outputs.data(), nullptr);
             g.context->CSSetShaderResources(0, static_cast<UINT>(inputs.size()), inputs.begin());
             g.context->Dispatch(groupsX, groupsY, 1);
         };
-        pass(b.accumulateShader.Get(), d.historyAccess[d.current].Get(), {traced, d.historyViews[previous].Get(), g.depthCopyView.Get(),
-            d.previousDepthView.Get()});
-        d.output = d.historyViews[d.current].Get();
+        pass(b.accumulateShader.Get(), {d.filteredAccess[0].Get(), d.momentsAccess[d.current].Get()}, {traced, d.historyViews[previous].Get(),
+            g.depthCopyView.Get(), d.previousDepthView.Get(), d.momentsViews[previous].Get()});
+        d.output = d.filteredViews[0].Get();
         for (UINT i = 0; i < passes; ++i)
         {
             constants.step = 1u << i;
             constants.final = signal == Signal::SunBounce && i + 1 == passes;
-            pass(b.filterShader.Get(), d.filteredAccess[i % 2].Get(), {d.output, g.depthCopyView.Get(), g.normalsView.Get(), b.lightingView.Get()});
-            d.output = d.filteredViews[i % 2].Get();
+            const auto output = i == 0 ? d.historyAccess[d.current].Get() : d.filteredAccess[i % 2].Get();
+            pass(b.filterShader.Get(), {output, nullptr}, {d.output, g.depthCopyView.Get(), g.normalsView.Get(), b.lightingView.Get()});
+            d.output = i == 0 ? d.historyViews[d.current].Get() : d.filteredViews[i % 2].Get();
         }
         g.context->CopyResource(d.previousDepth.Get(), g.depthCopy.Get());
     });
     d.current = previous;
-    d.historyValid = frame.cameraKnown;
-    std::memcpy(d.previousClipFromWorld, frame.clipFromWorld, sizeof(d.previousClipFromWorld));
-    std::memcpy(d.previousTranslation, frame.preViewTranslation, sizeof(d.previousTranslation));
     return d.output;
 }
 
 // Accumulates the traced bounce over frames and filters it, once Direct3D 11 has waited for it.
 void filterBounce(Gpu& g, const Capture& frame, const float (&worldFromClip)[16])
 {
-    denoise(g, g.bounce.denoiser, frame, worldFromClip, g.bounce.tracedView.Get(), 24, 3, Signal::SunBounce);
+    denoise(g, g.bounce.denoiser, frame, worldFromClip, g.bounce.tracedView.Get(), 24, 4, Signal::SunBounce);
 }
 
 // Lighting is about to draw: keeps the rows of its constants the bounced light is scaled by and the
@@ -2707,8 +2843,10 @@ void createLights(Gpu& g)
     pipeline.pRootSignature = l.rootSignature.Get();
     pipeline.CS = {LightsTraceShader, sizeof(LightsTraceShader)};
     check(g.d3d12->CreateComputePipelineState(&pipeline, IID_PPV_ARGS(&l.pipeline)), "Creating the light pipeline");
-    // LightDescriptor order. The depth, the outputs and the game's surfaces are written in ensureLights,
-    // each slot as it is made.
+    pipeline.CS = {LightsReuseShader, sizeof(LightsReuseShader)};
+    check(g.d3d12->CreateComputePipelineState(&pipeline, IID_PPV_ARGS(&l.reusePipeline)), "Creating the light reuse pipeline");
+    // LightDescriptor order. The depth, the outputs, the game's surfaces and the reservoirs are written
+    // in ensureLights, each slot as it is made.
     D3D12_DESCRIPTOR_HEAP_DESC descriptors{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, LightDescriptors, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
     check(g.d3d12->CreateDescriptorHeap(&descriptors, IID_PPV_ARGS(&l.descriptors)), "Creating the light descriptors");
     const auto at = [&](UINT index) { return lightDescriptor(g, index); };
@@ -2735,21 +2873,26 @@ void createLights(Gpu& g)
     g.d3d12->CreateShaderResourceView(g.cache->vertexResource(), &vertices, at(LightDescriptor::CacheVertices));
     vertices.Buffer.NumElements = g.templates->capacity();
     g.d3d12->CreateShaderResourceView(g.templates->vertexResource(), &vertices, at(LightDescriptor::TemplateVertices));
+    g.d3d12->CreateShaderResourceView(g.blueNoise12.Get(), nullptr, at(LightDescriptor::BlueNoise));
+    createReuseConstants(g, l.reservoirs);
     D3D12_QUERY_HEAP_DESC timestamps{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, FramesInFlight * 2};
     check(g.d3d12->CreateQueryHeap(&timestamps, IID_PPV_ARGS(&l.timestamps)), "Creating the light timestamps");
     l.timestampReadback = buffer(g.d3d12.Get(), FramesInFlight * 2 * sizeof(UINT64), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST,
         D3D12_RESOURCE_FLAG_NONE, "Creating the light timestamp readback");
 }
 
-// The traced images cover the view, and the descriptors also point at the depth copy and the normals
-// ensureTraced makes (it makes both again together) and at the diffuse colours prepareBounce copies.
-void ensureLights(Gpu& g, UINT width, UINT height)
+// The traced images, and with reuse the reservoirs, cover the view, and the descriptors also point at
+// the depth copy and the normals ensureTraced makes (it makes both again together) and at the diffuse
+// colours prepareBounce copies.
+void ensureLights(Gpu& g, UINT width, UINT height, bool reuse)
 {
     auto& l = g.lights;
-    if (l.visibility && l.width == width && l.height == height && l.depth12 == g.depthCopy12.Get() && l.albedo12 == g.bounce.albedo12.Get())
+    if (l.visibility && l.width == width && l.height == height && l.depth12 == g.depthCopy12.Get() && l.albedo12 == g.bounce.albedo12.Get()
+        && reservoirsFit(l.reservoirs, width, height, reuse))
         return;
 
     waitIdle(g);
+    fitReservoirs(g, l.reservoirs, width, height, reuse);
     if (!l.visibility || l.width != width || l.height != height)
     {
         const auto make = [&](ComPtr<ID3D11Texture2D>& texture, ComPtr<ID3D11ShaderResourceView>& view, ComPtr<ID3D12Resource>& shared)
@@ -2776,6 +2919,7 @@ void ensureLights(Gpu& g, UINT width, UINT height)
     g.d3d12->CreateUnorderedAccessView(l.bounced12.Get(), nullptr, nullptr, lightDescriptor(g, LightDescriptor::Bounced));
     g.d3d12->CreateShaderResourceView(g.normals12.Get(), nullptr, lightDescriptor(g, LightDescriptor::Normals));
     if (g.bounce.albedo12) g.d3d12->CreateShaderResourceView(g.bounce.albedo12.Get(), nullptr, lightDescriptor(g, LightDescriptor::Albedo));
+    writeReservoirsView(g, l.reservoirs, lightDescriptor(g, LightDescriptor::Reservoirs));
     l.depth12 = g.depthCopy12.Get();
     l.albedo12 = g.bounce.albedo12.Get();
 }
@@ -2961,7 +3105,7 @@ bool drawLight(Gpu& g, Capture& frame, ID3D11DeviceContext* context, std::uint32
 }
 
 // Traces toward the lights once they have drawn, timed on its own.
-void recordLights(Gpu& g, UINT slot, const Capture& frame, std::uint32_t flags)
+void recordLights(Gpu& g, UINT slot, const Capture& frame, std::uint32_t flags, bool reuse)
 {
     auto& l = g.lights;
     l.milliseconds = 0;
@@ -3002,7 +3146,9 @@ void recordLights(Gpu& g, UINT slot, const Capture& frame, std::uint32_t flags)
     list->SetComputeRootShaderResourceView(3, g.cache->coordinates());
     list->SetComputeRootShaderResourceView(4, g.templates->coordinates());
     list->SetComputeRootDescriptorTable(5, l.descriptors->GetGPUDescriptorHandleForHeapStart());
+    list->SetComputeRootConstantBufferView(6, writeReuseConstants(g, l.reservoirs, frame, slot, reuse));
     list->Dispatch((constants.size[0] + 7) / 8, (constants.size[1] + 7) / 8, 1);
+    if (reuse) recordReuse(list, l.reservoirs, l.reusePipeline.Get(), constants.size);
     list->EndQuery(l.timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot * 2 + 1);
     list->ResolveQueryData(l.timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot * 2, 2, l.timestampReadback.Get(), slot * 2 * sizeof(UINT64));
 }
@@ -3022,7 +3168,8 @@ void traceLights(Gpu& g, Capture& frame)
     const auto features = activeFeatures();
     const bool surfaces = g.bounce.surfaces && g.bounce.width == g.tracedWidth && g.bounce.height == g.tracedHeight;
     const bool soft = features.softLightShadows && surfaces, bounce = features.lightBounce && surfaces;
-    ensureLights(g, g.tracedWidth, g.tracedHeight);
+    const bool reuse = bounce && features.reuseBounceRays;
+    ensureLights(g, g.tracedWidth, g.tracedHeight, reuse);
     LightTableConstants table{};
     for (std::size_t i = 0; i < frame.lightRects.size(); ++i)
     {
@@ -3049,7 +3196,7 @@ void traceLights(Gpu& g, Capture& frame)
     g.context->Flush();
     const auto slot = static_cast<UINT>((g.frames - 1) % FramesInFlight);
     check(g.list->Reset(g.allocators[slot].Get(), nullptr), "Resetting the command list");
-    recordLights(g, slot, frame, (soft ? SoftLightShadows : 0) | (bounce ? LightBounce : 0));
+    recordLights(g, slot, frame, (soft ? SoftLightShadows : 0) | (bounce ? LightBounce : 0), reuse);
     check(g.list->Close(), "Recording the lights");
     check(g.queue->Wait(g.d3d12Fence.Get(), drawn), "Waiting for the drawn lights");
     ID3D12CommandList* lists[]{g.list.Get()};
@@ -3064,7 +3211,7 @@ void traceLights(Gpu& g, Capture& frame)
     ID3D11ShaderResourceView* bounced{};
     g.timer->begin(g.context, Pass::LightsFilter);
     if (soft) visibility = denoise(g, l.shadows, frame, g.lastTrace.worldFromClip, visibility, 6, 2, Signal::Visibility);
-    if (bounce) bounced = denoise(g, l.bounce, frame, g.lastTrace.worldFromClip, l.bouncedView.Get(), 16, 3, Signal::LightBounce);
+    if (bounce) bounced = denoise(g, l.bounce, frame, g.lastTrace.worldFromClip, l.bouncedView.Get(), 16, 4, Signal::LightBounce);
     g.timer->end(g.context, Pass::LightsFilter);
 
     D3D11_TEXTURE2D_DESC description{};
@@ -3152,7 +3299,7 @@ void recordTrace(Gpu& g, UINT slot, const Capture& frame, const Geometries& view
     }
     timestamp(7);
     recordAmbient(g, slot, constants);
-    recordBounce(g, slot, constants);
+    recordBounce(g, slot, frame, constants);
     // The bounce rays read the vertices too.
     barrier(list, g.vertices.Get(), readable, D3D12_RESOURCE_STATE_COPY_DEST);
     list->ResolveQueryData(g.timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot * TimestampsPerFrame, TimestampsPerFrame,
@@ -4400,8 +4547,8 @@ void readSun(Gpu& g)
 
         const auto* row = static_cast<const float*>(mapped.pData) + SunRow * 4;
         const auto length = std::sqrt(row[0] * row[0] + row[1] * row[1] + row[2] * row[2]);
-        // A sun or moon that casts shadows is above the horizon, so the direction toward it points up.
-        const auto scale = (row[2] < 0 ? -1.0f : 1.0f) / length;
+        // The row points the way the light travels; the rays go toward the sun or moon.
+        const auto scale = -1.0f / length;
         if (std::isfinite(scale))
         {
             for (int k = 0; k < 3; ++k) g.sun[k] = row[k] * scale;
@@ -4480,6 +4627,7 @@ void applySetting(const Measurement::Setting& setting)
     softLightShadows = setting.features.softLightShadows;
     lightBounce = setting.features.lightBounce;
     softSunShadows = setting.features.softSunShadows;
+    reuseBounceRays = setting.features.reuseBounceRays;
     selected = setting.view;
     bypassed = setting.paused;
 }
@@ -4497,7 +4645,7 @@ void startMeasurement()
     }
 
     m.features = {sunShadows, ambientOcclusion, halfAmbientRays, replaceCanopyShadows, offscreenGeometry, globalIllumination, lightShadows,
-        softLightShadows, lightBounce, softSunShadows};
+        softLightShadows, lightBounce, softSunShadows, reuseBounceRays};
     m.view = selected;
     m.bypassed = bypassed;
     Measurement::Setting setting{"", m.features, m.view, false};
@@ -4511,6 +4659,8 @@ void startMeasurement()
         m.settings.push_back(setting);
     };
     leaveOut(m.view != View::Off, "Debug view", [](auto& s) { s.view = View::Off; });
+    leaveOut(m.features.reuseBounceRays && (m.features.globalIllumination || (m.features.lightShadows && m.features.lightBounce)),
+        "Bounce ray reuse", [](auto& s) { s.features.reuseBounceRays = false; });
     leaveOut(m.features.lightShadows && m.features.lightBounce, "Light bounce", [](auto& s) { s.features.lightBounce = false; });
     leaveOut(m.features.lightShadows && m.features.softLightShadows, "Soft light shadows", [](auto& s) { s.features.softLightShadows = false; });
     leaveOut(m.features.lightShadows, "Light shadows", [](auto& s) { s.features.lightShadows = false; });
@@ -5129,6 +5279,7 @@ Status status()
     result.features.softLightShadows = softLightShadows;
     result.features.lightBounce = lightBounce;
     result.features.softSunShadows = softSunShadows;
+    result.features.reuseBounceRays = reuseBounceRays;
     result.bypassed = bypassed;
     result.toggledAt = toggledAt;
     result.performanceOverlay = performanceOverlay;
@@ -5162,6 +5313,7 @@ void enable(const Features& features)
     softLightShadows = features.softLightShadows;
     lightBounce = features.lightBounce;
     softSunShadows = features.softSunShadows;
+    reuseBounceRays = features.reuseBounceRays;
 }
 
 void toggleFeatures()

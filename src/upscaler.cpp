@@ -2073,6 +2073,11 @@ static void reloadDiagnostics()
             features.softSunShadows = value != 0;
             featuresRead = true;
         }
+        else if (key == "ray_tracing_reuse_bounce_rays")
+        {
+            features.reuseBounceRays = value != 0;
+            featuresRead = true;
+        }
         else if (key == "ray_tracing_performance_overlay" && rayTracingArmed()) ray_tracing::showPerformance(value != 0);
         // A new number starts a measurement, so rewriting the file with the same one does not.
         else if (key == "ray_tracing_measure_cost" && rayTracingArmed() && value && value != std::exchange(measureRequest, value))

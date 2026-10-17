@@ -1,12 +1,14 @@
 // Traces the sun's light bounced once off the captured geometry: global illumination (cs_6_5,
 // compiled by dxc at build time). Each pixel of the game's surface sends one cosine-weighted ray
-// into the hemisphere above it. Where it hits, a ray toward the sun tests whether the sun lights
-// that point, and the point's diffuse colour comes from the game's G-buffer when the game drew the
-// same point on screen, a mid grey otherwise. The output is the light bounced toward the pixel per
-// unit of the sun's colour; Direct3D 11 accumulates it over frames, filters it and lights the scene
-// with it.
+// into the hemisphere above it, its direction from blue noise. Where it hits, a ray toward the sun
+// tests whether the sun lights that point, and the point's diffuse colour comes from the game's
+// G-buffer when the game drew the same point on screen, a mid grey otherwise. The output is the light
+// bounced toward the pixel per unit of the sun's colour; Direct3D 11 accumulates it over frames,
+// filters it and lights the scene with it. With reuse, `main` keeps each pixel's sample in its
+// reservoir and `reuse`, run after it, lights the pixel from its reservoir and its neighbours'
+// (ray_tracing_reservoirs.hlsli).
 #define BounceRootSignature "RootConstants(num32BitConstants=45, b0), SRV(t0), SRV(t1), SRV(t6), SRV(t7), SRV(t8), SRV(t9), " \
-    "SRV(t10), DescriptorTable(SRV(t3, numDescriptors=3), SRV(t11, numDescriptors=2), UAV(u0))"
+    "SRV(t10), DescriptorTable(SRV(t3, numDescriptors=3), SRV(t11, numDescriptors=2), UAV(u0), SRV(t30), UAV(u3)), CBV(b1)"
 
 cbuffer BounceParameters : register(b0)
 {
@@ -40,6 +42,7 @@ RWTexture2D<float4> Output : register(u0); // rgb: bounced light per unit of sun
 // drew, at another level of detail or wind; they count from a metre and 1% of the view distance on,
 // so a surface does not light itself from its own copy.
 static const float MaxDistance = 5000, CopyDistance = 100, CopyDistancePerDistance = 0.01;
+static const uint CopyMask = 14;
 // The diffuse colour of points the game did not draw: about that of earth, rock and bark.
 static const float3 UnknownAlbedo = 0.25;
 
@@ -49,15 +52,10 @@ float3 Unproject(float2 screen, float depth)
     return world.xyz / world.w;
 }
 
-float3 CosineDirection(float3 normal, uint seed)
+float3 CosineDirection(float3 normal, float2 random)
 {
-    uint a = Hash(seed), b = Hash(a);
-    float2 random = float2(a, b) / 4294967296.0;
-    // An orthonormal basis without branches (Duff et al. 2017).
-    float flip = normal.z >= 0 ? 1 : -1;
-    float c = -1 / (flip + normal.z), d = normal.x * normal.y * c;
-    float3 tangent = float3(1 + flip * normal.x * normal.x * c, flip * d, -flip * normal.x);
-    float3 bitangent = float3(d, flip + normal.y * normal.y * c, -normal.y);
+    float3 tangent, bitangent;
+    Basis(normal, tangent, bitangent);
     float radius = sqrt(random.x), angle = 6.2831853 * random.y;
     return (tangent * cos(angle) + bitangent * sin(angle)) * radius + normal * sqrt(1 - random.x);
 }
@@ -96,33 +94,26 @@ float3 AlbedoAt(float3 position)
     return same && albedo.a > 0 ? albedo.rgb : UnknownAlbedo;
 }
 
-[RootSignature(BounceRootSignature)]
-[numthreads(8, 8, 1)]
-void main(uint2 pixel : SV_DispatchThreadID)
+// The sunlight a point sends back, per unit of the sun's colour. Everything captured shadows the
+// point, foliage included: a tree's copy shading its own leaves is canopy shading them all the same.
+float3 LightFrom(float3 position, float3 normal)
 {
-    if (any(pixel >= Size)) return;
-    float depth = GameDepth[pixel];
-    uint packedNormal = Normals[pixel];
-    if (depth <= 0 || !packedNormal)
-    {
-        Output[pixel] = 0;
-        return;
-    }
-    if (Sun.w == 0)
-    {
-        Output[pixel] = float4(0, 0, 0, 1);
-        return;
-    }
+    float lit = saturate(dot(normal, Sun.xyz));
+    float3 start = position + normal * (0.5 + length(position) * 1e-3);
+    if (lit > 0 && Occluded(start, Sun.xyz, 15, 0, 1e30)) lit = 0;
+    return AlbedoAt(position) * lit;
+}
 
-    float2 screen = (pixel + 0.5) / Size * float2(2, -2) + float2(-1, 1);
-    float3 eye = Unproject(screen, 1), surface = Unproject(screen, depth), normal = DecodeNormal(packedNormal);
-    float viewDistance = length(surface - eye);
-    // Float precision falls with distance, so the start moves further off the surface. Moving toward
-    // the eye as well keeps it in front of the surface where the G-buffer's normal tilts into it.
-    float bias = 0.5 + viewDistance * 1e-3;
+#include "ray_tracing_reservoirs.hlsli"
+
+// The point the pixel's bounce ray finds, and the light it sends back: none where the ray finds
+// nothing.
+Sample TraceBounce(uint2 pixel, float3 surface, float3 normal)
+{
+    float viewDistance = length(surface);
     RayDesc ray;
-    ray.Origin = surface + (normal + (eye - surface) / viewDistance) * bias;
-    ray.Direction = CosineDirection(normal, Hash(pixel.x + Hash(pixel.y + Hash(Frame))));
+    ray.Origin = RayOrigin(surface, normal, viewDistance);
+    ray.Direction = CosineDirection(normal, BlueNoisePair(pixel));
     ray.TMin = 0;
     ray.TMax = MaxDistance;
     RayQuery<RAY_FLAG_NONE> view;
@@ -133,23 +124,60 @@ void main(uint2 pixel : SV_DispatchThreadID)
     RayQuery<RAY_FLAG_NONE> copies;
     if (ray.TMin < ray.TMax)
     {
-        copies.TraceRayInline(Scene, RAY_FLAG_NONE, 14, ray);
+        copies.TraceRayInline(Scene, RAY_FLAG_NONE, CopyMask, ray);
         Resolve(copies);
     }
     bool hitCopy = ray.TMin < ray.TMax && copies.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
-    if (!hitCopy && view.CommittedStatus() != COMMITTED_TRIANGLE_HIT)
+    Sample found;
+    found.position = ray.Origin + ray.Direction * MaxDistance;
+    found.normal = -ray.Direction;
+    found.light = 0;
+    if (!hitCopy && view.CommittedStatus() != COMMITTED_TRIANGLE_HIT) return found;
+
+    found.position = ray.Origin + ray.Direction * (hitCopy ? copies.CommittedRayT() : view.CommittedRayT());
+    float3 hitNormal = hitCopy ? HitNormal(copies) : HitNormal(view);
+    found.normal = dot(hitNormal, ray.Direction) > 0 ? -hitNormal : hitNormal;
+    found.light = LightFrom(found.position, found.normal);
+    return found;
+}
+
+[RootSignature(BounceRootSignature)]
+[numthreads(8, 8, 1)]
+void main(uint2 pixel : SV_DispatchThreadID)
+{
+    if (any(pixel >= Size)) return;
+    float3 surface, normal;
+    uint packedNormal;
+    if (!SurfaceAt(pixel, surface, normal, packedNormal))
+    {
+        Output[pixel] = 0;
+        if (Reuse) Clear(pixel);
+        return;
+    }
+    if (Sun.w == 0)
     {
         Output[pixel] = float4(0, 0, 0, 1);
+        if (Reuse) Clear(pixel);
         return;
     }
 
-    float3 hit = ray.Origin + ray.Direction * (hitCopy ? copies.CommittedRayT() : view.CommittedRayT());
-    float3 hitNormal = hitCopy ? HitNormal(copies) : HitNormal(view);
-    if (dot(hitNormal, ray.Direction) > 0) hitNormal = -hitNormal;
-    float lit = saturate(dot(hitNormal, Sun.xyz));
-    // Everything captured shadows the point, foliage included: a tree's copy shading its own leaves
-    // is canopy shading them all the same.
-    float3 start = hit + hitNormal * (0.5 + length(hit - eye) * 1e-3);
-    if (lit > 0 && Occluded(start, Sun.xyz, 15, 0, 1e30)) lit = 0;
-    Output[pixel] = float4(AlbedoAt(hit) * lit, 1);
+    Sample found = TraceBounce(pixel, surface, normal);
+    if (Reuse) StoreChoice(pixel, surface, normal, packedNormal, found);
+    else Output[pixel] = float4(found.light, 1);
+}
+
+[RootSignature(BounceRootSignature)]
+[numthreads(8, 8, 1)]
+void reuse(uint2 pixel : SV_DispatchThreadID)
+{
+    if (any(pixel >= Size)) return;
+    float3 surface, normal;
+    uint packedNormal;
+    if (!SurfaceAt(pixel, surface, normal, packedNormal))
+    {
+        Output[pixel] = 0;
+        return;
+    }
+
+    Output[pixel] = float4(Sun.w == 0 ? 0 : ReusedLight(pixel, surface, normal, length(surface)), 1);
 }
