@@ -190,19 +190,18 @@ void drawWork(const Status& state)
 // One coloured line on what the ray tracing is doing right now.
 void drawStatus(const Status& state)
 {
-    const auto& features = state.features;
-    const bool anyFeature = features.sunShadows || features.ambientOcclusion || features.globalIllumination || features.lightShadows;
     if (!state.failure.empty()) statusLine(Red, std::format("Ray tracing stopped: {} Change a setting to retry.", state.failure));
-    else if (!anyFeature && state.view == View::Off) statusLine(Grey, "Ray tracing is off.");
+    else if (!state.features.any() && state.view == View::Off) statusLine(Grey, "Ray tracing is off.");
+    else if (!upscaler::rayTracingArmed()) statusLine(Yellow, "Restart the game to start ray tracing.");
     else if (state.bypassed) statusLine(Yellow, "Switched off with F9: the game's own image is shown.");
     else if (!state.tracedFrames) statusLine(Yellow, "Waiting for the first traced frame.");
     else statusLine(Green, "Ray tracing active. F9 switches it off to compare with the game.");
 }
 
-// Applies the features and keeps them in DaysGoneDLSS.ini for the next start.
+// Applies the features while ray tracing runs, and keeps them in DaysGoneDLSS.ini for the next start.
 void save(const Features& features)
 {
-    enable(features);
+    if (upscaler::rayTracingArmed()) enable(features);
     auto wanted = upscaler::currentSettings();
     wanted.rayTracing = features;
     upscaler::applySettings(wanted);
@@ -216,7 +215,9 @@ void drawMenu()
         "it costs performance and is not meant for play.");
     if (!open) return;
 
-    const auto state = status();
+    auto state = status();
+    // Until a restart starts it, ray tracing holds no features; the checkboxes edit the saved ones.
+    if (!upscaler::rayTracingArmed()) state.features = upscaler::currentSettings().rayTracing;
     drawStatus(state);
     ImGui::Separator();
 
@@ -279,6 +280,12 @@ void drawMenu()
 
 void drawDiagnostics(float width)
 {
+    if (!upscaler::rayTracingArmed())
+    {
+        statusLine(Grey, "Ray tracing is not running: turn on one of its features and restart the game to see its views and costs.");
+        return;
+    }
+
     const auto state = status();
     const char* views[]{"Off", "Ray-traced geometry", "Depth comparison", "Ray-traced sun light", "Sun shadow comparison",
         "Shadow caster depth comparison", "Ray-traced ambient occlusion", "Ambient occlusion comparison", "Off-screen shadow check",

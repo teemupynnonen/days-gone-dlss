@@ -19,6 +19,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <bitset>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -54,6 +55,10 @@ constexpr UINT MaskedVertexBytes = 28; // float4 clip position, float2 texture c
 // Baked coverage of alpha-tested materials: 32 by 32 slots of 256 texels square. A forest view
 // holds a few hundred: leaf atlases per species and impostors of distant trees.
 constexpr UINT SlotSize = 256, AtlasSlots = 32, MaterialSlots = AtlasSlots * AtlasSlots, NoMaterial = 0xffffffff;
+// A material holds the game's shader and textures. One not drawn for MaterialMemory traced frames
+// (about a minute at 30 fps) lets them go and frees its slot, unless a cached draw still uses the
+// slot. The stream output kept per shader pair goes likewise.
+constexpr UINT MaterialMemory = 1800;
 // Needles a texel or two wide in the game's textures fall between a slot's texels, and light leaks
 // through the canopy. Each slot texel is baked from BakeSamples squared samples (as BakeCopy reads them).
 constexpr UINT BakeSamples = 4;
@@ -122,6 +127,9 @@ constexpr UINT MaxCasterRuns = 64;
 // draws added in a frame are staged in whole rows.
 constexpr UINT CacheVertexCapacity = RowLength * 2048, CacheStagingRows = 256;
 constexpr UINT64 CacheStructureBytes = 512ull << 20, CacheScratchBytes = 32ull << 20;
+// Objects drawn with velocity are never cached. One not drawn for MoverMemory traced frames (about a
+// minute at 30 fps) is forgotten: its key is made of buffer addresses the game reuses for other objects.
+constexpr UINT MoverMemory = 1800;
 // Foliage templates have a cache of their own: a forest has hundreds of meshes, each up to tens of
 // thousands of vertices, and they must not evict one another.
 constexpr UINT TemplateVertexCapacity = RowLength * 1536;
@@ -290,6 +298,11 @@ public:
     bool contains(std::uint64_t key) const { return byKey.contains(key); }
     // Whether every draw of the object the view last drew is cached, and none has been evicted since.
     bool holdsWhole(std::uint64_t object) const { return wholeObjects.contains(object); }
+    // Evicts every entry of `objects`. Only before plan(), which drops the last frame's builds and
+    // traced entries: until then they point at entries.
+    void evictObjects(const std::unordered_set<std::uint64_t>& objects);
+    // Marks the coverage slots its alpha-tested entries use.
+    void markSlots(std::bitset<MaterialSlots>& slots) const;
     D3D12_GPU_VIRTUAL_ADDRESS coordinates() const { return coordinateBuffer->GetGPUVirtualAddress(); }
     std::optional<Template> find(std::uint64_t key) const;
     void clear();
@@ -406,6 +419,26 @@ struct Capture
     std::uint32_t lightModels{};
     unsigned tracedLights{}, gameLights{};
     bool lightsPending{}; // Lights wait in their slots for every light to draw
+
+    // Back to the defaults, keeping the containers' storage: a forest frame fills them with thousands
+    // of entries, and growing them again every frame slows the thread executing Direct3D work.
+    void reset()
+    {
+        Capture fresh;
+        const auto keepStorage = [](auto& to, auto& from) { to = std::move(from); to.clear(); };
+        keepStorage(fresh.casterRuns, casterRuns);
+        keepStorage(fresh.viewObjects, viewObjects);
+        keepStorage(fresh.casting, casting);
+        keepStorage(fresh.materialDraws, materialDraws);
+        keepStorage(fresh.transformDraws, transformDraws);
+        keepStorage(fresh.maskedMeshes, maskedMeshes);
+        keepStorage(fresh.capturedKeys, capturedKeys);
+        keepStorage(fresh.cacheDraws, cacheDraws);
+        keepStorage(fresh.templateDraws, templateDraws);
+        keepStorage(fresh.foliageDraws, foliageDraws);
+        keepStorage(fresh.lightRects, lightRects);
+        *this = std::move(fresh);
+    }
 } capture;
 
 // Direct3D 12's part of the newest frame it has finished, from its timestamps, in milliseconds.
@@ -595,13 +628,17 @@ struct Gpu
     ComPtr<ID3D11Buffer> lightSpace; // This frame's LightRows of the resolve's constants
     ComPtr<ID3D11ShaderResourceView> lightSpaceView;
     ComPtr<ID3D11ShaderResourceView> noCanopy; // Zeros in place of the resolve's canopy map: no soft tree shadow
-    // Coverage slots by pixel shader and bound textures; the references keep their addresses unique.
-    std::map<std::vector<IUnknown*>, UINT> materials;
-    std::vector<ComPtr<IUnknown>> materialReferences;
+    // Coverage slots by pixel shader and the view in each texture slot it declares (null in the
+    // others), with the frame each was last drawn in; the references keep the key's addresses unique.
+    // Slots freed by unused materials are taken first.
+    using MaterialKey = std::array<IUnknown*, 1 + 32>;
+    struct Material { UINT slot; UINT64 usedIn; std::vector<ComPtr<IUnknown>> references; };
+    std::map<MaterialKey, Material> materials;
+    std::vector<UINT> freeSlots;
     // Stream output of alpha-tested draws by vertex shader signature and coordinate input, and by the
     // shader pair each draw binds; the references keep the pair's addresses unique.
     std::map<std::string, ComPtr<ID3D11GeometryShader>, std::less<>> coordinateOutput;
-    struct ShaderPairOutput { ComPtr<ID3D11VertexShader> vertexShader; ComPtr<ID3D11PixelShader> pixelShader; ComPtr<ID3D11GeometryShader> output; };
+    struct ShaderPairOutput { ComPtr<ID3D11VertexShader> vertexShader; ComPtr<ID3D11PixelShader> pixelShader; ComPtr<ID3D11GeometryShader> output; UINT64 usedIn{}; };
     std::map<std::pair<IUnknown*, IUnknown*>, ShaderPairOutput> coordinateOutputByShaders;
     ComPtr<ID3D11Fence> fence;
     UINT64 fenceValue{};
@@ -625,8 +662,8 @@ struct Gpu
     ComPtr<ID3D12Resource> cacheTable; // Per frame in flight: the traced cached draws' coordinates and slots
     std::unique_ptr<GeometryCache> cache, templates;
     bool cacheReset{}; // The coverage atlas started again; cached slots are stale
-    std::unordered_map<ID3D11Buffer*, bool> staticBuffers; // Constant buffers by whether they are static
-    std::unordered_set<std::uint64_t> movers;              // Objects drawn with velocity: never cached
+    std::unordered_map<std::uint64_t, UINT64> movers; // Objects drawn with velocity, by the frame last drawn in: never cached
+    std::unordered_set<std::uint64_t> newMovers;      // Started moving since the last trace, which evicts their cached entries
     // Foliage: per transform buffer its transforms, the meshes each instance was last drawn with, and
     // the trees near the camera or seen lately with their sections placed; per mesh the cached template,
     // the instance it shows and the reference the trees were last placed by; the visible lists of every
@@ -651,7 +688,7 @@ struct Gpu
         std::vector<UINT64> seenIn; // Per instance: the read-back its meshes come from; 0 while not live
         std::vector<LiveTree> live; // Of many more instances
         bool pending{};
-        UINT64 loadedFrame{};
+        UINT64 loadedFrame{}, drawnFrame{};
     };
     std::unordered_map<ID3D11Buffer*, FoliageTrees> foliage;
     struct FoliageTemplate { std::uint64_t cacheKey; ID3D11Buffer* transforms; UINT reference; std::optional<FoliageReference> placedBy; };
@@ -1271,15 +1308,59 @@ void placeFoliage(Gpu& g, const Capture& frame)
         }
 }
 
+// The game frees the transform buffers of the world tiles it streams out, but the reference held here
+// would keep every one ever drawn, with its readback and copies, for the session. A buffer goes once
+// none of its trees is live and it has not been drawn for FoliageReloadFrames: a tree that is not live
+// is only placed again once seen, which draws its buffer again, and by then its transforms are about
+// due to be read again anyway. Without the off-screen geometry nothing is recorded or placed, so every
+// buffer goes at once. The templates whose reference instance it holds go too, or a buffer made later
+// at its address would place their trees: they are taken again where their meshes are drawn, and the
+// trees placed from them are placed again.
+void dropUnusedFoliage(Gpu& g)
+{
+    const auto unused = [&](const auto& entry)
+    {
+        const auto& trees = entry.second;
+        return !offscreenGeometry || (g.frames - trees.drawnFrame > FoliageReloadFrames && trees.live.empty());
+    };
+    if (!std::erase_if(g.foliage, unused)) return;
+
+    std::vector<std::uint64_t> orphaned;
+    for (auto model = g.foliageTemplates.begin(); model != g.foliageTemplates.end();)
+    {
+        if (g.foliage.contains(model->second.transforms))
+        {
+            ++model;
+            continue;
+        }
+
+        orphaned.push_back(model->first);
+        model = g.foliageTemplates.erase(model);
+    }
+
+    std::ranges::sort(orphaned);
+    for (auto& [buffer, trees] : g.foliage)
+        for (auto& tree : trees.live)
+        {
+            const auto end = tree.meshes.keys.begin() + tree.meshes.count;
+            if (std::any_of(tree.meshes.keys.begin(), end, [&](std::uint64_t mesh) { return std::ranges::binary_search(orphaned, mesh); }))
+                tree = {tree.index};
+        }
+
+    g.foliageChanged = true;
+}
+
 // Reads the visible lists that have landed and, when what the trees are placed from has changed,
 // places them, at the frame's first draw: before anything is captured, while the GPU is still busy
 // with the frame before. The trees are placed the frame after a read-back lands, so the two halves of
 // the work fall in different frames. Without the camera's position the trace drops the templates; the
-// trees wait for them.
+// trees wait for them. Unused transform buffers are dropped first, so the trees left to be placed
+// again are placed in this frame.
 void prepareFoliage(Gpu& g, const Capture& frame)
 {
     const TraceTime time;
     Stopwatch stopwatch;
+    dropUnusedFoliage(g);
     const bool place = offscreenGeometry && frame.cameraKnown && std::exchange(g.foliageChanged, false);
     readFoliage(g);
     if (place) placeFoliage(g, frame);
@@ -1760,6 +1841,24 @@ void GeometryCache::evict(std::list<Entry>::iterator entry)
     byKey.erase(entry->key);
     wholeObjects.erase(entry->object);
     entries.erase(entry);
+}
+
+void GeometryCache::evictObjects(const std::unordered_set<std::uint64_t>& objects)
+{
+    if (objects.empty()) return;
+
+    for (auto entry = entries.begin(); entry != entries.end();)
+    {
+        const auto next = std::next(entry);
+        if (objects.contains(entry->object)) evict(entry);
+        entry = next;
+    }
+}
+
+void GeometryCache::markSlots(std::bitset<MaterialSlots>& slots) const
+{
+    for (const auto& entry : entries)
+        if (entry.slot < MaterialSlots) slots.set(entry.slot);
 }
 
 GeometryCache::Room GeometryCache::roomOf(const Entry& entry, Ring ring)
@@ -3045,6 +3144,29 @@ void recordTrace(Gpu& g, UINT slot, const Capture& frame, const Geometries& view
         g.timestampReadback.Get(), slot * TimestampsPerFrame * sizeof(UINT64));
 }
 
+// The caches stand in for the draws they hold, which then never look their material up, and trace
+// them out of view, so a material whose slot they still use is kept however long ago it was drawn.
+// Earlier frames' traces may still read a freed slot on the GPU, but Direct3D 11 bakes it again only
+// after waiting for this frame's.
+void dropUnusedMaterials(Gpu& g)
+{
+    std::bitset<MaterialSlots> cached;
+    g.cache->markSlots(cached);
+    g.templates->markSlots(cached);
+    for (auto material = g.materials.begin(); material != g.materials.end();)
+    {
+        const auto slot = material->second.slot;
+        if (cached[slot] || g.frames - material->second.usedIn <= MaterialMemory)
+        {
+            ++material;
+            continue;
+        }
+
+        g.freeSlots.push_back(slot);
+        material = g.materials.erase(material);
+    }
+}
+
 // Direct3D 11 turns the streamed clip positions into world positions and copies the game's depth,
 // Direct3D 12 builds and traces, and Direct3D 11 waits on the GPU before it reads the results.
 bool trace(Gpu& g, const Capture& frame)
@@ -3163,8 +3285,10 @@ bool trace(Gpu& g, const Capture& frame)
     waitFor(g, g.submitted[slot]);
     gpuWaitTicks += ticksNow() - waitStart;
     if (g.submitted[slot]) readTimings(g, slot);
-    // Without the camera's position cached geometry cannot be placed.
-    if (std::exchange(g.cacheReset, false) || !frame.cameraKnown)
+    // Without the camera's position cached geometry cannot be placed, and without the off-screen
+    // geometry it is not traced: the caches are emptied and plan nothing.
+    const bool caching = offscreenGeometry && frame.cameraKnown;
+    if (std::exchange(g.cacheReset, false) || !caching)
     {
         g.cache->clear();
         g.templates->clear();
@@ -3177,15 +3301,30 @@ bool trace(Gpu& g, const Capture& frame)
         g.foliageStructures.clear();
         g.foliageChanged = true;
     }
+
+    // Objects that started moving leave the cache: their copies would stay where they were seen. Once
+    // forgotten, an object is cached when drawn still and leaves again when it moves.
+    g.cache->evictObjects(g.newMovers);
+    g.newMovers.clear();
+    if (g.frames % MoverMemory == 0) std::erase_if(g.movers, [&](const auto& mover) { return g.frames - mover.second > MoverMemory; });
+
+    // The frame's alpha-tested draws looked their materials up in this frame (g.frames moves on only
+    // after the trace), so the slots they carry are not freed.
+    if (g.frames % MaterialMemory == 0)
+    {
+        dropUnusedMaterials(g);
+        std::erase_if(g.coordinateOutputByShaders, [&](const auto& pair) { return g.frames - pair.second.usedIn > MaterialMemory; });
+    }
+
     // The shadow caster and off-screen shadow views show everything sun rays can see beyond the view,
     // on screen too.
     const std::vector<GeometryCache::Draw> none;
     const std::unordered_set<std::uint64_t> noObjects;
     const bool everything = selected == View::ShadowCasters || selected == View::OffscreenShadows;
     stopwatch.restart();
-    g.cache->plan(frame.cameraKnown ? frame.cacheDraws : none, maskedStart, everything, frame.casting, frame.preViewTranslation);
+    g.cache->plan(caching ? frame.cacheDraws : none, maskedStart, everything, frame.casting, frame.preViewTranslation);
     const auto templatesHeld = g.templates->size();
-    g.templates->plan(frame.cameraKnown ? frame.templateDraws : none, maskedStart, false, noObjects, frame.preViewTranslation);
+    g.templates->plan(caching ? frame.templateDraws : none, maskedStart, false, noObjects, frame.preViewTranslation);
     // Templates are only evicted to make room for new ones.
     if (g.templates->size() < templatesHeld + g.templates->building().first) dropEvictedFoliage(g);
     const auto instances = writeInstances(g, slot, frame.preViewTranslation);
@@ -3360,12 +3499,21 @@ std::uint64_t drawKey(ID3D11DeviceContext* context, std::uint32_t count, std::ui
     return key;
 }
 
+// Asked at every draw, not remembered by address: the game frees buffers and makes others, of either
+// usage, at the same addresses.
+bool staticBuffer(ID3D11Buffer* buffer)
+{
+    D3D11_BUFFER_DESC description{};
+    buffer->GetDesc(&description);
+    return description.Usage != D3D11_USAGE_DYNAMIC;
+}
+
 // The object a draw belongs to, whatever its level of detail: the static constant buffers its vertex
 // shader reads (the primitive's own; per-draw constants are dynamic) and the instances it draws.
 // Instanced foliage keeps its per-instance data in static vertex buffers instead, so instanced draws
 // without static constants are told apart by those, per level of detail. Zero when neither applies:
 // the draw cannot be told apart from other objects.
-std::uint64_t objectKey(Gpu& g, ID3D11DeviceContext* context, std::uint32_t instances, std::uint32_t firstInstance)
+std::uint64_t objectKey(ID3D11DeviceContext* context, std::uint32_t instances, std::uint32_t firstInstance)
 {
     ComPtr<ID3D11VertexShader> vertexShader;
     context->VSGetShader(vertexShader.GetAddressOf(), nullptr, nullptr);
@@ -3380,14 +3528,7 @@ std::uint64_t objectKey(Gpu& g, ID3D11DeviceContext* context, std::uint32_t inst
         auto* buffer = buffers[slot];
         if (!buffer) continue;
 
-        const auto [known, added] = g.staticBuffers.try_emplace(buffer, false);
-        if (added)
-        {
-            D3D11_BUFFER_DESC description{};
-            buffer->GetDesc(&description);
-            known->second = description.Usage != D3D11_USAGE_DYNAMIC;
-        }
-        if ((slots & (1u << slot)) && known->second) key = (key ^ reinterpret_cast<std::uint64_t>(buffer)) * 1099511628211ull;
+        if ((slots & (1u << slot)) && staticBuffer(buffer)) key = (key ^ reinterpret_cast<std::uint64_t>(buffer)) * 1099511628211ull;
         buffer->Release();
     }
     if (!key && instances > 1)
@@ -3401,14 +3542,7 @@ std::uint64_t objectKey(Gpu& g, ID3D11DeviceContext* context, std::uint32_t inst
             auto* stream = streams[slot];
             if (!stream) continue;
 
-            const auto [known, added] = g.staticBuffers.try_emplace(stream, false);
-            if (added)
-            {
-                D3D11_BUFFER_DESC description{};
-                stream->GetDesc(&description);
-                known->second = description.Usage != D3D11_USAGE_DYNAMIC;
-            }
-            dynamic = dynamic || !known->second;
+            dynamic = dynamic || !staticBuffer(stream);
             key = (key ^ reinterpret_cast<std::uint64_t>(stream) ^ (std::uint64_t{offsets[slot]} << 40)) * 1099511628211ull;
             stream->Release();
         }
@@ -3448,10 +3582,24 @@ void offerToCache(std::uint64_t object, std::uint64_t draw, UINT first, UINT ver
         return;
     }
 
+    // The view's objects and its movers are noted even without the off-screen geometry, when nothing is
+    // offered: the shadow casters of the static objects the view drew are left to its capture.
     capture.viewObjects.insert(object);
-    if (moving) g.movers.insert(object);
-    if (g.movers.contains(object)) ++capture.movingDraws;
-    if (!g.movers.contains(object)) capture.cacheDraws.push_back({cacheKey(object, draw), object, first, vertices, slot, masked});
+
+    // An object that starts moving leaves the cache: the trace evicts its entries, and its draws offered
+    // earlier in the frame go now.
+    if (moving && g.movers.try_emplace(object).second)
+    {
+        g.newMovers.insert(object);
+        std::erase_if(capture.cacheDraws, [&](const GeometryCache::Draw& offered) { return offered.object == object; });
+    }
+
+    if (const auto mover = g.movers.find(object); mover != g.movers.end())
+    {
+        mover->second = g.frames;
+        ++capture.movingDraws;
+    }
+    else if (offscreenGeometry) capture.cacheDraws.push_back({cacheKey(object, draw), object, first, vertices, slot, masked});
 }
 
 // Whether the cache can stand in for a static object's shadow casters: it holds the object whole and
@@ -3553,6 +3701,7 @@ void recordFoliage(ID3D11DeviceContext* context, const FoliageSource& source, st
 {
     auto& g = *gpu;
     auto& trees = g.foliage[source.transforms.Get()];
+    trees.drawnFrame = g.frames;
     D3D11_BUFFER_DESC description{};
     source.transforms->GetDesc(&description);
     if (!trees.source)
@@ -3600,15 +3749,16 @@ UINT bake(Gpu& g, ID3D11DeviceContext* context, ID3D11PixelShader* pixelShader, 
     bool fades, UINT toggles, UINT transformRow)
 {
     // The material is the shader and the textures it declares; other slots can hold anything. Draws
-    // look it up every frame, so the samplers and constants are fetched only to bake it.
+    // look it up every frame, so its key has a place for every slot and is built without allocating,
+    // and the samplers and constants are fetched only to bake it.
     std::array<ID3D11ShaderResourceView*, 32> views{};
     std::array<ID3D11SamplerState*, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT> samplers{};
     std::array<ID3D11Buffer*, D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT> buffers{};
     const auto declared = static_cast<UINT>(32 - std::countl_zero(textures));
     context->PSGetShaderResources(0, declared, views.data());
-    std::vector<IUnknown*> key{pixelShader};
+    Gpu::MaterialKey key{pixelShader};
     for (UINT slot = 0; slot < declared; ++slot)
-        if (textures & (1u << slot)) key.push_back(views[slot]);
+        if (textures & (1u << slot)) key[1 + slot] = views[slot];
     const auto release = [&]
     {
         for (auto* view : views)
@@ -3621,7 +3771,8 @@ UINT bake(Gpu& g, ID3D11DeviceContext* context, ID3D11PixelShader* pixelShader, 
     if (const auto found = g.materials.find(key); found != g.materials.end())
     {
         release();
-        return found->second;
+        found->second.usedIn = g.frames;
+        return found->second.slot;
     }
     context->PSGetSamplers(0, static_cast<UINT>(samplers.size()), samplers.data());
     context->PSGetConstantBuffers(0, static_cast<UINT>(buffers.size()), buffers.data());
@@ -3644,13 +3795,18 @@ UINT bake(Gpu& g, ID3D11DeviceContext* context, ID3D11PixelShader* pixelShader, 
     if (g.materials.size() >= MaterialSlots)
     {
         g.materials.clear();
-        g.materialReferences.clear();
         g.cacheReset = true;
         static bool reported{};
         if (!std::exchange(reported, true)) upscaler::log("The coverage atlas filled; materials are baked again from the start.");
     }
 
-    const auto slot = static_cast<UINT>(g.materials.size());
+    // With no slot freed, the materials hold the slots below their count.
+    auto slot = static_cast<UINT>(g.materials.size());
+    if (!g.freeSlots.empty())
+    {
+        slot = g.freeSlots.back();
+        g.freeSlots.pop_back();
+    }
     const BakeConstants constants{{slot % AtlasSlots * SlotSize, slot / AtlasSlots * SlotSize}, {}};
     inOwnState(g, [&]
     {
@@ -3684,10 +3840,11 @@ UINT bake(Gpu& g, ID3D11DeviceContext* context, ID3D11PixelShader* pixelShader, 
         g.context->CSSetUnorderedAccessViews(0, 1, g.coverageAccess.GetAddressOf(), nullptr);
         g.context->Dispatch(SlotSize / 8, SlotSize / 8, 1);
     });
+    Gpu::Material material{slot, g.frames};
     for (auto* object : key)
-        if (object) g.materialReferences.emplace_back(object);
+        if (object) material.references.emplace_back(object);
     release();
-    g.materials.emplace(std::move(key), slot);
+    g.materials.emplace(key, std::move(material));
     return slot;
 }
 
@@ -3767,6 +3924,7 @@ bool captureAlphaTested(ID3D11DeviceContext* context, std::uint32_t count, std::
     }
     auto& pair = g.coordinateOutputByShaders[{vertexShader.Get(), pixelShader.Get()}];
     if (!pair.vertexShader) pair = {vertexShader, pixelShader, coordinateOutput(g, vertexShader.Get(), input)};
+    pair.usedIn = g.frames;
     const auto& streamOutput = pair.output;
     if (!streamOutput)
     {
@@ -3912,7 +4070,7 @@ void captureShadowCaster(ID3D11DeviceContext* context, UINT map, const D3D11_VIE
     }
 
     const bool beyondView = selected == View::ShadowCasters || selected == View::OffscreenShadows;
-    const auto object = beyondView ? 0 : objectKey(*gpu, context, instances, firstInstance);
+    const auto object = beyondView ? 0 : objectKey(context, instances, firstInstance);
     if (object && !gpu->movers.contains(object) && capture.viewObjects.contains(object))
     {
         ++capture.casterDrawsInView;
@@ -4541,7 +4699,7 @@ void beginView(const float (&clipFromWorld)[16], const std::int32_t (&rect)[4], 
 {
     if (!wanted()) return;
 
-    capture = {};
+    capture.reset();
     capture.open = true;
     std::memcpy(capture.clipFromWorld, clipFromWorld, sizeof(capture.clipFromWorld));
     std::memcpy(capture.preViewTranslation, preViewTranslation, sizeof(capture.preViewTranslation));
@@ -4764,7 +4922,8 @@ void captureDraw(ID3D11DeviceContext* context, std::uint32_t count, std::uint32_
         const auto firstVertex = capture.maskedVertices;
         if (target.Get() != gpu->sceneDepth.Get() || !capture.casterRuns.empty()) return finish();
 
-        if (const auto foliage = foliageSource(context))
+        // Foliage is told apart only for the trees' copies, which only the off-screen geometry traces.
+        if (const auto foliage = offscreenGeometry ? foliageSource(context) : std::nullopt)
         {
             const auto mesh = foliageMesh(context, count, first, baseVertex, true);
             if (copiesStandIn(*gpu, mesh))
@@ -4774,7 +4933,7 @@ void captureDraw(ID3D11DeviceContext* context, std::uint32_t count, std::uint32_
                 return finish();
             }
         }
-        const auto object = objectKey(*gpu, context, instances, firstInstance);
+        const auto object = objectKey(context, instances, firstInstance);
         if (cacheStandsIn(*gpu, object, key))
         {
             standIn(object, key, true);
@@ -4788,7 +4947,7 @@ void captureDraw(ID3D11DeviceContext* context, std::uint32_t count, std::uint32_
             const auto vertices = capture.maskedVertices - firstVertex;
             const auto slot = capture.materialDraws.back()[1];
             offerToCache(object, key, firstVertex, vertices, slot, true, false);
-            if (const auto foliage = foliageSource(context))
+            if (const auto foliage = offscreenGeometry ? foliageSource(context) : std::nullopt)
                 recordFoliage(context, *foliage, foliageMesh(context, count, first, baseVertex, true), instances, firstInstance, firstVertex,
                     vertices, slot, true);
         }
@@ -4814,7 +4973,7 @@ void captureDraw(ID3D11DeviceContext* context, std::uint32_t count, std::uint32_
     }
 
     // Foliage sways with the wind, drawn with velocity, but its instances stay put.
-    if (const auto foliage = foliageSource(context))
+    if (const auto foliage = offscreenGeometry ? foliageSource(context) : std::nullopt)
     {
         const auto mesh = foliageMesh(context, count, first, baseVertex, false);
         if (copiesStandIn(*gpu, mesh))
@@ -4825,7 +4984,7 @@ void captureDraw(ID3D11DeviceContext* context, std::uint32_t count, std::uint32_
         }
     }
     const auto key = drawKey(context, count, instances, first, baseVertex, firstInstance, indexed);
-    const auto object = objectKey(*gpu, context, instances, firstInstance);
+    const auto object = objectKey(context, instances, firstInstance);
     if (!moving && cacheStandsIn(*gpu, object, key))
     {
         standIn(object, key, false);
@@ -4839,7 +4998,7 @@ void captureDraw(ID3D11DeviceContext* context, std::uint32_t count, std::uint32_
         const auto vertices = capture.opaqueVertices - firstVertex;
         offerToCache(object, key, firstVertex, vertices, NoMaterial, false, moving);
         // Foliage sways with the wind, drawn with velocity, but its instances stay put.
-        if (const auto foliage = foliageSource(context))
+        if (const auto foliage = offscreenGeometry ? foliageSource(context) : std::nullopt)
             recordFoliage(context, *foliage, foliageMesh(context, count, first, baseVertex, false), instances, firstInstance, firstVertex,
                 vertices, NoMaterial, false);
     }
@@ -4876,7 +5035,7 @@ bool draw(ID3D11DeviceContext* context, std::uint32_t count, std::uint32_t insta
 void present(ID3D11DeviceContext* context, ID3D11Texture2D* backBuffer) noexcept
 {
     const auto view = selected.load();
-    auto frame = std::exchange(capture, {});
+    auto& frame = capture;
     const auto now = ticksNow();
     const auto frameMilliseconds = lastPresent ? millisecondsSince(now - lastPresent) : 0.0f;
     lastPresent = now;
@@ -4915,6 +5074,9 @@ void present(ID3D11DeviceContext* context, ID3D11Texture2D* backBuffer) noexcept
         publishCosts();
     }
     catch (const std::exception& error) { fail(error.what()); }
+
+    // The draws until the next view begins are not captured.
+    capture.reset();
 }
 
 void release() noexcept

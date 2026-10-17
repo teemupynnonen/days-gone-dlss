@@ -320,6 +320,35 @@ void main(float4 position : SV_Position, float2 uv : TEXCOORD0, float fade : COL
     expect(cachedTriangle > Size * Size / 8 && ray_tracing::status().tracedCachedDraws > 0,
         "The triangle the view drew in earlier frames is still traced from the geometry cache.");
 
+    // Without the off-screen geometry the caches do no work: they are emptied, and the triangle the
+    // view draws is not cached. Back on, it is cached again, for the check below.
+    ray_tracing::Features onScreenOnly{};
+    onScreenOnly.offscreenGeometry = false;
+    ray_tracing::enable(onScreenOnly);
+    const auto triangleAlone = [&] { draw(vertexShader.Get(), depthState.Get(), 3); };
+    frame(triangleAlone);
+    const auto onScreenState = ray_tracing::status();
+    expect(!onScreenState.cachedDraws && !onScreenState.newCacheEntries, "Without the off-screen geometry nothing is cached.");
+    ray_tracing::enable({});
+    frame(triangleAlone);
+    expect(ray_tracing::status().newCacheEntries > 0, "With the off-screen geometry back on, the triangle is cached again.");
+
+    // An object that starts moving leaves the cache, or its copies would shadow where it was: once
+    // drawn with a velocity target, the triangle is gone from the sun rays' scene when not drawn.
+    const auto velocity = texture(device.Get(), DXGI_FORMAT_R16G16_UNORM, D3D11_BIND_RENDER_TARGET);
+    ComPtr<ID3D11RenderTargetView> velocityTarget;
+    check(device->CreateRenderTargetView(velocity.Get(), nullptr, &velocityTarget));
+    ID3D11RenderTargetView* movingTargets[]{gbuffer[0].Get(), gbuffer[1].Get(), velocityTarget.Get()};
+    frame([&]
+    {
+        draw(backgroundShader.Get(), depthState.Get(), 3);
+        context->OMSetRenderTargets(3, movingTargets, depthTarget.Get());
+        draw(vertexShader.Get(), depthState.Get(), 3);
+        context->OMSetRenderTargets(2, targets, depthTarget.Get());
+    });
+    expect(!nearer(frame(backgroundAlone)) && !ray_tracing::status().tracedCachedDraws,
+        "The triangle drawn with velocity is no longer traced from the geometry cache.");
+
     // Ambient occlusion: a floor 100 cm below the eye meets a wall 150 cm to its left. The G-buffer
     // carries Bend's octahedral normal, and stand-ins for Bend's occlusion passes carry their DXBC
     // checksums: the mask pass reads the normal, the game's occlusion is fully visible with marker
