@@ -234,11 +234,13 @@ float4 main(uint vertex : SV_VertexID) : SV_Position
 }
 )";
 
-// Adds the traced sun shadows to the game's resolved ones before lighting reads them. The target's
-// red channel holds the square root of the sun's visibility (lighting squares it and skips the sun
-// at 0); taking the lower visibility keeps the shadows the game sees and the trace misses (foliage,
-// off-screen casters). Surfaces facing away from the sun are left to the lighting's N.L. Writes red only.
-// With soft shadows the visibility comes filtered.
+// Adds the traced sun shadows to the game's resolved ones before lighting reads them. The target holds
+// the square root of the sun's visibility (lighting squares it and skips the sun at 0): in red for
+// most lighting models, in green for skin (model 3), whose resolve leaves red at 0 and whose lighting
+// reads only green. The other channel is written back as the game left it. Taking the lower
+// visibility keeps the shadows the game sees and the trace misses (foliage, off-screen casters).
+// Surfaces facing away from the sun are left to the lighting's N.L. With soft shadows the visibility
+// comes filtered.
 inline constexpr char Inject[] = R"(
 cbuffer RegionParameters : register(b0)
 {
@@ -248,14 +250,17 @@ cbuffer RegionParameters : register(b0)
 Texture2D<float4> Sun : register(t0);        // r: traced visibility, g: N.L
 Texture2D<float2> GameShadow : register(t1); // The game's target before this pass
 Texture2D<float4> Visibility : register(t2); // r: the visibility to use, Sun's own or filtered
+Texture2D<uint> Normals : register(t3);      // The lighting model in bits 28 to 31
 
 float4 main(float4 position : SV_Position) : SV_Target
 {
     int2 local = int2(position.xy) - RenderOrigin;
     if (any(local < 0) || any(local >= int2(Size))) discard;
     if (Sun.Load(int3(local, 0)).g <= 0) discard;
-    float game = GameShadow.Load(int3(position.xy, 0)).x;
-    return float4(sqrt(min(game * game, saturate(Visibility.Load(int3(local, 0)).r))), 0, 0, 0);
+    float2 game = GameShadow.Load(int3(position.xy, 0));
+    float2 shadowed = sqrt(min(game * game, saturate(Visibility.Load(int3(local, 0)).r)));
+    bool skin = Normals.Load(int3(local, 0)) >> 28 == 3;
+    return float4(skin ? float2(game.x, shadowed.y) : float2(shadowed.x, game.y), 0, 0);
 }
 )";
 

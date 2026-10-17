@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Ray-traced sun shadows now fall on skin (faces, hands), not only on clothes. Bend keeps skin's
+  sun shadow in another channel of its shadow texture, which the traced shadows did not write.
 - Fix fallen branches, some road pieces and other repeated static meshes losing their ray-traced
   shadows and ambient occlusion with **Off-screen objects and trees** on: one cached copy stood in
   for every copy of the mesh, so the rest went missing from the traced scene.
