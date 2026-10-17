@@ -382,9 +382,12 @@ is read when it changes, with or without DLSS, overrides them without saving the
   each with its own bottom-level structure (`PREFER_FAST_TRACE`) in rings of vertices,
   coordinates and structures that evict the oldest. A draw is identified by the static constant
   buffers its vertex shader declares (the primitive's own; per-draw constants are dynamic) and its
-  instances; draws with a velocity target move and are never cached. An object that starts moving
-  leaves the cache, and a moving one not drawn for 1800 frames (about a minute) is forgotten, since
-  the game reuses its buffers' addresses for other objects. Cached draws the view did not draw this
+  instances; draws with a velocity target move and are never cached. Bend places some static meshes,
+  such as fallen branches, by per-draw constants instead, so all their copies share one key; with
+  one copy cached for all of them, the others went missing from the trace. An object the view draws
+  twice with the same draw in a frame is therefore kept out of the cache like a moving one. An
+  object that starts moving or repeats leaves the cache, and one not drawn for 1800 frames (about a
+  minute) is forgotten, since the game reuses its buffers' addresses for other objects. Cached draws the view did not draw this
   frame are traced with mask 2. A static draw the cache already holds is not captured
   again: its entry stands in for it, traced with masks 1 and 2, and the rebuild leaves it out. The
   cache also stands in for the shadow casters of an object it holds whole: every draw the view last

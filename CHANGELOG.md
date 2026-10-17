@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Fix fallen branches, some road pieces and other repeated static meshes losing their ray-traced
+  shadows and ambient occlusion with **Off-screen objects and trees** on: one cached copy stood in
+  for every copy of the mesh, so the rest went missing from the traced scene.
 - Hand DLSS an exposure texture (a constant 1: the colour it upscales is already tone-mapped).
   Add-ons that follow the evaluation can read it; OptiScaler's DLSS 5 neural rendering takes its
   white point from it instead of reporting that the game supplies no exposure, and OptiScaler no

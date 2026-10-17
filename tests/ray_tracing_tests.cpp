@@ -349,6 +349,51 @@ void main(float4 position : SV_Position, float2 uv : TEXCOORD0, float fade : COL
     expect(!nearer(frame(backgroundAlone)) && !ray_tracing::status().tracedCachedDraws,
         "The triangle drawn with velocity is no longer traced from the geometry cache.");
 
+    // Bend places some static meshes, such as fallen branches, by per-draw constants: the same draw
+    // with the same static constants at two places, which the object key cannot tell apart. The cache
+    // holds one of them, so it must not stand in for the view's draws: both stay where the view drew
+    // them.
+    const auto copyCode = compile(R"(
+cbuffer View : register(b0) { row_major float4x4 ClipFromWorld; };
+cbuffer Placement : register(b1) { float4 Offset; };
+cbuffer Mesh : register(b2) { float4 Extent; };
+float4 main(uint vertex : SV_VertexID) : SV_Position
+{
+    float2 corner = float2(vertex == 1, vertex == 2) * Extent.xy;
+    return mul(float4(Offset.x + corner.x, corner.y - 100, 500, 1), ClipFromWorld);
+})");
+    ComPtr<ID3D11VertexShader> copyShader;
+    check(device->CreateVertexShader(copyCode->GetBufferPointer(), copyCode->GetBufferSize(), nullptr, &copyShader));
+    ray_tracing::vertexShaderCreated(copyCode->GetBufferPointer(), copyCode->GetBufferSize(), copyShader.Get());
+    const float extent[4]{200, 200};
+    D3D11_BUFFER_DESC constantDescription{16, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER};
+    const D3D11_SUBRESOURCE_DATA extentData{extent};
+    ComPtr<ID3D11Buffer> mesh, placement;
+    check(device->CreateBuffer(&constantDescription, &extentData, &mesh));
+    constantDescription.Usage = D3D11_USAGE_DYNAMIC;
+    constantDescription.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    check(device->CreateBuffer(&constantDescription, nullptr, &placement));
+    const auto copyAt = [&](float x)
+    {
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        check(context->Map(placement.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped));
+        const float offset[4]{x};
+        std::memcpy(mapped.pData, offset, sizeof(offset));
+        context->Unmap(placement.Get(), 0);
+        ID3D11Buffer* constants[]{placement.Get(), mesh.Get()};
+        context->VSSetConstantBuffers(1, 2, constants);
+        draw(copyShader.Get(), depthState.Get(), 3);
+    };
+    const auto twoCopies = [&]
+    {
+        copyAt(-300);
+        copyAt(100);
+    };
+    ray_tracing::select(ray_tracing::View::DepthComparison);
+    frame(twoCopies);
+    const auto copies = compare(frame(twoCopies), "Two copies of a mesh");
+    expect(copies[0] > Size * Size / 16 && copies[2] == 0, "Both copies of a mesh placed by per-draw constants are traced where the view drew them.");
+
     // Ambient occlusion: a floor 100 cm below the eye meets a wall 150 cm to its left. The G-buffer
     // carries Bend's octahedral normal, and stand-ins for Bend's occlusion passes carry their DXBC
     // checksums: the mask pass reads the normal, the game's occlusion is fully visible with marker
