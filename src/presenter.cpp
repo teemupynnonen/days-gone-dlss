@@ -7,16 +7,23 @@
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
+#include <MinHook.h>
 #include <reshade.hpp>
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdio>
+#include <cstring>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace days_gone_dlss::presenter
 {
@@ -27,8 +34,6 @@ using reshade::log::level;
 
 // ReShade's proxies return their native object for this interface (IID_UnwrappedObject).
 constexpr GUID UnwrappedObject{0x7f2c9a11, 0x3b4e, 0x4d6a, {0x81, 0x2f, 0x5e, 0x9c, 0xd3, 0x7a, 0x1b, 0x42}};
-// Where ReShade keeps a swap chain's colour space (SKID_SwapChainColorSpace); its runtime reads it there.
-constexpr GUID ColorSpaceData{0x18b57e4, 0x1493, 0x4953, {0xad, 0xf2, 0xde, 0x6d, 0x99, 0xcc, 0x5, 0xe5}};
 // IDXGIFactory2::CreateSwapChainForHwnd in the factory's virtual function table.
 constexpr std::size_t CreateSwapChainForHwndSlot = 15;
 // Command allocators in rotation; the swap chain lets at most three frames queue.
@@ -38,12 +43,13 @@ constexpr DWORD FenceTimeout = 10'000;
 using CreateSwapChainForHwnd = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory2* factory, IUnknown* device, HWND window,
     const DXGI_SWAP_CHAIN_DESC1* desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen, IDXGIOutput* output, IDXGISwapChain1** chain);
 
-FrameCallback onFrame{};
 std::filesystem::path addonDirectory;
 Route presentRoute{};
-// What the factory's slot held before ours: ReShade's hook.
-CreateSwapChainForHwnd nextCreate{};
+// DXGI's own CreateSwapChainForHwnd, past the detour.
+CreateSwapChainForHwnd originalCreate{};
 std::atomic<bool> presenting{};
+// From the add-on's present event to the stand-in's Present, on the presenting thread.
+std::optional<frame_generation::Inputs> submittedFrame;
 
 std::mutex statusMutex;
 std::string statusText; // Empty until install()
@@ -159,10 +165,6 @@ public:
     SwapChain(const SwapChain&) = delete;
     SwapChain& operator=(const SwapChain&) = delete;
 
-    // ReShade's overlay, drawn into the back buffer at each present. Recreated when the buffers change.
-    void createOverlay();
-    void destroyOverlay();
-
     // IUnknown
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void** object) override;
     ULONG STDMETHODCALLTYPE AddRef() override { return ++references; }
@@ -173,7 +175,7 @@ public:
     HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID name, const IUnknown* data) override { return chain->SetPrivateDataInterface(name, data); }
     HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID name, UINT* size, void* data) override { return chain->GetPrivateData(name, size, data); }
     HRESULT STDMETHODCALLTYPE GetParent(REFIID id, void** parent) override { return chain->GetParent(id, parent); }
-    HRESULT STDMETHODCALLTYPE GetDevice(REFIID id, void** device) override;
+    HRESULT STDMETHODCALLTYPE GetDevice(REFIID id, void** device) override { return device11->QueryInterface(id, device); }
 
     // IDXGISwapChain
     HRESULT STDMETHODCALLTYPE Present(UINT interval, UINT flags) override { return present(interval, flags); }
@@ -240,14 +242,13 @@ private:
 
     std::atomic<ULONG> references{1};
 
-    // Direct3D 11: the game's device as it passed it (ReShade's proxy), and the native one the add-on uses.
-    ComPtr<IUnknown> gameDevice;
+    // Direct3D 11, native: ReShade passes its proxy's device on unwrapped.
     ComPtr<ID3D11Device5> device11;
     ComPtr<ID3D11DeviceContext4> context11;
     ComPtr<ID3D11Fence> fence11;
 
-    // Direct3D 12, native: ReShade wraps the device it creates, and other add-ons would see this one as
-    // a game device. Streamline's proxies of the device and queue make its swap chain. The copies run
+    // Direct3D 12, native: a device ReShade wraps would show other add-ons a second game device.
+    // Streamline's proxies of the device and queue make its swap chain. The copies run
     // on a queue of their own: DLSS Frame Generation blocks the presenting queue while it works, and
     // Direct3D 11's next frame waits only for its copy, not for that. FSR generates on the queue it
     // presents from, after the copy and the preparation it needs, so for FSR that is the copy queue.
@@ -268,8 +269,6 @@ private:
     HWND window{};
     DXGI_SWAP_CHAIN_DESC1 desc{}; // As the game sees it
     DXGI_COLOR_SPACE_TYPE colorSpace{DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709};
-    reshade::api::effect_runtime* overlay{};
-    bool creatingOverlay{};
 
     // The game renders here; Direct3D 12 copies from its view of the same texture.
     ComPtr<ID3D11Texture2D> backBuffer;
@@ -279,7 +278,7 @@ private:
 
 SwapChain::SwapChain(IDXGIFactory2* factory, IUnknown* device, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1& requested,
     const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen, IDXGIOutput* output)
-    : gameDevice(device), window(hwnd), desc(requested)
+    : window(hwnd), desc(requested)
 {
     device11 = unwrapped<ID3D11Device5>(device);
     if (!device11) throw std::runtime_error("The game's device lacks Direct3D 11.4.");
@@ -343,7 +342,6 @@ SwapChain::SwapChain(IDXGIFactory2* factory, IUnknown* device, HWND hwnd, const 
 
 SwapChain::~SwapChain()
 {
-    destroyOverlay();
     try { waitIdle(); }
     catch (const Failure& failure) { logFailure(failure); }
 
@@ -359,26 +357,6 @@ SwapChain::~SwapChain()
     if (presentRoute == Route::Streamline) frame_generation::stop();
     presenting = false;
     setStatus(level::info, "The game released its swap chain.");
-}
-
-void SwapChain::createOverlay()
-{
-    // ReShade's runtime wants the device the swap chain reports; it gets the native one, as for the
-    // swap chains ReShade hooks itself.
-    char base[MAX_PATH]{};
-    auto size = sizeof(base);
-    reshade::get_reshade_base_path(base, &size);
-    const auto config = std::string(base) + "\\ReShade.ini";
-    creatingOverlay = true;
-    const bool created = reshade::create_effect_runtime(reshade::api::device_api::d3d11, device11.Get(), context11.Get(),
-        static_cast<IDXGISwapChain*>(this), config.c_str(), &overlay);
-    creatingOverlay = false;
-    if (!created) reshade::log::message(level::error, "Days Gone DLSS: ReShade could not draw its overlay on the game's frames.");
-}
-
-void SwapChain::destroyOverlay()
-{
-    if (overlay) reshade::destroy_effect_runtime(std::exchange(overlay, nullptr));
 }
 
 HRESULT SwapChain::QueryInterface(REFIID id, void** object)
@@ -402,11 +380,6 @@ ULONG SwapChain::Release()
     const auto left = --references;
     if (!left) delete this;
     return left;
-}
-
-HRESULT SwapChain::GetDevice(REFIID id, void** device)
-{
-    return creatingOverlay ? device11->QueryInterface(id, device) : gameDevice->QueryInterface(id, device);
 }
 
 HRESULT SwapChain::GetBuffer(UINT index, REFIID id, void** surface)
@@ -477,13 +450,7 @@ HRESULT SwapChain::GetLastPresentCount(UINT* count)
 HRESULT SwapChain::SetColorSpace1(DXGI_COLOR_SPACE_TYPE space)
 {
     const auto result = chain->SetColorSpace1(space);
-    if (FAILED(result) || space == colorSpace) return result;
-
-    // ReShade's overlay reads the colour space when it starts, as for a resize.
-    colorSpace = space;
-    destroyOverlay();
-    chain->SetPrivateData(ColorSpaceData, sizeof(space), &space);
-    createOverlay();
+    if (SUCCEEDED(result)) colorSpace = space;
     return result;
 }
 
@@ -491,8 +458,7 @@ HRESULT SwapChain::ResizeBuffers(UINT count, UINT width, UINT height, DXGI_FORMA
 {
     try
     {
-        // Direct3D 12 resizes only once nothing uses the old buffers, ReShade's overlay included.
-        destroyOverlay();
+        // Direct3D 12 resizes only once nothing uses the old buffers. ReShade has released its own.
         waitIdle();
         if (presentRoute == Route::Fsr) fsr_frame_generation::release();
         backBuffer.Reset();
@@ -510,7 +476,6 @@ HRESULT SwapChain::ResizeBuffers(UINT count, UINT width, UINT height, DXGI_FORMA
         }
         // The game gets a back buffer either way, at the old size when resizing failed.
         createBackBuffer();
-        createOverlay();
         return result;
     }
     catch (const Failure& failure)
@@ -525,8 +490,8 @@ HRESULT SwapChain::present(UINT interval, UINT flags)
     // A test present only asks whether the window is visible; nothing was rendered for it.
     if (flags & DXGI_PRESENT_TEST) return chain->Present(interval, flags);
 
-    const auto inputs = onFrame ? onFrame(backBuffer.Get()) : frame_generation::Inputs{};
-    if (overlay) reshade::update_and_present_effect_runtime(overlay);
+    // ReShade has drawn its overlay by now, after the add-on's present event submitted the frame.
+    const auto inputs = std::exchange(submittedFrame, std::nullopt).value_or(frame_generation::Inputs{});
     try { copyFrame(inputs); }
     catch (const Failure& failure)
     {
@@ -636,6 +601,54 @@ void SwapChain::waitFor(UINT64 value)
         throw Failure("Direct3D 12 did not finish a frame within 10 seconds.", DXGI_ERROR_DEVICE_HUNG);
 }
 
+// DXGI's own function behind an entry of its factories' function table. Some setups replace the entry
+// in memory (ReShade does when Ubisoft's overlay is loaded) and call the function it held, so it is
+// read from the entry in dxgi.dll's file and relocated to where dxgi.dll is loaded.
+void* originalEntry(void* const* slot)
+{
+    HMODULE module{};
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCWSTR>(slot), &module))
+        throw std::runtime_error("Finding the module that holds DXGI's function table failed.");
+    wchar_t path[MAX_PATH]{};
+    if (!GetModuleFileNameW(module, path, MAX_PATH)) throw std::runtime_error("Finding dxgi.dll's file failed.");
+
+    std::ifstream file(path, std::ios::binary);
+    const std::vector<char> image((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    const auto read = [&](std::size_t offset, auto& value)
+    {
+        if (offset > image.size() || image.size() - offset < sizeof(value)) throw std::runtime_error("dxgi.dll's file is shorter than its headers say.");
+        std::memcpy(&value, image.data() + offset, sizeof(value));
+    };
+    IMAGE_DOS_HEADER dos{};
+    IMAGE_NT_HEADERS64 nt{};
+    read(0, dos);
+    read(static_cast<std::size_t>(dos.e_lfanew), nt);
+    const auto base = reinterpret_cast<std::uintptr_t>(module);
+    const auto* loaded = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + reinterpret_cast<const IMAGE_DOS_HEADER*>(module)->e_lfanew);
+    if (dos.e_magic != IMAGE_DOS_SIGNATURE || nt.Signature != IMAGE_NT_SIGNATURE
+        || nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC || nt.FileHeader.TimeDateStamp != loaded->FileHeader.TimeDateStamp)
+        throw std::runtime_error("dxgi.dll's file is not the one loaded.");
+
+    const auto rva = reinterpret_cast<std::uintptr_t>(slot) - base;
+    const auto sections = static_cast<std::size_t>(dos.e_lfanew) + offsetof(IMAGE_NT_HEADERS64, OptionalHeader) + nt.FileHeader.SizeOfOptionalHeader;
+    for (WORD i = 0; i < nt.FileHeader.NumberOfSections; ++i)
+    {
+        IMAGE_SECTION_HEADER section{};
+        read(sections + i * sizeof(section), section);
+        if (rva < section.VirtualAddress || rva + sizeof(std::uint64_t) > section.VirtualAddress + section.SizeOfRawData) continue;
+
+        std::uint64_t stored{};
+        read(section.PointerToRawData + (rva - section.VirtualAddress), stored);
+        const auto entry = static_cast<std::uintptr_t>(stored - nt.OptionalHeader.ImageBase) + base;
+        if (entry < base || entry >= base + loaded->OptionalHeader.SizeOfImage) break;
+
+        return reinterpret_cast<void*>(entry);
+    }
+    throw std::runtime_error("DXGI's CreateSwapChainForHwnd is not in dxgi.dll's file.");
+}
+
+// Behind ReShade: ReShade wraps what this returns as the game's swap chain.
 HRESULT STDMETHODCALLTYPE createSwapChainForHwnd(IDXGIFactory2* factory, IUnknown* device, HWND window, const DXGI_SWAP_CHAIN_DESC1* desc,
     const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen, IDXGIOutput* output, IDXGISwapChain1** chain)
 {
@@ -643,7 +656,7 @@ HRESULT STDMETHODCALLTYPE createSwapChainForHwnd(IDXGIFactory2* factory, IUnknow
     // other while it lives, pass on.
     ComPtr<ID3D11Device> game;
     if (presenting || !device || !desc || !chain || FAILED(device->QueryInterface(IID_PPV_ARGS(&game))))
-        return nextCreate(factory, device, window, desc, fullscreen, output, chain);
+        return originalCreate(factory, device, window, desc, fullscreen, output, chain);
 
     // Without frame generation the game's own swap chain does the same job without the copy.
     const bool fsr = presentRoute == Route::Fsr;
@@ -655,7 +668,7 @@ HRESULT STDMETHODCALLTYPE createSwapChainForHwnd(IDXGIFactory2* factory, IUnknow
     if (!started)
     {
         setStatus(level::warning, "Frame generation did not start: " + (fsr ? fsr_frame_generation::status() : frame_generation::status()));
-        return nextCreate(factory, device, window, desc, fullscreen, output, chain);
+        return originalCreate(factory, device, window, desc, fullscreen, output, chain);
     }
     SwapChain* created{};
     try
@@ -667,9 +680,8 @@ HRESULT STDMETHODCALLTYPE createSwapChainForHwnd(IDXGIFactory2* factory, IUnknow
         if (fsr) fsr_frame_generation::stop();
         else frame_generation::stop();
         setStatus(level::warning, std::string("Frame generation did not start: ") + error.what());
-        return nextCreate(factory, device, window, desc, fullscreen, output, chain);
+        return originalCreate(factory, device, window, desc, fullscreen, output, chain);
     }
-    created->createOverlay();
     *chain = created;
     presenting = true;
     setStatus(level::info, "Presenting through Direct3D 12 for frame generation.");
@@ -677,33 +689,40 @@ HRESULT STDMETHODCALLTYPE createSwapChainForHwnd(IDXGIFactory2* factory, IUnknow
 }
 }
 
-void install(FrameCallback frame, const std::filesystem::path& directory, Route route) noexcept
+void install(const std::filesystem::path& directory, Route route) noexcept
 {
     static bool installed{};
     if (std::exchange(installed, true)) return;
 
-    onFrame = frame;
     addonDirectory = directory;
     presentRoute = route;
     try
     {
-        // DXGI's factories share one function table, which ReShade has hooked by now. Taking the slot
-        // over puts this hook in front of ReShade's.
-        ComPtr<IDXGIFactory2> factory;
-        check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)), "Creating a DXGI factory");
-        auto* slot = &(*reinterpret_cast<void***>(factory.Get()))[CreateSwapChainForHwndSlot];
-        DWORD protection{};
-        if (!VirtualProtect(slot, sizeof(*slot), PAGE_READWRITE, &protection))
-            throw std::runtime_error("Making the DXGI factory's function table writable failed.");
-        nextCreate = reinterpret_cast<CreateSwapChainForHwnd>(*slot);
-        *slot = reinterpret_cast<void*>(&createSwapChainForHwnd);
-        VirtualProtect(slot, sizeof(*slot), protection, &protection);
+        // ReShade gives the game proxies of DXGI's factories, which call the real factories' shared
+        // function table. Detouring DXGI's function behind that table puts this hook behind ReShade, so
+        // ReShade wraps the stand-in as it would the game's own swap chain: its overlay, effects and
+        // add-on events see a Direct3D 11 game, which add-ons such as RenoDX's DLSS 5 need to follow DLSS.
+        ComPtr<IDXGIFactory2> proxy;
+        check(CreateDXGIFactory1(IID_PPV_ARGS(&proxy)), "Creating a DXGI factory");
+        const auto factory = unwrapped<IDXGIFactory2>(proxy.Get());
+        if (!factory) throw std::runtime_error("The DXGI factory lacks IDXGIFactory2.");
+        auto* target = originalEntry(&(*reinterpret_cast<void***>(factory.Get()))[CreateSwapChainForHwndSlot]);
+        auto status = MH_Initialize();
+        if (status == MH_ERROR_ALREADY_INITIALIZED) status = MH_OK;
+        if (status == MH_OK) status = MH_CreateHook(target, reinterpret_cast<void*>(&createSwapChainForHwnd), reinterpret_cast<void**>(&originalCreate));
+        if (status == MH_OK) status = MH_EnableHook(target);
+        if (status != MH_OK) throw std::runtime_error(std::string("Hooking DXGI's CreateSwapChainForHwnd failed: ") + MH_StatusToString(status) + ".");
         setStatus(level::info, "Waiting for the game's swap chain.");
     }
     catch (const std::exception& error)
     {
         setStatus(level::error, std::string("Frame generation did not start: ") + error.what());
     }
+}
+
+void submit(const frame_generation::Inputs& inputs) noexcept
+{
+    submittedFrame = inputs;
 }
 
 bool active() noexcept

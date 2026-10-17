@@ -202,11 +202,12 @@ frame_generation::Inputs frame(ID3D11Texture2D* backBuffer)
 void onPresent(command_queue*, swapchain* chain, const rect*, const rect*, uint32_t, const rect*)
 {
     // Other add-ons can present their own swap chains; count only the game's frames. Through
-    // Direct3D 12, the presenter reports them instead.
+    // Direct3D 12 the game's swap chain is the presenter's stand-in, which hands the frame on.
     if (chain->get_device()->get_api() != device_api::d3d11
         || (nativeDevice && reinterpret_cast<ID3D11Device*>(chain->get_device()->get_native()) != nativeDevice))
         return;
-    frame(reinterpret_cast<ID3D11Texture2D*>(chain->get_current_back_buffer().handle));
+    const auto inputs = frame(reinterpret_cast<ID3D11Texture2D*>(chain->get_current_back_buffer().handle));
+    if (presenter::active()) presenter::submit(inputs);
 }
 
 // F9 switches the ray-traced features off and on, for A/B comparison with the overlay closed.
@@ -302,7 +303,7 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon, HMODULE reshadeMo
     const auto settings = startupSettings();
     upscaler::armRayTracing(settings.rayTracing);
     if (const auto mode = settings.frameGeneration; mode != upscaler::FrameGeneration::Off)
-        presenter::install(frame, dataDirectory(), mode == upscaler::FrameGeneration::Fsr ? presenter::Route::Fsr : presenter::Route::Streamline);
+        presenter::install(dataDirectory(), mode == upscaler::FrameGeneration::Fsr ? presenter::Route::Fsr : presenter::Route::Streamline);
     reshade::register_event<reshade::addon_event::init_command_queue>(onInitCommandQueue);
     reshade::register_event<reshade::addon_event::destroy_command_queue>(onDestroyCommandQueue);
     reshade::register_event<reshade::addon_event::init_pipeline>(onInitPipeline);
