@@ -250,8 +250,8 @@ float4 main(float4 position : SV_Position) : SV_Target
 
 // Combines the traced ambient occlusion with the game's own for its blur: of each corner's 6-bit
 // visibility the lower of the two, with the depth Bend keeps in the top bytes. The game's gives the
-// near contact the trees' copies leave out (they occlude from 30 cm), such as grass on the ground; the
-// trace adds what the screen does not hold. The trace leaves the corners it skips fully visible, so
+// near contact the trees' copies leave out on foliage (they occlude it from 30 cm); the trace adds
+// what the screen does not hold. The trace leaves the corners it skips fully visible, so
 // the game's stay there. Texels outside the view keep the game's.
 inline constexpr char AmbientPack[] = R"(
 cbuffer RegionParameters : register(b0)
@@ -309,6 +309,29 @@ void main(uint2 pixel : SV_DispatchThreadID)
     float3 color = float3(packed.x & 255, packed.x >> 8 & 255, packed.x >> 16 & 255) / 255;
     float diffuse = model == 1 ? 1 - (packed.y & 255) / 255.0 : 1;
     Albedo[pixel] = model >= 1 && model <= 3 ? float4(color * color * diffuse, 1) : 0;
+}
+)";
+
+// Copies the game's G-buffer normal over the view into the texture shared with D3D12, the normal in
+// bits 0 to 19 and the lighting model, the stencil's low 4 bits, in bits 28 to 31: rays keep the
+// trees' copies off foliage's own leaves (ray_tracing_scene.hlsli). 0 stays 0, unknown.
+inline constexpr char GameNormals[] = R"(
+cbuffer RegionParameters : register(b0)
+{
+    int2 RenderOrigin;
+    uint2 Size;
+};
+Texture2D<uint> GBuffer : register(t0);  // Bend's second G-buffer target
+Texture2D<uint2> Stencil : register(t1); // y: the stencil
+RWTexture2D<uint> Normals : register(u0);
+
+[numthreads(8, 8, 1)]
+void main(uint2 pixel : SV_DispatchThreadID)
+{
+    if (any(pixel >= Size)) return;
+    int3 texel = int3(int2(pixel) + RenderOrigin, 0);
+    uint normal = GBuffer.Load(texel) & 0xfffff;
+    Normals[pixel] = normal ? normal | (Stencil.Load(texel).y & 15) << 28 : 0;
 }
 )";
 

@@ -6,8 +6,8 @@
 // game's surface into the part of the hemisphere nearest its corner, and occluders within a radius
 // count more the nearer they are. The top bytes hold Bend's depth; Direct3D 11 fills them in.
 // Direct3D 11 also keeps, per corner, the lower of this and the game's own: the game's screen-space
-// occlusion gives the near contact the trees' copies leave out (CopyDistance), such as grass on the
-// ground, and the rays add what the screen does not hold.
+// occlusion gives the near contact the trees' copies leave out on foliage (CopiesFrom), and the rays
+// add what the screen does not hold.
 #define AmbientRootSignature "RootConstants(num32BitConstants=22, b0), SRV(t0), SRV(t7), SRV(t8), SRV(t9), " \
     "DescriptorTable(SRV(t3, numDescriptors=4), UAV(u0))"
 
@@ -38,8 +38,6 @@ static const float3 Corners[4] = { float3(-1, -1, 1), float3(1, -1, 1), float3(-
 // take away light the game's ambient lighting already gets from the surroundings, such as the
 // ground below a wall.
 static const float Radius = 100, RadiusPerDistance = 0.025;
-// The trees' copies count from 30 cm plus 0.2% of the view distance on, as for sun rays.
-static const float CopyDistance = 30, CopyDistancePerDistance = 2e-3;
 
 float3 Unproject(float2 screen, float depth)
 {
@@ -72,9 +70,9 @@ float3 CosineDirection(float3 normal, float2 random)
 // geometry off screen (2) occlude from the start: a wall just outside the view still darkens the
 // corner beside it, which the screen-space occlusion cannot see. The trees' copies (mask 4) stand in
 // for most of the view's foliage but keep the wind of the frame their template came from, so they
-// occlude from `copyDistance` on: a leaf is not occluded by its own copy. The shadow casters are the
-// sun shadow map's coarser level of detail, placed from the map, and stand off the surfaces they
-// double by more than these short rays allow.
+// occlude from `copyDistance` on (CopiesFrom). The shadow casters are the sun shadow map's coarser
+// level of detail, placed from the map, and stand off the surfaces they double by more than these
+// short rays allow.
 float Visibility(float3 start, float3 direction, float radius, float copyDistance)
 {
     RayDesc ray;
@@ -158,7 +156,7 @@ void main(uint2 pixel : SV_DispatchThreadID, uint2 local : SV_GroupThreadID)
         float bias = 0.5 + viewDistance * 1e-3;
         start = position + (normal + (eye - position) / viewDistance) * bias;
         radius = Radius + RadiusPerDistance * viewDistance;
-        copyDistance = CopyDistance + CopyDistancePerDistance * viewDistance;
+        copyDistance = CopiesFrom(packedNormal, viewDistance);
         for (uint pair = 0; pair < 4; ++pair)
             if (traced >> pair & 1) corners[pair] = CornerVisibility(sides, pair, normal, start, radius, copyDistance, seed);
     }

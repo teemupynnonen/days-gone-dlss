@@ -232,10 +232,12 @@ void main(uint2 pixel : SV_DispatchThreadID)
     float2 screen = (pixel + 0.5) / Size * float2(2, -2) + float2(-1, 1);
     float3 surface = Unproject(screen, depth);
     // The translated world has the camera at its origin. Float precision falls with distance, so rays
-    // start further off the surface, as sun rays do; the trees' copies only occlude from `near`.
+    // start further off the surface, as sun rays do; the trees' copies only occlude from `near`
+    // (CopiesFrom).
     float distance = length(surface);
     float bias = 0.5 + distance * 1e-3;
-    float near = 30 + distance * 2e-3;
+    uint packedNormal = Normals[pixel];
+    float near = CopiesFrom(packedNormal, distance);
     uint seed = Hash(pixel.x + Hash(pixel.y + Hash(Frame * 2)));
     for (uint i = 0; i < LightCount; ++i)
     {
@@ -251,6 +253,5 @@ void main(uint2 pixel : SV_DispatchThreadID)
     Unshadowed[pixel] = float4(unshadowed, 0);
     if (!(Flags & Bounce)) return;
 
-    uint packedNormal = Normals[pixel];
     Bounced[pixel] = packedNormal ? float4(BouncedLight(pixel, surface, DecodeNormal(packedNormal)), 1) : 0;
 }

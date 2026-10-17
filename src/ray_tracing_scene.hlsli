@@ -104,3 +104,17 @@ float3 DecodeNormal(uint packed)
     if (normal.z < 0) normal.xy = (1 - abs(normal.yx)) * select(normal.xy >= 0, 1.0, -1.0);
     return normalize(normal);
 }
+
+// Bend lights leaves and grass with lighting model 2, which the game's normals carry in bits 28 to 31
+// (GameNormals); the ground and most other surfaces are model 1.
+static const uint FoliageModel = 2;
+
+// Where rays from a pixel start seeing the trees' copies. Foliage sways with the wind, but its copies
+// keep the pose of their template's frame, so rays from foliage see them only from 30 cm plus 0.2% of
+// the view distance on: a leaf is not shadowed by its own copy. Rays from other surfaces see them from
+// the start, or leaf litter and grass would shadow nothing within that distance of the ground under
+// them.
+float CopiesFrom(uint packedNormal, float viewDistance)
+{
+    return packedNormal >> 28 == FoliageModel ? 30 + viewDistance * 2e-3 : 0;
+}

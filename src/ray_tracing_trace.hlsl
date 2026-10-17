@@ -58,11 +58,11 @@ float3 Unproject(float2 screen, float depth)
 
 // 1 where no captured geometry of the given instances lies between the point and the sun along
 // `direction`. The instanced foliage (mask 4) repeats the trees on screen, wind and level of detail
-// aside, so it only occludes from `near` on: its copy of a tree never shadows that tree's own leaves.
-float TraceSun(float3 start, float3 direction, uint mask, float near)
+// aside, so it only occludes from `copies` on (CopiesFrom).
+float TraceSun(float3 start, float3 direction, uint mask, float copies)
 {
     if (Occluded(start, direction, mask & 11, 0, 1e30)) return 0;
-    return (mask & 4) && Occluded(start, direction, 4, near, 1e30) ? 0 : 1;
+    return (mask & 4) && Occluded(start, direction, 4, copies, 1e30) ? 0 : 1;
 }
 
 // Toward the sun's centre, or with soft shadows a point on its disc that varies by pixel and frame.
@@ -176,11 +176,11 @@ void main(uint2 pixel : SV_DispatchThreadID)
     else start = surface + (known ? normal : Sun.xyz) * bias;
     float lit = known ? dot(normal, Sun.xyz) : 1;
     // Shadows of geometry that only the view's capture holds go when it leaves the view. A caster
-    // closer to the pixel than the foliage's `near` leaves the view with it, bar the screen's edges,
-    // so the check keeps the view's geometry that close.
-    float near = 30 + viewDistance * 2e-3;
-    float offscreen = OffscreenCheck && !Occluded(start, Sun.xyz, 1, 0, near) ? TraceSun(start, Sun.xyz, 14, near) : 0;
-    float visible = TraceSun(start, SunDirection(pixel), 15, near);
+    // within 30 cm plus 0.2% of the view distance leaves the view with the pixel, bar the screen's
+    // edges, so the check keeps the view's geometry that close.
+    float near = 30 + viewDistance * 2e-3, copies = CopiesFrom(packedNormal, viewDistance);
+    float offscreen = OffscreenCheck && !Occluded(start, Sun.xyz, 1, 0, near) ? TraceSun(start, Sun.xyz, 14, copies) : 0;
+    float visible = TraceSun(start, SunDirection(pixel), 15, copies);
     SunOutput[pixel] = float4(visible, lit, known, offscreen);
     if (SoftShadows) SunVisibility[pixel] = float4(visible.xxx, 1);
 }

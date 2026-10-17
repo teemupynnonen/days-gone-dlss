@@ -372,7 +372,7 @@ struct Capture
     UINT opaqueVertices{}, maskedVertices{};
     unsigned basePassDraws{}, capturedDraws{}, maskedDraws{}, unbakedDraws{}, backgroundDraws{}, unknownShaderDraws{}, unsupportedDraws{},
         overCapacityDraws{}, casterDraws{}, repeatedCasterDraws{};
-    unsigned movingDraws{}, anonymousDraws{}; // Captured draws not cached: drawn with velocity, or not told apart
+    unsigned movingDraws{}, anonymousDraws{}; // Captured draws not cached: moving or repeated, or not told apart
     unsigned copiedFoliageDraws{}; // Foliage draws left to the trees' copies, not captured
     unsigned standInDraws{}; // Static draws left to the geometry cache, not captured
     // Shadow casters follow the view's geometry in both ranges, in runs by shadow map (0 is the far
@@ -394,6 +394,7 @@ struct Capture
     DXGI_FORMAT shadowFormat{};
     std::unordered_set<std::uint64_t> maskedMeshes; // drawKey of the alpha-tested depth-only draws
     std::unordered_set<std::uint64_t> capturedKeys; // drawKey of the draws captured so far this frame
+    std::unordered_set<std::uint64_t> viewDraws;    // cacheKey of the view's draws so far this frame
     std::vector<GeometryCache::Draw> cacheDraws;    // The view's static draws
     std::vector<GeometryCache::Draw> templateDraws; // Foliage templates offered this frame
     // Foliage draws and their visible instance lists, staged at `staged` in the frame's readback.
@@ -433,6 +434,7 @@ struct Capture
         keepStorage(fresh.transformDraws, transformDraws);
         keepStorage(fresh.maskedMeshes, maskedMeshes);
         keepStorage(fresh.capturedKeys, capturedKeys);
+        keepStorage(fresh.viewDraws, viewDraws);
         keepStorage(fresh.cacheDraws, cacheDraws);
         keepStorage(fresh.templateDraws, templateDraws);
         keepStorage(fresh.foliageDraws, foliageDraws);
@@ -605,6 +607,8 @@ struct Gpu
     ComPtr<ID3D11Texture2D> normals;
     ComPtr<ID3D11ShaderResourceView> normalsView;
     ComPtr<ID3D11UnorderedAccessView> normalsAccess;
+    ComPtr<ID3D11ShaderResourceView> normalsSourceView, stencilView; // Of the game's textures
+    ComPtr<ID3D11ComputeShader> normalsShader;
     bool normalsKnown{}; // This frame's are copied
     ID3D11Resource* depthResource{}; // The game's depth texture behind depthView
     ComPtr<ID3D11Texture2D> shadowCopy; // The game's sun shadow as its resolve passes left it
@@ -662,8 +666,10 @@ struct Gpu
     ComPtr<ID3D12Resource> cacheTable; // Per frame in flight: the traced cached draws' coordinates and slots
     std::unique_ptr<GeometryCache> cache, templates;
     bool cacheReset{}; // The coverage atlas started again; cached slots are stale
-    std::unordered_map<std::uint64_t, UINT64> movers; // Objects drawn with velocity, by the frame last drawn in: never cached
-    std::unordered_set<std::uint64_t> newMovers;      // Started moving since the last trace, which evicts their cached entries
+    // Objects drawn with velocity or drawn twice in a frame (drawnBefore), by the frame last drawn in:
+    // never cached.
+    std::unordered_map<std::uint64_t, UINT64> movers;
+    std::unordered_set<std::uint64_t> newMovers;      // Movers since the last trace, which evicts their cached entries
     // Foliage: per transform buffer its transforms, the meshes each instance was last drawn with, and
     // the trees near the camera or seen lately with their sections placed; per mesh the cached template,
     // the instance it shows and the reference the trees were last placed by; the visible lists of every
@@ -1586,6 +1592,9 @@ std::unique_ptr<Gpu> create(ID3D11DeviceContext* context)
     code = compile(shaders::BakeCopy, "ray-tracing-bake-copy", "cs_5_0");
     check(g.device->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, g.bakeCopyShader.GetAddressOf()),
         "Creating the coverage copy shader");
+    code = compile(shaders::GameNormals, "ray-tracing-game-normals", "cs_5_0");
+    check(g.device->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, g.normalsShader.GetAddressOf()),
+        "Creating the normals copy shader");
     code = compile(shaders::FullScreen, "ray-tracing-full-screen", "vs_5_0");
     check(g.device->CreateVertexShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, g.fullScreenShader.GetAddressOf()),
         "Creating the full-screen shader");
@@ -1741,33 +1750,6 @@ void ensureTraced(Gpu& g, UINT width, UINT height)
     g.d3d12->CreateUnorderedAccessView(g.sunSoft12.Get(), nullptr, nullptr, handle);
     g.tracedWidth = width;
     g.tracedHeight = height;
-}
-
-// Copies the game's G-buffer normal over the view: the G-buffer's second target, so it does not
-// depend on the game's own ambient occlusion, or else the normal that occlusion pass read. Frames
-// without either (menus) clear it to 0, unknown.
-void prepareNormals(Gpu& g, const Capture& frame)
-{
-    const auto& source = frame.gbuffer[1] ? frame.gbuffer[1] : frame.normals;
-    ComPtr<ID3D11Texture2D> normals;
-    D3D11_TEXTURE2D_DESC description{};
-    if (source && SUCCEEDED(source.As(&normals))) normals->GetDesc(&description);
-    g.normalsKnown = (description.Format == DXGI_FORMAT_R32_UINT || description.Format == DXGI_FORMAT_R32_TYPELESS)
-        && description.Width >= static_cast<UINT>(frame.rect[2]) && description.Height >= static_cast<UINT>(frame.rect[3]);
-    if (!g.normalsKnown)
-    {
-        static bool reported{};
-        if (normals && !std::exchange(reported, true))
-            upscaler::log("The game's G-buffer normal is not an R32_UINT texture covering the view; ambient occlusion, bounced light and "
-                "soft light shadows are not traced, and sun rays take the traced normals.");
-        constexpr UINT unknown[4]{};
-        g.context->ClearUnorderedAccessViewUint(g.normalsAccess.Get(), unknown);
-        return;
-    }
-
-    const D3D11_BOX view{static_cast<UINT>(frame.rect[0]), static_cast<UINT>(frame.rect[1]), 0, static_cast<UINT>(frame.rect[2]),
-        static_cast<UINT>(frame.rect[3]), 1};
-    g.context->CopySubresourceRegion(g.normals.Get(), 0, 0, 0, 0, normals.Get(), 0, &view);
 }
 
 void readTimings(Gpu& g, UINT slot)
@@ -2364,6 +2346,39 @@ ID3D11ShaderResourceView* gameView(Gpu& g, ComPtr<ID3D11ShaderResourceView>& vie
         || FAILED(g.device->CreateShaderResourceView(texture.Get(), &readable, view.GetAddressOf())))
         return nullptr;
     return view.Get();
+}
+
+// Copies the game's G-buffer normal over the view with each pixel's lighting model (GameNormals): the
+// G-buffer's second target, so it does not depend on the game's own ambient occlusion, or else the
+// normal that occlusion pass read. Frames without either (menus) clear it to 0, unknown. Without the
+// stencil every lighting model reads as 0.
+void prepareNormals(Gpu& g, const Capture& frame, UINT width, UINT height)
+{
+    const auto& source = frame.gbuffer[1] ? frame.gbuffer[1] : frame.normals;
+    auto* normals = gameView(g, g.normalsSourceView, source.Get(), DXGI_FORMAT_R32_UINT, frame.rect);
+    g.normalsKnown = normals != nullptr;
+    if (!g.normalsKnown)
+    {
+        static bool reported{};
+        if (source && !std::exchange(reported, true))
+            upscaler::log("The game's G-buffer normal is not a readable R32_UINT texture covering the view; ambient occlusion, bounced "
+                "light and soft light shadows are not traced, and sun rays take the traced normals.");
+        constexpr UINT unknown[4]{};
+        g.context->ClearUnorderedAccessViewUint(g.normalsAccess.Get(), unknown);
+        return;
+    }
+
+    ID3D11ShaderResourceView* inputs[]{normals, gameView(g, g.stencilView, frame.depth.Get(), DXGI_FORMAT_UNKNOWN, frame.rect)};
+    const RegionConstants region{{frame.rect[0], frame.rect[1]}, {width, height}};
+    inOwnState(g, [&]
+    {
+        g.context->UpdateSubresource(g.regionConstants.Get(), 0, nullptr, &region, 0, 0);
+        g.context->CSSetShader(g.normalsShader.Get(), nullptr, 0);
+        g.context->CSSetConstantBuffers(0, 1, g.regionConstants.GetAddressOf());
+        g.context->CSSetShaderResources(0, static_cast<UINT>(std::size(inputs)), inputs);
+        g.context->CSSetUnorderedAccessViews(0, 1, g.normalsAccess.GetAddressOf(), nullptr);
+        g.context->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
+    });
 }
 
 // Copies the game's diffuse colours over the view for the bounce rays and the lights' bounce, when
@@ -3204,7 +3219,7 @@ bool trace(Gpu& g, const Capture& frame)
     ensureTraced(g, width, height);
     ensureBuildSpace(g, view, casters);
     g.timer->begin(g.context, Pass::Prepare);
-    prepareNormals(g, frame);
+    prepareNormals(g, frame, width, height);
     prepareAmbient(g, frame, width, height);
     prepareBounce(g, frame, width, height);
     auto* depth = gameDepth(g, frame.depth.Get());
@@ -3302,8 +3317,9 @@ bool trace(Gpu& g, const Capture& frame)
         g.foliageChanged = true;
     }
 
-    // Objects that started moving leave the cache: their copies would stay where they were seen. Once
-    // forgotten, an object is cached when drawn still and leaves again when it moves.
+    // Objects that started moving leave the cache: their copies would stay where they were seen. So do
+    // objects drawn twice in a frame, whose one copy would stand in for both. Once forgotten, an object
+    // is cached when drawn still and once, and leaves again when it moves or repeats.
     g.cache->evictObjects(g.newMovers);
     g.newMovers.clear();
     if (g.frames % MoverMemory == 0) std::erase_if(g.movers, [&](const auto& mover) { return g.frames - mover.second > MoverMemory; });
@@ -3558,6 +3574,15 @@ std::uint64_t objectKey(ID3D11DeviceContext* context, std::uint32_t instances, s
 // never cached: their copies would stay where they were seen.
 std::uint64_t cacheKey(std::uint64_t object, std::uint64_t draw) { return (object ^ draw) * 1099511628211ull; }
 
+// Whether the view already drew this draw of the object this frame. Bend places some static meshes,
+// such as fallen branches, by per-draw constants, which the object key leaves out: every copy has the
+// same key, and the cache would stand one copy in for all of them. Such an object is kept out of the
+// cache, as a moving one is.
+bool drawnBefore(std::uint64_t object, std::uint64_t draw)
+{
+    return object && !capture.viewDraws.insert(cacheKey(object, draw)).second;
+}
+
 // Whether the cache can stand in for a static draw, so the view need not capture it: it holds the
 // draw's geometry.
 bool cacheStandsIn(const Gpu& g, std::uint64_t object, std::uint64_t draw)
@@ -3586,8 +3611,8 @@ void offerToCache(std::uint64_t object, std::uint64_t draw, UINT first, UINT ver
     // offered: the shadow casters of the static objects the view drew are left to its capture.
     capture.viewObjects.insert(object);
 
-    // An object that starts moving leaves the cache: the trace evicts its entries, and its draws offered
-    // earlier in the frame go now.
+    // An object that starts moving, or is drawn twice (drawnBefore), leaves the cache: the trace evicts
+    // its entries, and its draws offered earlier in the frame go now.
     if (moving && g.movers.try_emplace(object).second)
     {
         g.newMovers.insert(object);
@@ -4654,7 +4679,7 @@ void logFrame(const Capture& frame)
     const auto state = status();
     char text[1536]{};
     std::snprintf(text, sizeof(text), "Ray tracing frame %llu: %u G-buffer draws, %u captured (%u alpha-tested, %u of them tiled, %u without coverage, %u materials), %u decals, sky or screen passes, "
-        "%u unknown shader, %u unsupported, %u over capacity; %u shadow casters (%u repeats skipped, %u left to the view, %u to the cache), %u cached draws (%u traced, %u standing in for the view; not cached: %u moving, %u anonymous), %u foliage instances from %u meshes (%u placed; %u draws left to them; %llu tree sections past %u not traced so far); %llu triangles; "
+        "%u unknown shader, %u unsupported, %u over capacity; %u shadow casters (%u repeats skipped, %u left to the view, %u to the cache), %u cached draws (%u traced, %u standing in for the view; not cached: %u moving or repeated, %u anonymous), %u foliage instances from %u meshes (%u placed; %u draws left to them; %llu tree sections past %u not traced so far); %llu triangles; "
         "%u shadow resolve draws, sun %s %.3f, %.3f, %.3f; traced shadows %s; traced ambient occlusion %s; traced global illumination %s; "
         "local lights %u traced, %u left to the game.",
         static_cast<unsigned long long>(tracedFrames), frame.basePassDraws, frame.capturedDraws, frame.maskedDraws,
@@ -4934,7 +4959,8 @@ void captureDraw(ID3D11DeviceContext* context, std::uint32_t count, std::uint32_
             }
         }
         const auto object = objectKey(context, instances, firstInstance);
-        if (cacheStandsIn(*gpu, object, key))
+        const bool repeated = drawnBefore(object, key);
+        if (!repeated && cacheStandsIn(*gpu, object, key))
         {
             standIn(object, key, true);
             return finish();
@@ -4946,7 +4972,7 @@ void captureDraw(ID3D11DeviceContext* context, std::uint32_t count, std::uint32_
             capture.capturedKeys.insert(key);
             const auto vertices = capture.maskedVertices - firstVertex;
             const auto slot = capture.materialDraws.back()[1];
-            offerToCache(object, key, firstVertex, vertices, slot, true, false);
+            offerToCache(object, key, firstVertex, vertices, slot, true, repeated);
             if (const auto foliage = offscreenGeometry ? foliageSource(context) : std::nullopt)
                 recordFoliage(context, *foliage, foliageMesh(context, count, first, baseVertex, true), instances, firstInstance, firstVertex,
                     vertices, slot, true);
@@ -4985,7 +5011,8 @@ void captureDraw(ID3D11DeviceContext* context, std::uint32_t count, std::uint32_
     }
     const auto key = drawKey(context, count, instances, first, baseVertex, firstInstance, indexed);
     const auto object = objectKey(context, instances, firstInstance);
-    if (!moving && cacheStandsIn(*gpu, object, key))
+    const bool repeated = drawnBefore(object, key);
+    if (!moving && !repeated && cacheStandsIn(*gpu, object, key))
     {
         standIn(object, key, false);
         return finish();
@@ -4996,7 +5023,7 @@ void captureDraw(ID3D11DeviceContext* context, std::uint32_t count, std::uint32_
         ++capture.capturedDraws;
         capture.capturedKeys.insert(key);
         const auto vertices = capture.opaqueVertices - firstVertex;
-        offerToCache(object, key, firstVertex, vertices, NoMaterial, false, moving);
+        offerToCache(object, key, firstVertex, vertices, NoMaterial, false, moving || repeated);
         // Foliage sways with the wind, drawn with velocity, but its instances stay put.
         if (const auto foliage = offscreenGeometry ? foliageSource(context) : std::nullopt)
             recordFoliage(context, *foliage, foliageMesh(context, count, first, baseVertex, false), instances, firstInstance, firstVertex,
