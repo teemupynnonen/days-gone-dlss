@@ -1,6 +1,6 @@
 # Days Gone DLSS changelog
 
-## Unreleased
+## 1.7.2
 
 - The add-on now starts on copies of 1.13 and 1.07 from outside Steam, such as DRM-free copies,
   where it failed with "initialization was not successful". It told the game version from the
