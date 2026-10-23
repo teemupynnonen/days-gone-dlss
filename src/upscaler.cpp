@@ -115,7 +115,7 @@ struct GameBuild
 {
     const char* name;
     int version; // GAME_VERSION in upscaler_shaders.hpp
-    std::uint32_t timeDateStamp, sizeOfImage; // PE header fields identifying the executable
+    std::uint32_t timeDateStamp; // The PE header's link time, the fallback identification
     Address preVisibilityFrameSetup;
     std::span<const unsigned char> preVisibilityPrefix;
     // FMemStackBase page allocation for RHI commands (the slow path of every AllocCommand).
@@ -148,7 +148,7 @@ constexpr unsigned char AllocateCommandPagePrefix107[]{0x48, 0x89, 0x5C, 0x24, 0
     0x74, 0x24, 0x18, 0x57, 0x48, 0x83, 0xEC, 0x30, 0x8D, 0x9A, 0xFF, 0xFF};
 
 constexpr GameBuild Builds[]{
-    {"1.13 (Steam build 19221447)", 113, 0x68754D46, 0x93F0000, 0x20E6920, PreVisibilityPrefix113, 0x19C0EA0,
+    {"1.13 (Steam build 19221447)", 113, 0x68754D46, 0x20E6920, PreVisibilityPrefix113, 0x19C0EA0,
         AllocateCommandPagePrefix113, 0x1BF7F0, EngineTickPrefix113, 0x4A60C44, 0x4ADCA50, 0x4CD0620, {0x2D50, 0xB28, 0xB38, 0x10F0, 0x1744, 0x1755, 0x1760, 0x1CE0, 0xB60},
         {{
             {0x4CA41C8, dxbcHash("6e855e67ebcbdd2ec77695de2f6121c5")},
@@ -163,7 +163,7 @@ constexpr GameBuild Builds[]{
         }},
         &RayTracingView113},
     // Steam beta days_gone_classic. Its shaders come from the _P patch pak's global shader cache.
-    {"1.07 (Steam build 10034136)", 107, 0x60EDC8B2, 0x64B6000, 0x1E3B9F0, PreVisibilityPrefix107, 0x1771BB0,
+    {"1.07 (Steam build 10034136)", 107, 0x60EDC8B2, 0x1E3B9F0, PreVisibilityPrefix107, 0x1771BB0,
         AllocateCommandPagePrefix107, 0x1C5770, EngineTickPrefix107, 0x4217B88, 0x428B180, 0x4480F10, {0x2270, 0x48, 0x58, 0x610, 0xC64, 0xC75, 0xC80, 0x1200, 0x80},
         {{
             {0x4455ED8, dxbcHash("7833e521684c1b0a3090b22a5a7ad680")},
@@ -179,15 +179,34 @@ constexpr GameBuild Builds[]{
         nullptr},
 };
 
+// Another executable's addresses may not be mapped, so the code is copied out rather than compared in place.
+bool codeMatches(Address address, std::span<const unsigned char> prefix)
+{
+    std::array<unsigned char, 32> code{};
+    SIZE_T read{};
+    return prefix.size() <= code.size()
+        && ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address), code.data(), prefix.size(), &read)
+        && read == prefix.size() && !std::memcmp(code.data(), prefix.data(), prefix.size());
+}
+
+// The code at a build's addresses identifies it, so repacks that remove Steam's DRM section or
+// rewrite header fields still work. The link time is the fallback for code that doesn't match
+// yet, such as a DRM wrapper that decrypts it later; the hooks check the code again before patching.
 const GameBuild* findBuild(Address imageBase)
 {
+    for (const auto& build : Builds)
+        if (codeMatches(imageBase + build.preVisibilityFrameSetup, build.preVisibilityPrefix)
+            && codeMatches(imageBase + build.allocateCommandPage, build.allocateCommandPagePrefix)
+            && codeMatches(imageBase + build.engineTick, build.engineTickPrefix))
+            return &build;
+
     const auto* base = reinterpret_cast<const std::uint8_t*>(imageBase);
     const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
     const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
     if (dos->e_magic != IMAGE_DOS_SIGNATURE || nt->Signature != IMAGE_NT_SIGNATURE) return nullptr;
 
     for (const auto& build : Builds)
-        if (nt->FileHeader.TimeDateStamp == build.timeDateStamp && nt->OptionalHeader.SizeOfImage == build.sizeOfImage)
+        if (nt->FileHeader.TimeDateStamp == build.timeDateStamp)
             return &build;
     return nullptr;
 }
@@ -1620,7 +1639,9 @@ void applyDiagnostics(const Diagnostics& options)
 
 const char* selectBuild(std::uintptr_t base) noexcept
 {
-    build = findBuild(base);
+    // ReShade loads the add-on again in a session, when its hooks have patched the code that
+    // identified the build; the first match stands.
+    if (!build) build = findBuild(base);
     imageBase = build ? base : 0;
     return build ? build->name : nullptr;
 }

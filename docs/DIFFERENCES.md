@@ -5,8 +5,10 @@ depends on that is not listed here is identical.
 
 1.13 is the current Steam release; 1.07 is the last version before the Remastered update (Steam
 beta `days_gone_classic`). Both run Unreal 4.11 with Bend's renderer on Direct3D 11. The add-on
-identifies the build from the executable's PE header (`Builds[]` in `src/upscaler.cpp`) and stays
-unloaded on any other executable.
+identifies the build by the code at its hooked functions' addresses (`Builds[]` in
+`src/upscaler.cpp`), with the PE header's TimeDateStamp as the fallback, and stays unloaded on any
+other executable. Copies with Steam's DRM section (`.bind`) removed or header fields rewritten keep
+the same code and data addresses, so they work.
 
 | Version | Steam build | Branch | TimeDateStamp | SizeOfImage | SHA-256 |
 | --- | --- | --- | --- | --- | --- |
