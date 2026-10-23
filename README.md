@@ -51,7 +51,8 @@ You can also remove its INI, log, and `DaysGoneDLSS` documentation folder.
 ## Problems
 
 If the add-on is missing, check the install path, game version, and ReShade's full add-on
-support. For DLSS or FSR errors, check the overlay status and your GPU driver.
+support. ReShade.log says when the game's executable is not a supported build. For DLSS or FSR
+errors, check the overlay status and your GPU driver.
 
 Report issues with `DaysGoneDLSS.log` and `ReShade.log` from the game executable's folder (with
 frame generation also `sl.log`), plus your GPU, driver, resolution, SDR/HDR setting, and steps to

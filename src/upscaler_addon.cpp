@@ -239,6 +239,20 @@ upscaler::Settings startupSettings()
         return {};
     }
 }
+
+// ReShade only reports that initialization failed; naming the executable makes a copy from
+// another store or an unknown patch easy to tell apart in a report.
+std::string unsupportedBuildMessage()
+{
+    const auto* base = reinterpret_cast<const std::uint8_t*>(GetModuleHandleW(nullptr));
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + reinterpret_cast<const IMAGE_DOS_HEADER*>(base)->e_lfanew);
+    char text[256]{};
+    std::snprintf(text, sizeof(text),
+        "This DaysGone.exe (time stamp %08lX, image size %lX) is not a supported build. "
+        "Supported are Steam's 1.13 (build 19221447) and 1.07 (days_gone_classic beta).",
+        nt->FileHeader.TimeDateStamp, nt->OptionalHeader.SizeOfImage);
+    return text;
+}
 }
 
 // TEMPORARY: where fatal exceptions happen, before the engine's crash handler ends the process.
@@ -290,9 +304,14 @@ LONG CALLBACK logFatalException(EXCEPTION_POINTERS* info)
 
 extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon, HMODULE reshadeModule)
 {
-    if (!upscaler::selectBuild(reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr)))
-        || !reshade::register_addon(addon, reshadeModule))
+    if (!reshade::register_addon(addon, reshadeModule)) return false;
+
+    if (!upscaler::selectBuild(reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr))))
+    {
+        reshade::log::message(reshade::log::level::error, unsupportedBuildMessage().c_str());
+        reshade::unregister_addon(addon, reshadeModule);
         return false;
+    }
 
     if (!exceptionHandler) exceptionHandler = AddVectoredExceptionHandler(1, logFatalException); // TEMPORARY
     self = addon;
